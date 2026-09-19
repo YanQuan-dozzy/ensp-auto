@@ -1,0 +1,39 @@
+{
+  "name": "ensp-auto",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "eNSP 网络实验的 AI 代理工作台",
+  "main": "./out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "typecheck:node": "tsc --noEmit -p tsconfig.node.json --composite false",
+    "typecheck:web": "tsc --noEmit -p tsconfig.web.json --composite false",
+    "typecheck": "npm run typecheck:node && npm run typecheck:web",
+    "verify": "npm run typecheck && npm run build",
+    "test": "node tests/harness/bundle.mjs && node --test tests/unit/patterns.test.mjs tests/unit/telnet.test.mjs tests/unit/config.test.mjs tests/unit/apply-config.test.mjs tests/unit/translate.test.mjs tests/unit/topology.test.mjs tests/unit/session-tree.test.mjs tests/unit/mcp.test.mjs tests/unit/project-file.test.mjs tests/unit/merge-layers.test.mjs"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "^0.85.1",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "@xyflow/react": "^12.11.6",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "zod": "^4.6.5",
+    "zustand": "^5.0.15"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.1",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^5.2.0",
+    "electron": "^44.4.2",
+    "electron-vite": "^5.0.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.6"
+  }
+}

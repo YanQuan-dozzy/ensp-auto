@@ -1,0 +1,23 @@
+node_modules/
+out/
+dist/
+release/
+.npm-cache/
+
+# 内部工具目录与特殊文档（不入库）
+.trae/
+.workbuddy/
+.npmrc
+electron-win32.zip
+
+*.log
+npm-debug.log*
+.vite/
+
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+node_modules/.tmp/

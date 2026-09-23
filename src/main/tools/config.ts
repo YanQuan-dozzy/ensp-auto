@@ -2,7 +2,14 @@ import type { CommandResult, DeviceId, Expectation, ExpectationMode, ToolResult 
 import { classifyDanger } from '@shared/risk'
 import { genRollbackCommands } from '../core/rollback'
 import { diffLines } from './command'
-import { fail, failFromCommand, ok, Type, type ToolSpec } from './registry'
+import {
+  fail,
+  failFromCommand,
+  ok,
+  withDeviceLock,
+  Type,
+  type ToolSpec
+} from './registry'
 
 /**
  * 配置变更类工具（v0.2/F-4.x）。
@@ -57,11 +64,19 @@ interface StepFailed {
   error: string
 }
 
+/** 设备停在 [Y/N] 之类的确认提示上：本条命令未生效，后续命令也不能再下发 */
+interface StepAwaitingConfirm {
+  index: number
+  command: string
+  prompt?: string
+}
+
 interface ExecOutcome {
   applied: string[]
   failed?: StepFailed
   blockedCommand?: string
   sysViewError?: string
+  awaitingConfirm?: StepAwaitingConfirm
 }
 
 /**
@@ -69,6 +84,8 @@ interface ExecOutcome {
  * 1. 逐条危险扫描，命中即整体拦截（TOOLS.md「拦在 ToolRegistry 执行前」）
  * 2. 进入系统视图（幂等；已在该视图时重复进入无害）
  * 3. 逐条下发，每条读回显判定成败，任一失败即停止
+ * 4. 命中设备确认提示（[Y/N]）立即停止 —— 绝不自作主张应答（决策 D3 = 停止并上报），
+ *    也不继续下发后续命令：此时设备把任何输入都当成对提示的回答。
  */
 async function executeCommands(
   session: { exec(cmd: string, opts?: { timeoutMs?: number; signal?: AbortSignal }): Promise<CommandResult> },
@@ -94,6 +111,16 @@ async function executeCommands(
       timeoutMs: 15000,
       ...(signal ? { signal } : {})
     })
+    if (r.awaitingConfirm) {
+      return {
+        applied,
+        awaitingConfirm: {
+          index: i,
+          command: c,
+          ...(r.confirmText ? { prompt: r.confirmText } : {})
+        }
+      }
+    }
     if (!r.ok) {
       return {
         applied,
@@ -183,7 +210,9 @@ export const applyConfig: ToolSpec<{
     const verifiedFlag = d?.verified === false ? '，未达期望' : ''
     return `下发 ${d?.applied?.length ?? 0} 条配置 → 成功${verifiedFlag}`
   },
-  handler: async (args, ctx) => {
+  // D6：快照 → 下发 → 校验是多步事务，必须独占设备（execute_task / batch_configure
+  // 复用本 handler，自动获得同等保护）；finally 释放，异常路径不漏锁。
+  handler: withDeviceLock('apply_config', async (args, ctx) => {
     const t0 = Date.now()
     const deviceId = args.deviceId
     const session = ctx.sessions.get(deviceId)
@@ -205,6 +234,14 @@ export const applyConfig: ToolSpec<{
     const description = args.description.trim()
     let snapshotId = args.snapshotId
     let snapshotText: string | null = null
+    /**
+     * D3（2026-09-23）：这份快照是否完整。
+     *
+     * 设备回显超过 maxBytes 时通信层会截断（头 256KB + 尾 256KB），而 rollback 按段
+     * 解析 —— 缺中间段会让「其实存在的段」被判成新增/删除，回滚**报成功却没回到现场**。
+     * 不完整快照仍入库（可查看/可 diff），但不能当回滚基线。
+     */
+    let snapshotComplete = true
     if (!snapshotId) {
       const cur = await session.exec('display current-configuration', {
         timeoutMs: 30000,
@@ -213,17 +250,36 @@ export const applyConfig: ToolSpec<{
       if (!cur.ok) {
         return fail('NO_SNAPSHOT', `快照采集失败：${cur.error ?? '命令执行失败'}`, metaOf(t0, deviceId))
       }
-      snapshotText = cur.clean
-      snapshotId = ctx.snapshots.save(
+      const complete = !cur.truncated && !cur.decodeIssues
+      const saved = ctx.snapshots.save(
         deviceId,
         cur.clean,
-        `变更前快照：${description.slice(0, 40)}`
-      ).id
-    } else if (!ctx.snapshots.get(deviceId, snapshotId)) {
-      return fail('NO_SNAPSHOT', `快照不存在：${snapshotId}`, metaOf(t0, deviceId))
+        `变更前快照：${description.slice(0, 40)}`,
+        { complete }
+      )
+      snapshotId = saved.id
+      snapshotComplete = saved.complete
+      snapshotText = cur.clean
     } else {
-      snapshotText = ctx.snapshots.read(deviceId, snapshotId)
+      const existing = ctx.snapshots.get(deviceId, snapshotId)
+      if (!existing) {
+        return fail('NO_SNAPSHOT', `快照不存在：${snapshotId}`, metaOf(t0, deviceId))
+      }
+      // 显式指定了不完整快照 = 主动选择一个不可用的回滚依据，直接拒绝而不是埋雷
+      if (existing.complete === false) {
+        return fail(
+          'SNAPSHOT_INCOMPLETE',
+          `快照 ${snapshotId} 采集时不完整（超过设备回显上限），不能作为本次变更的回滚依据；` +
+            '请先用 save_config_snapshot 重新采集一份完整快照',
+          metaOf(t0, deviceId)
+        )
+      }
+      snapshotId = existing.id
+      // 到这里 complete 必然不是 false（上面已提前返回）
+      snapshotComplete = existing.complete
+      snapshotText = ctx.snapshots.read(deviceId, existing.id)
     }
+    const snapshotInfo = { snapshotId, snapshotComplete }
 
     const log = (result: 'ok' | 'failed' | 'blocked', extra?: Partial<Parameters<typeof ctx.changes.add>[0]>): void => {
       ctx.changes.add({
@@ -255,6 +311,36 @@ export const applyConfig: ToolSpec<{
       return fail('FAILED', `无法进入系统视图：${execOutcome.sysViewError}`, metaOf(t0, deviceId))
     }
 
+    // 设备停在 [Y/N]：上报为「半途中止」，不替用户应答、也不继续下发（决策 D3）
+    if (execOutcome.awaitingConfirm) {
+      const ac = execOutcome.awaitingConfirm
+      const prompt = ac.prompt ?? '[Y/N]'
+      log('failed', {
+        verified: false,
+        error: { code: 'INCOMPLETE', message: `设备停在确认提示（${prompt}），已中止下发` }
+      })
+      return {
+        ok: false,
+        error: {
+          code: 'INCOMPLETE',
+          message:
+            `配置下发在「${ac.command}」处停在设备确认提示：${prompt}。` +
+            '已中止后续命令（此时设备会把任何输入都当成对该提示的回答），' +
+            '配置半途中止且未自动回滚。' +
+            `请用 answer_device_prompt({ deviceId: '${deviceId}', answer: 'y' 或 'n', reason: '…' }) ` +
+            '显式应答该提示（y 继续 / n 取消）后再继续下发；' +
+            '在此状态下下发其他命令会被设备当成应答吃掉。'
+        },
+        data: {
+          applied: execOutcome.applied,
+          awaitingConfirm: ac,
+          needsUserInput: true,
+          ...snapshotInfo
+        } as never,
+        meta: metaOf(t0, deviceId)
+      }
+    }
+
     const meta = metaOf(t0, deviceId)
     if (execOutcome.failed) {
       const f = execOutcome.failed
@@ -268,7 +354,7 @@ export const applyConfig: ToolSpec<{
         data: {
           applied: execOutcome.applied,
           failed: f,
-          snapshotId
+          ...snapshotInfo
         } as never,
         meta
       }
@@ -290,7 +376,7 @@ export const applyConfig: ToolSpec<{
         return {
           ok: false,
           error: { code: 'EXPECTATION_UNMET', message: '配置已下发但未达到期望状态，请修正或回滚' },
-          data: { applied: execOutcome.applied, snapshotId, verified: false, actual } as never,
+          data: { applied: execOutcome.applied, verified: false, actual, ...snapshotInfo } as never,
           meta
         }
       }
@@ -310,13 +396,13 @@ export const applyConfig: ToolSpec<{
     return ok(
       {
         applied: execOutcome.applied,
-        snapshotId,
+        ...snapshotInfo,
         ...(args.expectation ? { verified: verified ?? false } : {}),
         ...(diff ? { diff } : {})
       } as never,
       meta
     )
-  }
+  })
 }
 
 // ———————————————————— verify_expectation ————————————————————
@@ -391,7 +477,8 @@ export const restoreSnapshot: ToolSpec<{ deviceId: string; snapshotId?: string; 
   ),
   summarize: (args, result) =>
     result.ok ? `回滚 ${args.deviceId}（应用 ${((result.data as { appliedCommands?: number })?.appliedCommands ?? 0)} 条）` : '回滚失败',
-  handler: async (args, ctx) => {
+  // D6：回滚同样是多步事务（对比 → 生成撤销命令 → 逐条下发），必须独占设备
+  handler: withDeviceLock('restore_snapshot', async (args, ctx) => {
     const t0 = Date.now()
     const deviceId = args.deviceId
     const session = ctx.sessions.get(deviceId)
@@ -407,6 +494,26 @@ export const restoreSnapshot: ToolSpec<{ deviceId: string; snapshotId?: string; 
       : ctx.snapshots.latest(deviceId)
     if (!snap) {
       return fail('NO_SNAPSHOT', '该设备没有可用快照，无法回滚', metaOf(t0, deviceId))
+    }
+    /*
+     * D3（决策 P2 = 严格）：采集时不完整的快照不能当回滚基线。
+     *
+     * 截断快照缺中间段，而回滚命令是按「段」diff 出来的 —— 用缺段的基线算 diff
+     * 会既可能漏撤销（残留配置）又可能误撤销（把未变更的段当新增 undo 掉），
+     * 且回滚会**报成功**，事后无人能发现。宁可要求先重新采集一份完整快照。
+     */
+    if (snap.complete === false) {
+      const fallback = ctx.snapshots
+        .list(deviceId)
+        .find((s) => s.complete !== false)
+      return fail(
+        'SNAPSHOT_INCOMPLETE',
+        `快照 ${snap.id}（${snap.label}）采集时不完整（超过设备回显上限），不能作为回滚基线。` +
+          (fallback
+            ? `可改用更早的完整快照 ${fallback.id}（${fallback.label}），或重新采集一份完整快照。`
+            : '请在设备空闲时用 save_config_snapshot 重新采集一份完整快照。'),
+        metaOf(t0, deviceId)
+      )
     }
     const snapText = ctx.snapshots.read(deviceId, snap.id)
     if (snapText === null) {
@@ -456,7 +563,11 @@ export const restoreSnapshot: ToolSpec<{ deviceId: string; snapshotId?: string; 
     })
     if (!approved) {
       log('rejected')
-      return fail('GATE_REJECTED', '用户拒绝了回滚操作', meta)
+      return fail(
+        'GATE_REJECTED',
+        '回滚未获批准：用户拒绝了本次回滚，或任务已中止 / 当前出口（如 MCP）不支持人工确认',
+        meta
+      )
     }
 
     const outcome = await executeCommands(session, plan.commands, ctx.signal)
@@ -465,6 +576,28 @@ export const restoreSnapshot: ToolSpec<{ deviceId: string; snapshotId?: string; 
     }
     if (outcome.sysViewError) {
       return fail('FAILED', `无法进入系统视图：${outcome.sysViewError}`, meta)
+    }
+    if (outcome.awaitingConfirm) {
+      const ac = outcome.awaitingConfirm
+      log('failed')
+      return {
+        ok: false,
+        error: {
+          code: 'INCOMPLETE',
+          message:
+            `回滚在「${ac.command}」处停在设备确认提示：${ac.prompt ?? '[Y/N]'}。` +
+            '已中止后续命令。' +
+            `请用 answer_device_prompt({ deviceId: '${deviceId}', answer: 'y' 或 'n', reason: '…' }) ` +
+            '应答该提示后再继续；直接下发其他命令会被设备当成应答吃掉。'
+        },
+        data: {
+          appliedCommands: outcome.applied.length,
+          applied: outcome.applied,
+          awaitingConfirm: ac,
+          needsUserInput: true
+        } as never,
+        meta
+      }
     }
     if (outcome.failed) {
       const f = outcome.failed
@@ -487,7 +620,7 @@ export const restoreSnapshot: ToolSpec<{ deviceId: string; snapshotId?: string; 
       } as never,
       meta
     )
-  }
+  })
 }
 
 // ———————————————————— save_configuration ————————————————————

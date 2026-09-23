@@ -1,5 +1,6 @@
 import { useEffect, type ReactNode } from 'react'
 import { useApp } from '@/stores/app'
+import { IconAlertTriangle } from '@/components/ui'
 
 /**
  * 危险操作闸门。
@@ -30,9 +31,12 @@ export function GateDialog(): ReactNode {
   return (
     <div className="overlay" role="dialog" aria-modal="true" aria-label="危险操作确认">
       <div className="dialog">
-        <div className="dialog-bar" />
+        <div className="dialog-bar" style={{ background: 'var(--danger)' }} />
         <div className="dialog-body">
-          <div className="dialog-title">危险操作确认</div>
+          <div className="dialog-title" style={{ color: 'var(--danger)' }}>
+            <IconAlertTriangle size={18} />
+            危险操作确认
+          </div>
 
           <dl className="kv">
             <dt>工具</dt>
@@ -42,16 +46,16 @@ export function GateDialog(): ReactNode {
               {argsText}
             </dd>
             <dt>后果</dt>
-            <dd>{gate.reason}</dd>
+            <dd style={{ color: 'var(--danger)', fontWeight: 500 }}>{gate.reason}</dd>
           </dl>
 
-          <p style={{ fontSize: 'var(--text-sm)', color: 'var(--text-muted)' }}>
-            该操作不可撤销。批准后将立即在设备上执行。
+          <p style={{ fontSize: 'var(--text-xs)', color: 'var(--text-muted)' }}>
+            该操作不可撤销。批准后将立即在设备上执行；拒绝则安全跳过本次调用。
           </p>
 
           <div className="dialog-actions">
             <button className="btn" onClick={() => void resolveGate('reject')}>
-              拒绝
+              拒绝执行 (Esc)
             </button>
             <button className="btn danger" onClick={() => void resolveGate('approve')}>
               确认执行

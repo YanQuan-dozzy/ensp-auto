@@ -9,7 +9,7 @@ import { gzipSync } from 'node:zlib'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { decodeTopo, parseTopoXml, readTopoFile } from '../.build/harness.mjs'
+import { decodeTopo, parseTopoXml, readTopoFile, parseDeviceInterfaces, resolveInterfaceName } from '../.build/harness.mjs'
 
 const XML_PLAIN = `<?xml version="1.0" encoding="UNICODE"?>
 <topo version="1.3.00.100">
@@ -175,4 +175,144 @@ test('readTopoFile：真机 GBK .topo 端到端（字节 → 解码 → 设备/�
   } finally {
     fs.rmSync(file, { force: true })
   }
+})
+
+// —— 接口表解析 + 链路端口标注（拓扑展示增强，参照 ensp- 参考实现）——
+
+test('parseDeviceInterfaces：标准 slot/interface（GE count=4）展开为有序接口表', () => {
+  const inner = '<slot number="slot0" isMainBoard="1">'
+    + '<interface sztype="Ethernet" interfacename="GE" count="4" />'
+    + '</slot>'
+  assert.deepEqual(parseDeviceInterfaces(inner), ['GE0/0/0', 'GE0/0/1', 'GE0/0/2', 'GE0/0/3'])
+})
+
+test('parseDeviceInterfaces：同名类型跨分组连续编号（AR2220 GE×1 + GE×2 → GE0/0/0..2）', () => {
+  const inner = '<slot number="slot0">'
+    + '<interface sztype="Ethernet" interfacename="GE" count="1" />'
+    + '<interface sztype="Ethernet" interfacename="GE" count="2" />'
+    + '</slot>'
+  assert.deepEqual(parseDeviceInterfaces(inner), ['GE0/0/0', 'GE0/0/1', 'GE0/0/2'])
+})
+
+test('parseDeviceInterfaces：防火墙 triplet 格式（type + slotIndex/cardIndex/interfaceIndex）', () => {
+  const inner = '<interface category="1" type="GE" slotIndex="0" cardIndex="0" interfaceIndex="1" />'
+  assert.deepEqual(parseDeviceInterfaces(inner), ['GE0/0/1'])
+})
+
+test('parseDeviceInterfaces：无接口定义返回空数组', () => {
+  assert.deepEqual(parseDeviceInterfaces(''), [])
+  assert.deepEqual(parseDeviceInterfaces('<slot number="s0"></slot>'), [])
+})
+
+test('resolveInterfaceName：表内命中与越界兜底', () => {
+  const ifaces = ['GE0/0/0', 'GE0/0/1']
+  assert.equal(resolveInterfaceName(ifaces, 0), 'GE0/0/0')
+  assert.equal(resolveInterfaceName(ifaces, 1), 'GE0/0/1')
+  assert.equal(resolveInterfaceName(ifaces, 9), 'GE0/0/9') // 越界兜底，不抛错
+  assert.equal(resolveInterfaceName([], 3), 'GE0/0/3')
+})
+
+// —— 接口编号对齐 VRP 真机（参照 ensp-mcp interface_mapping：交换机 GE/Eth 从 1 起，路由器 GE 从 0 起）——
+
+test('parseDeviceInterfaces：交换机 GE 从 GE0/0/1 起（S5700 class 模型）', () => {
+  const inner = '<slot number="s0" isMainBoard="1">'
+    + '<interface sztype="Ethernet" interfacename="GE" count="24" />'
+    + '</slot>'
+  const ifaces = parseDeviceInterfaces(inner, { isSwitch: true })
+  assert.equal(ifaces.length, 24)
+  assert.equal(ifaces[0], 'GE0/0/1')
+  assert.equal(ifaces[23], 'GE0/0/24')
+  assert.equal(ifaces.includes('GE0/0/0'), false) // 交换机无 GE0/0/0
+})
+
+test('parseDeviceInterfaces：路由器 GE 保持从 GE0/0/0 起（isSwitch=false 兜底同旧行为）', () => {
+  const inner = '<slot number="s0">'
+    + '<interface sztype="Ethernet" interfacename="GE" count="3" />'
+    + '</slot>'
+  assert.deepEqual(parseDeviceInterfaces(inner, { isSwitch: false }), ['GE0/0/0', 'GE0/0/1', 'GE0/0/2'])
+})
+
+test('parseDeviceInterfaces：Ethernet/Eth 一律从 0/0/1 起', () => {
+  const eth = '<slot><interface sztype="Ethernet" interfacename="Ethernet" count="24"/></slot>'
+  assert.equal(parseDeviceInterfaces(eth)[0], 'Ethernet0/0/1')
+  assert.equal(parseDeviceInterfaces(eth)[5], 'Ethernet0/0/6')
+  const ethShort = '<slot><interface interfacename="Eth" count="2"/></slot>'
+  assert.deepEqual(parseDeviceInterfaces(ethShort), ['Eth0/0/1', 'Eth0/0/2'])
+})
+
+test('parseDeviceInterfaces：其他类型（Serial/POS）保持 0/0/{n}', () => {
+  const serial = '<slot><interface interfacename="Serial" count="2"/></slot>'
+  assert.deepEqual(parseDeviceInterfaces(serial), ['Serial0/0/0', 'Serial0/0/1'])
+})
+
+test('resolveInterfaceName：越界兜底按 isSwitch 加 1', () => {
+  assert.equal(resolveInterfaceName([], 3, true), 'GE0/0/4')
+  assert.equal(resolveInterfaceName([], 3, false), 'GE0/0/3')
+})
+
+test('parseTopoXml：成对 <dev> 内部接口表 + line srcIndex/tarIndex → 链路端口标注', () => {
+  const xml = `<topo version="1.3.00">
+  <devices>
+    <dev id="R1-1" name="R1" model="AR2220" com_port="2000" cx="10" cy="10">
+      <slot number="slot0" isMainBoard="1">
+        <interface sztype="Ethernet" interfacename="GE" count="3" />
+      </slot>
+    </dev>
+    <dev id="SW1-2" name="SW1" model="S5700" com_port="2001" cx="200" cy="10">
+      <slot number="slot0" isMainBoard="1">
+        <interface sztype="Ethernet" interfacename="GE" count="24" />
+      </slot>
+    </dev>
+  </devices>
+  <lines>
+    <line srcDeviceID="R1-1" destDeviceID="SW1-2">
+      <interfacePair lineName="Copper" srcIndex="1" srcBoundRectIsMoved="1" tarIndex="9" tarBoundRectIsMoved="1"/>
+    </line>
+  </lines>
+</topo>`
+  const { topology } = parseTopoXml(xml)
+  const r1 = topology.nodes.find((n) => n.name === 'R1')
+  assert.deepEqual(r1.interfaces, ['GE0/0/0', 'GE0/0/1', 'GE0/0/2']) // 路由器 0-based
+  const sw1 = topology.nodes.find((n) => n.name === 'SW1')
+  assert.equal(sw1.interfaces.length, 24)
+  assert.equal(sw1.interfaces[0], 'GE0/0/1') // 交换机 1-based
+  assert.equal(sw1.interfaces[9], 'GE0/0/10')
+
+  const link = topology.links.find((l) => l.from === 'R1' && l.to === 'SW1')
+  assert.equal(link.label, 'GE0/0/1 ↔ GE0/0/10') // R1 srcIndex=1 → GE0/0/1；SW1 tarIndex=9 → GE0/0/10
+})
+
+test('parseTopoXml：同端点对多条 interfacePair → label 全部合并不截断（并联链路标注）', () => {
+  const xml = `<topo>
+  <devices>
+    <dev name="C1" model="S5700"><slot number="s"><interface interfacename="GE" count="24"/></slot></dev>
+    <dev name="C2" model="S5700"><slot number="s"><interface interfacename="GE" count="24"/></slot></dev>
+  </devices>
+  <lines>
+    <line srcDeviceID="C1" destDeviceID="C2">
+      <interfacePair lineName="Copper" srcIndex="0" tarIndex="0"/>
+      <interfacePair lineName="Copper" srcIndex="1" tarIndex="1"/>
+      <interfacePair lineName="Copper" srcIndex="2" tarIndex="2"/>
+    </line>
+  </lines>
+</topo>`
+  const { topology, report } = parseTopoXml(xml)
+  assert.equal(report.links, 1) // 同端点对去重为 1 条
+  const link = topology.links[0]
+  assert.equal(link.label, 'GE0/0/1 ↔ GE0/0/1 / GE0/0/2 ↔ GE0/0/2 / GE0/0/3 ↔ GE0/0/3') // 三对全保留，交换机从 1 起
+})
+
+test('parseTopoXml：旧版 interfacePair 自带 name 端点 + srcIndex/tarIndex → label', () => {
+  const xml = `<topo>
+  <devices>
+    <dev name="AR1" model="AR2220"><slot><interface interfacename="GE" count="4"/></slot></dev>
+    <dev name="SW1" model="S5700"><slot><interface interfacename="GE" count="24"/></slot></dev>
+  </devices>
+  <links>
+    <interfacePair srcIndex="2" tarIndex="3"><fromdevice name="AR1"/><todevice name="SW1"/></interfacePair>
+  </links>
+</topo>`
+  const { topology } = parseTopoXml(xml)
+  const link = topology.links.find((l) => l.from === 'AR1' && l.to === 'SW1')
+  assert.equal(link.label, 'GE0/0/2 ↔ GE0/0/4') // AR1 路由器 0-based；SW1 交换机 tarIndex=3 → GE0/0/4
 })

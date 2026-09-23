@@ -10,6 +10,9 @@ release/
 .npmrc
 electron-win32.zip
 
+# 公开文档待审查后另行推送
+docs/
+
 *.log
 npm-debug.log*
 .vite/
@@ -21,3 +24,13 @@ Thumbs.db
 !.vscode/extensions.json
 
 node_modules/.tmp/
+
+# 测试 harness 的 esbuild 产物（由 tests/harness/bundle.mjs 生成）
+tests/.build/
+
+# 本地临时验证日志（不入库）
+.tmp/
+
+# 由 tools/make-launcher.py 从 start.cmd + start-hidden.vbs 编出来的启动器二进制
+# （源码是那两份脚本，二进制不入库；构建方式见 tools/）
+start.exe

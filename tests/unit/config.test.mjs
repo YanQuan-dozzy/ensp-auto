@@ -7,6 +7,7 @@ import {
   genRollbackCommands,
   parseConfigStanzas,
   invertCommand,
+  UNDOABLE_HEADER_RE,
   checkExpectation,
   ChangeStore
 } from '../.build/harness.mjs'
@@ -116,6 +117,55 @@ test('回滚：整段新增 → 只发 undo 段头（子行随段消失）', () 
   const plan = genRollbackCommands(oldCfg, newCfg)
   assert.deepEqual(plan.commands, ['undo ospf 2'])
   assert.deepEqual(plan.added, ['ospf 2', 'area 0.0.0.0', 'network 10.0.0.0 0.0.0.255'])
+})
+
+// —— D1（2026-09-23）：段头可 undo 与否必须分叉 ——
+//
+// 反例来源：`undo interface GigabitEthernet0/0/0` 在 VRP 里不存在，
+// 下发即 `Error: Unrecognized command`；而 executeCommands 遇错即停，
+// 于是回滚在第一条就中断、设备停在半回滚状态。
+
+test('D1：新增的 interface 段 → 进段 + 逐行 undo，绝不含 undo interface', () => {
+  const plan = genRollbackCommands(
+    '',
+    'interface GigabitEthernet0/0/0\n ip address 10.0.1.1 255.255.255.0\n'
+  )
+  assert.deepEqual(plan.commands, [
+    'interface GigabitEthernet0/0/0',
+    'undo ip address 10.0.1.1 255.255.255.0'
+  ])
+  assert.ok(
+    !plan.commands.some((c) => /^undo\s+interface\b/i.test(c)),
+    '不得生成设备不存在的 undo interface'
+  )
+})
+
+test('D1：新增的 vlan 段仍走整体 undo（不回归简化路径）', () => {
+  const plan = genRollbackCommands('', 'vlan 10\n')
+  assert.deepEqual(plan.commands, ['undo vlan 10'])
+})
+
+test('D1：可 undo 段头白名单覆盖视图入口，且排除 interface/aaa/keychain 一类', () => {
+  for (const h of ['vlan 10', 'ospf 1', 'acl number 3000', 'acl name deny-web', 'bgp 100']) {
+    assert.ok(UNDOABLE_HEADER_RE.test(h), `${h} 应可整体 undo`)
+  }
+  for (const h of [
+    `${IFACE}`,
+    'firewall zone name trust',
+    'nat address-group 1',
+    'dhcp server ip-pool vlan10',
+    'keychain kc',
+    'user-interface vty 0 4',
+    'aaa',
+    'mpls'
+  ]) {
+    assert.ok(!UNDOABLE_HEADER_RE.test(h), `${h} 不可整体 undo，必须走逐行路径`)
+  }
+})
+
+test('D1：新增段的子行撤销尊重 invertCommand（undo shutdown → shutdown）', () => {
+  const plan = genRollbackCommands('', 'interface GigabitEthernet0/0/1\n undo shutdown\n')
+  assert.deepEqual(plan.commands, ['interface GigabitEthernet0/0/1', 'shutdown'])
 })
 
 test('回滚：整段被删 → 按快照原样补回（header + 全部子行）', () => {

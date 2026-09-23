@@ -158,10 +158,115 @@ export const runShowCommand: ToolSpec<{ deviceId: string; command: string }> = {
   }
 }
 
+export const answerDevicePrompt: ToolSpec<{ deviceId: string; answer: 'y' | 'n'; reason: string }> = {
+  name: 'answer_device_prompt',
+  description:
+    '应答设备当前的交互确认提示（[Y/N]、[Y/N]: 一类）。' +
+    '仅当上一条工具结果带 awaitingConfirm=true 时使用：无挂起提示时调用会被拒绝（NO_PENDING_PROMPT），' +
+    '以免把 y / n 当成普通命令打进当前视图。' +
+    '应答 y 可能触发不可逆操作（删文件 / 清配置），属 danger，需人工闸门批准。',
+  risk: 'danger',
+  scope: 'device',
+  schema: Type.Object(
+    {
+      deviceId: Type.String({ description: '设备 ID' }),
+      answer: Type.Union([Type.Literal('y'), Type.Literal('n')], {
+        description: '应答内容：y 继续执行该操作，n 取消'
+      }),
+      reason: Type.String({ description: '应答意图说明，用于闸门弹窗与执行轨迹' })
+    },
+    { additionalProperties: false }
+  ),
+  summarize: (args, result) =>
+    result.ok ? `应答 ${args.deviceId} 确认提示：${args.answer}` : `应答 ${args.deviceId} 失败`,
+  handler: async (args, ctx) => {
+    const t0 = Date.now()
+    const session = ctx.sessions.get(args.deviceId)
+    if (!session) {
+      return fail('NOT_CONNECTED', `设备未连接：${args.deviceId}`, { ms: Date.now() - t0 })
+    }
+
+    const raw = typeof args.answer === 'string' ? args.answer.trim().toLowerCase() : ''
+    if (raw !== 'y' && raw !== 'n') {
+      return fail('BAD_PARAM', `answer 必须为 'y' 或 'n'，收到 ${JSON.stringify(args.answer)}`, {
+        ms: Date.now() - t0,
+        deviceId: args.deviceId
+      })
+    }
+    if (!args.reason?.trim()) {
+      return fail('BAD_PARAM', '请提供 reason 说明本次应答的意图', {
+        ms: Date.now() - t0,
+        deviceId: args.deviceId
+      })
+    }
+
+    /*
+     * 关键不变量：没有挂起提示时绝不下发。
+     *
+     * 通信层把「confirmPaused 状态下的下一次 exec」当成显式应答并插到队首（R6），
+     * 所以只有在挂起时这条命令才真的是「对该提示的回答」；否则它会被当成一条
+     * 普通命令打进当前视图（`y` → Error: Unrecognized command），并顺带污染队列顺序。
+     */
+    if (!session.isAwaitingConfirm) {
+      return fail(
+        'NO_PENDING_PROMPT',
+        '设备当前没有等待应答的确认提示。请先执行触发提示的命令，并确认其返回 awaitingConfirm=true 后再应答。',
+        { ms: Date.now() - t0, deviceId: args.deviceId }
+      )
+    }
+
+    const confirmText = session.awaitingConfirmText
+    const r = await session.exec(raw, {
+      timeoutMs: 15000,
+      ...(ctx.signal ? { signal: ctx.signal } : {})
+    })
+
+    // 应答后设备又停在另一处提示（例如二次确认）：如实上报，让代理决定是否再应答
+    if (r.awaitingConfirm) {
+      return {
+        ok: false,
+        error: {
+          code: 'INCOMPLETE',
+          message:
+            `已应答「${raw}」，但设备随即停在另一处确认提示：${r.confirmText ?? '[Y/N]'}。` +
+            '设备仍处于等待应答状态，请确认后再用本工具应答。'
+        },
+        data: {
+          answered: raw,
+          confirmText,
+          nextPrompt: r.confirmText,
+          clean: r.clean.slice(0, 8000)
+        } as never,
+        meta: { ms: Date.now() - t0, deviceId: args.deviceId, settled: r.settled }
+      }
+    }
+    if (!r.ok) {
+      return failFromCommand(r, 'FAILED', {
+        ms: Date.now() - t0,
+        deviceId: args.deviceId,
+        settled: r.settled
+      })
+    }
+
+    return ok(
+      {
+        answered: raw,
+        confirmText,
+        clean: r.clean.slice(0, 8000),
+        prompt: r.prompt,
+        view: r.view
+      } as never,
+      { ms: Date.now() - t0, deviceId: args.deviceId, settled: r.settled }
+    )
+  }
+}
+
 export const saveConfigSnapshot: ToolSpec<{ deviceId: string; label?: string }> = {
   name: 'save_config_snapshot',
+
   description:
-    '采集设备当前运行配置并存为快照（只读设备，写本地库）。任何配置变更前都应先做快照。',
+    '采集设备当前运行配置并存为快照（只读设备，写本地库）。任何配置变更前都应先做快照。' +
+    '若回显超过设备上限被截断，快照会标注 snapshotComplete:false —— 这类快照不能作为回滚基线。',
   risk: 'read',
   scope: 'local',
   schema: Type.Object(
@@ -188,12 +293,18 @@ export const saveConfigSnapshot: ToolSpec<{ deviceId: string; label?: string }> 
     if (!r.ok) {
       return failFromCommand(r, 'FAILED', { ms: Date.now() - t0, deviceId: args.deviceId })
     }
+    // D3：截断 / 解码有损的快照仍入库，但标注为不可作回滚基线
+    const complete = !r.truncated && !r.decodeIssues
     const meta = ctx.snapshots.save(
       args.deviceId,
       r.clean,
-      args.label ?? `自动快照 ${new Date().toLocaleString('zh-CN')}`
+      args.label ?? `自动快照 ${new Date().toLocaleString('zh-CN')}`,
+      { complete }
     )
-    return ok(meta, { ms: Date.now() - t0, deviceId: args.deviceId })
+    return ok({ ...meta, snapshotComplete: meta.complete }, {
+      ms: Date.now() - t0,
+      deviceId: args.deviceId
+    })
   }
 }
 

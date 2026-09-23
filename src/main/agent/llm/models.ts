@@ -1,13 +1,15 @@
 import { createModels, createProvider, type MutableModels, type Provider } from '@earendil-works/pi-ai'
 import { openAICompletionsApi } from '@earendil-works/pi-ai/api/openai-completions.lazy'
+import { COMPAT_PROVIDERS, isCompatProvider, type CompatProvider, type LlmProvider } from '@shared/providers'
 
 /**
  * 按设置装配 pi-ai 的 Models 集合（多 provider 的单一装配点）。
  *
  * 划分（参照 pi 官方「自定义 Provider」文档的思路）：
- * - deepseek / custom   → OpenAI Chat Completions 兼容线（createProvider + openAICompletionsApi）。
- *   baseUrl 与 model 名都透传：DeepSeek 官方目录不含 deepseek-chat 这类旧名，且用户常把
- *   baseUrl 指到代理/中转，因此这两档合一走兼容线，差别只在 UI 标签。
+ * - deepseek / zhipu / qwen / kimi / doubao / qianfan / minimax / custom → OpenAI Chat
+ *   Completions 兼容线（createProvider + openAICompletionsApi）。baseUrl 与 model 名都透传：
+ *   国产主流平台官方均提供 OpenAI 兼容端点，且用户常把 baseUrl 指到代理/中转，
+ *   因此这几档合一走兼容线，差别只在默认端点与 UI 标签。
  * - openai / anthropic / google → 官方内建 provider（各自的原生 API），model 须在目录里，
  *   API key 通过每请求的 apiKey 显式传入（最高优先级）。
  *
@@ -16,7 +18,7 @@ import { openAICompletionsApi } from '@earendil-works/pi-ai/api/openai-completio
  */
 
 export interface LLMSettings {
-  provider: 'deepseek' | 'openai' | 'anthropic' | 'google' | 'custom'
+  provider: LlmProvider
   baseUrl: string
   model: string
   apiKey: string
@@ -37,18 +39,20 @@ const BUILTIN_FACTORIES: Record<'openai' | 'anthropic' | 'google', () => Promise
 }
 
 export function buildLLM(settings: LLMSettings): Promise<LLMHandle> {
-  if (settings.provider === 'deepseek' || settings.provider === 'custom') {
+  if (isCompatProvider(settings.provider)) {
     return buildCompat(settings)
   }
   return buildBuiltin(settings)
 }
 
 async function buildCompat(settings: LLMSettings): Promise<LLMHandle> {
-  const baseUrl = (settings.baseUrl || 'https://api.deepseek.com').trim()
+  const provider = settings.provider as CompatProvider
+  const preset = COMPAT_PROVIDERS[provider]
+  const baseUrl = (settings.baseUrl || preset.defaultBaseUrl).trim()
   const models = createModels()
-  const provider = createProvider({
+  const p = createProvider({
     id: 'compat',
-    name: settings.provider === 'deepseek' ? 'DeepSeek（OpenAI 兼容）' : '自定义 OpenAI 兼容端点',
+    name: preset.label,
     baseUrl,
     auth: {
       apiKey: {
@@ -73,12 +77,12 @@ async function buildCompat(settings: LLMSettings): Promise<LLMHandle> {
     ],
     api: openAICompletionsApi()
   })
-  models.setProvider(provider)
+  models.setProvider(p)
   return { models, provider: 'compat', modelId: settings.model }
 }
 
 async function buildBuiltin(settings: LLMSettings): Promise<LLMHandle> {
-  // buildLLM 已把 deepseek/custom 分流到 buildCompat，这里只剩三个官方 provider
+  // buildLLM 已把 deepseek/zhipu/qwen/custom 分流到 buildCompat，这里只剩三个官方 provider
   const providerId = settings.provider as 'openai' | 'anthropic' | 'google'
   const factory = BUILTIN_FACTORIES[providerId]
   const models = createModels()

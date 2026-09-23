@@ -1,5 +1,10 @@
 import type { PromptInfo, ViewKind } from '@shared/types'
-import { PROMPT_REJECT_RE, PROMPT_TAIL_RE, VIEW_KEYWORDS } from './patterns'
+import {
+  PROMPT_REJECT_RE,
+  PROMPT_REJECT_WORDS,
+  PROMPT_TAIL_RE,
+  VIEW_KEYWORDS
+} from './patterns'
 
 /**
  * 提示符解析与视图推断。
@@ -55,6 +60,13 @@ export function matchPromptTail(tail: string, expectedHost?: string): PromptMatc
 
   // 含空白或常见标点的内容基本可断定是输出正文
   if (PROMPT_REJECT_RE.test(rawContent)) return null
+
+  // T4.3：设备输出里随处可见的「肯定/否定/错误」短语不是宿主名。
+  // 这类误判只发生在锁宿主名之前（握手期），一旦锁上就有 expectedHost 强约束兜着；
+  // 但握手期锁错一次，后面整段会话的提示符判定都会跟着错。
+  if (PROMPT_REJECT_WORDS.test(rawContent.trim())) return null
+  // 纯数字 / 纯符号也不是宿主名（如 [1]、[--]）
+  if (!/[A-Za-z_]/.test(rawContent)) return null
 
   const split = extractView(rawContent)
   if (!split.host) return null

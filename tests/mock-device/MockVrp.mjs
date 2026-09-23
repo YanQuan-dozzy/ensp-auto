@@ -100,6 +100,15 @@ export class MockVrp {
     sock.on('data', (chunk) => {
       const text = chunk.toString('utf8')
 
+      // VRP 中断键（Ctrl+C，D11）：打断当前执行、清掉半行输入、回到当前提示符。
+      // 真实设备就是这么表现的 —— 客户端中止长输出命令时会发 \x03；
+      // 若不在此清掉 buffer，\x03 会和新的一行命令粘在一起被解析成一条未知命令。
+      if (text.includes('\x03')) {
+        state.buffer = ''
+        sock.write(`\r\n${this.promptText()}`)
+        return
+      }
+
       if (state.awaitingMore) {
         if (text.includes(' ')) this.sendNextPage(sock, state)
         return

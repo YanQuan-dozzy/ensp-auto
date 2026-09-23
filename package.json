@@ -11,9 +11,10 @@
     "preview": "electron-vite preview",
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json --composite false",
     "typecheck:web": "tsc --noEmit -p tsconfig.web.json --composite false",
-    "typecheck": "npm run typecheck:node && npm run typecheck:web",
+    "typecheck:tests": "tsc --noEmit -p tsconfig.tests.json",
+    "typecheck": "npm run typecheck:node && npm run typecheck:web && npm run typecheck:tests",
     "verify": "npm run typecheck && npm run build",
-    "test": "node tests/harness/bundle.mjs && node --test tests/unit/patterns.test.mjs tests/unit/telnet.test.mjs tests/unit/config.test.mjs tests/unit/apply-config.test.mjs tests/unit/translate.test.mjs tests/unit/topology.test.mjs tests/unit/session-tree.test.mjs tests/unit/mcp.test.mjs tests/unit/project-file.test.mjs tests/unit/merge-layers.test.mjs"
+    "test": "node tests/harness/bundle.mjs && node --test \"tests/unit/*.test.mjs\""
   },
   "dependencies": {
     "@earendil-works/pi-ai": "^0.85.1",
@@ -23,6 +24,7 @@
     "@xyflow/react": "^12.11.6",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
+    "ssh2": "^1.17.0",
     "zod": "^4.6.5",
     "zustand": "^5.0.15"
   },
@@ -30,6 +32,7 @@
     "@types/node": "^26.6.1",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
+    "@types/ssh2": "^1.15.6",
     "@vitejs/plugin-react": "^5.2.0",
     "electron": "^44.4.2",
     "electron-vite": "^5.0.0",

@@ -15,7 +15,11 @@ export default defineConfig({
         input: { index: resolve(import.meta.dirname, 'src/main/index.ts') },
         // MCP SDK 及其依赖为 CJS 动态 require，打入 ESM bundle 会炸（R1），
         // 一律外部化，运行时从 node_modules 加载
-        external: ['@modelcontextprotocol/sdk', 'zod']
+        // ssh2 同理：CJS + 可选原生 cpu-features，打入 ESM bundle 会炸
+        // zod 没有在 src 里直接 import，但必须保持 external 且留在 dependencies：
+        // 它是 @modelcontextprotocol/sdk 的运行时依赖，SDK 在 external 状态下会
+        // 在运行时 require('zod')，靠 node_modules 解析 —— 打进 bundle 反而会炸。
+        external: ['@modelcontextprotocol/sdk', 'zod', 'ssh2']
       }
     }
   },

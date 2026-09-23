@@ -102,6 +102,13 @@ test('deriveTopology：LLDP 未开启的设备被跳过，不产出节点错误'
 test('guessRole 按型号/名字推断角色', () => {
   assert.equal(guessRole('AR1', 'AR2220'), 'router')
   assert.equal(guessRole('Core-SW1', 'S5735'), 'switch')
+  assert.equal(guessRole('FW1', 'USG6000V'), 'firewall')
+  assert.equal(guessRole('USG5500'), 'firewall')
+  assert.equal(guessRole('AC1', 'AC6005'), 'wlan')
+  assert.equal(guessRole('AP-1', 'AP4050DN'), 'wlan')
+  assert.equal(guessRole('Server-1', 'Server'), 'server')
+  assert.equal(guessRole('Cloud-1', 'Cloud'), 'cloud')
+  assert.equal(guessRole('Hub-1', 'Hub'), 'cloud')
   assert.equal(guessRole('PC-1'), 'pc')
   assert.equal(guessRole('某设备'), 'unknown')
 })

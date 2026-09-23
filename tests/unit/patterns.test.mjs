@@ -59,9 +59,18 @@ test('提示符：~ 前缀标记未提交状态', () => {
   assert.equal(split.view, 'ospf')
 })
 
-test('提示符防误判：输出正文里的 [OK] 在已知宿主名时被拒绝', () => {
-  assert.ok(matchPromptTail('\n[OK]'), '无宿主名约束时 [OK] 会命中（这是已知局限）')
-  assert.equal(matchPromptTail('\n[OK]', 'Huawei'), null, '有宿主名约束时必须拒绝')
+test('提示符防误判：输出正文里的 [OK] 一律被拒绝（T4.3 起不再依赖宿主名约束）', () => {
+  // R11：过去这里断言「无宿主名约束时 [OK] 会命中」——那是握手期的真实缺陷：
+  // 握手阶段还没有宿主名可约束，一旦把 [OK] 锁成宿主名，整段会话的提示符判定都会错。
+  assert.equal(matchPromptTail('\n[OK]'), null, '没有宿主名约束时也不能把 [OK] 当提示符')
+  assert.equal(matchPromptTail('\n[OK]', 'Huawei'), null)
+  assert.equal(matchPromptTail('\n[ERROR]'), null)
+  assert.equal(matchPromptTail('\n[Y/N]'), null)
+  assert.equal(matchPromptTail('\n[1]'), null, '纯数字不是宿主名')
+  // 正常宿主名（含数字的也一样）不受影响
+  assert.ok(matchPromptTail('\n<Huawei>'))
+  assert.ok(matchPromptTail('\n[R1]'))
+  assert.ok(matchPromptTail('\n[Core-SW1]'))
 })
 
 test('提示符防误判：含空白的方括号内容不被当作提示符', () => {

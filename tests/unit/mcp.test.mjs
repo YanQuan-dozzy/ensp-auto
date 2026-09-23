@@ -5,7 +5,13 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { createMcpServer, TOOLS } from '../.build/harness.mjs'
+import {
+  createMcpServer,
+  TOOLS,
+  builtinTools,
+  agentTools,
+  McpClientManager
+} from '../.build/harness.mjs'
 
 async function rpcClient(base, log = console.error) {
   let sessionId = null
@@ -115,4 +121,53 @@ test('MCP：CallTool 执行异常被捕获为 isError，服务不崩', async (t)
   })
   const result = await client.call('tools/call', { name: 'list_snapshots', arguments: { deviceId: '127.0.0.1:1' } })
   assert.equal(result.isError, true)
+})
+
+// ———————————————— D7（2026-09-23）：对外出口绝不暴露外部工具 ————————————————
+
+test('D7：外部工具即使 risk=write（受信任）也不进 ListTools，调用返回未知工具', async (t) => {
+  const fakeExternal = {
+    name: 'mcp__files__read_file',
+    description: '[MCP · files] 外部工具',
+    risk: 'write', // 受信任的外部工具正是这个等级 —— 旧实现会在这里穿透 danger 过滤
+    scope: 'local',
+    schema: { type: 'object', properties: {} },
+    handler: async () => ({ ok: true, data: {}, meta: { ms: 1 } })
+  }
+  const deps = {
+    // 模拟误把 agentTools（含外部工具）塞给对外出口
+    tools: [...TOOLS, fakeExternal],
+    buildContext: () => ({})
+  }
+  const srv = await createMcpServer({ deps, port: 0 })
+  t.after(() => void srv.close())
+  const client = await rpcClient(srv.url)
+  await client.call('initialize', {
+    protocolVersion: '2025-03-26',
+    capabilities: {},
+    clientInfo: { name: 't', version: '1' }
+  })
+
+  const listed = await client.call('tools/list', {})
+  const names = listed.tools.map((x) => x.name)
+  assert.ok(!names.includes('mcp__files__read_file'), '外部工具不得出现在对外清单')
+  assert.ok(names.every((n) => TOOLS.some((t) => t.name === n)), '外露清单只含内置工具')
+  assert.ok(names.includes('list_devices'), '内置工具照常外露')
+
+  const called = await client.call('tools/call', {
+    name: 'mcp__files__read_file',
+    arguments: {}
+  })
+  assert.equal(called.isError, true)
+  assert.match(called.content[0].text, /未知工具/, '照着名字也调不动（R31 的口径）')
+})
+
+test('D7：builtinTools / agentTools 是两个集合，对外出口用前者', () => {
+  const mgr = new McpClientManager({ onChange() {} })
+  const settingsOff = { mcp: { exposeToAgent: false }, permission: { externalToolConfirm: false } }
+  const settingsOn = { mcp: { exposeToAgent: true }, permission: { externalToolConfirm: false } }
+  // 无外部连接时两者数量一致，但语义不同：前者恒等于内置表
+  assert.equal(agentTools(settingsOff, mgr).length, TOOLS.length)
+  assert.equal(agentTools(settingsOn, mgr).length, TOOLS.length)
+  assert.ok(builtinTools().every((t) => !t.name.startsWith('mcp__')))
 })

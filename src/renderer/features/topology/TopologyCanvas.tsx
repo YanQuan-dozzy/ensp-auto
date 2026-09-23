@@ -1,125 +1,90 @@
-import { memo, useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
-  Background,
-  BackgroundVariant,
-  Controls,
-  Handle,
-  MiniMap,
-  Position,
-  ReactFlow,
+  ReactFlowProvider,
+  addEdge,
+  applyEdgeChanges,
   applyNodeChanges,
+  useReactFlow,
   type Connection,
   type Edge,
   type Node,
   type NodeChange,
-  type NodeProps,
   type OnConnect,
+  type OnEdgesChange,
   type OnNodesChange
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import { useApp } from '@/stores/app'
 import type { TopologyLink, TopologyNode, TopologyRole } from '@shared/types'
+import { computeAutoLayout } from './autoLayout'
+import {
+  TopoNodeData,
+  TopoNodeMemo,
+  TopoEdge,
+  linkKeyStr,
+  computeUsedHandles,
+  toFlowNodes,
+  toFlowEdges
+} from './TopoRender'
+import './topology.css'
+import { useTopoEditing } from './useTopoEditing'
+import { useTopoFinder } from './useTopoFinder'
+import { TopologyToolbar } from './TopologyToolbar'
+import { TopologyStage } from './TopologyStage'
+import { TopoContextMenu, TopoDetailPanel, TopoFinderPanel } from './TopoOverlays'
 
-/**
- * 拓扑画布（v0.3 / F-5.4 手动补画 + F-5.5 展示）。
- *
- * - 数据源：主进程 TopologyStore 的合并拓扑（实采推导 + 手动补画）
- * - 手动补画：画布内任意节点都可拖动（落位即保存）；工具栏可新增节点；
- *   任意两个节点间拖线即新增链路（F-5.4）
- * - 工具栏「从设备刷新」触发 refresh_topology 实采推导
- */
-
-interface TopoNodeData {
-  label: string
-  role: TopologyRole
-  model?: string
-  [key: string]: unknown
-}
-
-const ROLE_LABEL: Record<TopologyRole, string> = {
-  router: '路由器',
-  switch: '交换机',
-  pc: '终端',
-  unknown: '未知'
-}
-
-const NODE_COLOR: Record<TopologyRole, string> = {
-  router: 'var(--agent)',
-  switch: 'var(--info)',
-  pc: 'var(--success)',
-  unknown: 'var(--text-muted)'
-}
-
-function TopoNode(props: NodeProps): ReactNode {
-  const data = props.data as TopoNodeData
-  const selected = props.selected ?? false
-  const color = NODE_COLOR[data.role] ?? 'var(--text-muted)'
-  return (
-    <div
-      className="topo-node"
-      style={{
-        borderColor: selected ? 'var(--accent)' : color,
-        background: 'var(--bg-elevated)'
-      }}
-    >
-      <Handle type="target" position={Position.Left} />
-      <div className="topo-node-name" style={{ color: 'var(--text-primary)' }}>
-        {data.label}
-      </div>
-      <div className="topo-node-sub" style={{ color }}>
-        {ROLE_LABEL[data.role] ?? data.role}
-        {data.model ? ` · ${data.model}` : ''}
-      </div>
-      <Handle type="source" position={Position.Right} />
-    </div>
-  )
-}
-
-const TopoNodeMemo = memo(TopoNode)
-
-const toFlowNodes = (nodes: TopologyNode[]): Node[] =>
-  nodes.map((n, i) => ({
-    id: n.id,
-    position: {
-      x: Number.isFinite(n.x) ? (n.x as number) : ((i % 4) * 240 + 40),
-      y: Number.isFinite(n.y) ? (n.y as number) : (Math.floor(i / 4) * 130 + 40)
-    },
-    data: { label: n.name, role: n.role, ...(n.model ? { model: n.model } : {}) },
-    type: 'topo'
-  }))
-
-const toFlowEdges = (links: TopologyLink[], nodeIds: Set<string>): Edge[] =>
-  links
-    .filter((l) => nodeIds.has(l.from) && nodeIds.has(l.to))
-    .map((l) => ({ id: l.id, source: l.from, target: l.to, type: 'smoothstep', label: l.label }))
-
-/** 画布节点的 data 收口成业务类型（避免在组件各处以 unknown 裸操） */
-const dataOf = (node: Node): TopoNodeData => node.data as TopoNodeData
-
-export function TopologyCanvas(): ReactNode {
+function FlowInner(): ReactNode {
   const topology = useApp((s) => s.topology)
   const refreshing = useApp((s) => s.topologyRefreshing)
   const refresh = useApp((s) => s.refreshTopology)
   const saveManual = useApp((s) => s.saveManualTopology)
+  const removeTopology = useApp((s) => s.removeTopology)
   const importTopology = useApp((s) => s.importTopology)
+  const discoverTopoFiles = useApp((s) => s.discoverTopoFiles)
+  const importTopoPath = useApp((s) => s.importTopoPath)
+  const connect = useApp((s) => s.connect)
+  const { fitView } = useReactFlow()
 
   const [nodes, setNodes] = useState<Node[]>(() => toFlowNodes(topology.nodes))
+  const [edges, setEdges] = useState<Edge[]>([])
+  const [dragging, setDragging] = useState(false)
   const [addName, setAddName] = useState('')
   const [addRole, setAddRole] = useState<TopologyRole>('unknown')
-  const [importNotice, setImportNotice] = useState('')
+  const canvasRef = useRef<HTMLDivElement>(null)
+  const addInputRef = useRef<HTMLInputElement>(null)
 
-  // 拓扑数据变化（刷新 / 合并 / 加载）时重建画布节点与连线
+  const roleOf = useMemo(
+    () => new Map(topology.nodes.map((n) => [n.id, n.role])),
+    [topology.nodes]
+  )
+
+  // 节点中心位置（与 toFlowNodes 相同的 x/y 兜底），用于为连线挑选上下/左右连接点
+  const positionsOf = useMemo(
+    () =>
+      new Map(
+        topology.nodes.map((n, i) => [
+          n.id,
+          {
+            x: Number.isFinite(n.x) ? (n.x as number) : (i % 4) * 240 + 40,
+            y: Number.isFinite(n.y) ? (n.y as number) : Math.floor(i / 4) * 130 + 40
+          }
+        ])
+      ),
+    [topology.nodes]
+  )
+
+  // 拓扑数据变化（刷新 / 合并 / 加载 / 手动保存）时重建画布
   useEffect(() => {
     setNodes(toFlowNodes(topology.nodes))
-  }, [topology])
-
-  const edges = useMemo(
-    () => toFlowEdges(topology.links, new Set(topology.nodes.map((n) => n.id))),
-    [topology]
-  )
+    setEdges(toFlowEdges(topology.links, roleOf, positionsOf))
+  }, [topology, roleOf, positionsOf])
 
   const onNodesChange: OnNodesChange = useCallback((changes: NodeChange[]) => {
     setNodes((ns) => applyNodeChanges(changes, ns))
+  }, [])
+
+  const onEdgesChange: OnEdgesChange = useCallback((changes) => {
+    setEdges((es) => applyEdgeChanges(changes, es))
   }, [])
 
   const manualNodes = useMemo(
@@ -131,38 +96,90 @@ export function TopologyCanvas(): ReactNode {
     [topology]
   )
 
-  // 拖动落位即保存：被拖过的节点（无论来源）并入手动集，写入主进程
-  const onNodeDragStop = useCallback(
-    (_e: unknown, node: Node) => {
-      const d = dataOf(node)
-      const others = manualNodes.filter((n) => n.id !== node.id)
-      const moved: TopologyNode = {
-        id: node.id,
-        name: d.label,
-        role: d.role,
-        ...(typeof d.model === 'string' && d.model ? { model: d.model } : {}),
-        x: node.position.x,
-        y: node.position.y,
-        source: 'manual'
-      }
-      void saveManual({ nodes: [...others, moved], links: manualLinks })
-    },
-    [manualNodes, manualLinks, saveManual]
+  // 编辑交互与导入/发现均外提为 hook（useTopoEditing.ts / useTopoFinder.ts），FlowInner 只做装配
+  const editing = useTopoEditing({
+    topology,
+    flowNodes: nodes,
+    flowEdges: edges,
+    manualNodes,
+    manualLinks,
+    saveManual,
+    removeTopology,
+    endDrag: () => setDragging(false),
+    canvasRef
+  })
+  const finder = useTopoFinder({ importTopology, discoverTopoFiles, importTopoPath })
+
+  /**
+   * 几何快照（T4.5）：只在「非拖动」时跟随最新 nodes/edges。
+   * version 是 useMemo 的稳定判据 —— 拖动期间它不变，于是「未使用连接点」不会每帧重算。
+   */
+  const geomRef = useRef({ nodes, edges, version: 0 })
+  if (!dragging && (geomRef.current.nodes !== nodes || geomRef.current.edges !== edges)) {
+    geomRef.current = { nodes, edges, version: geomRef.current.version + 1 }
+  }
+
+  // 未使用连接点：按几何计算。拖动中冻结（version 不变），拖动结束后刷新一次（T4.5）
+  const usedByNode = useMemo(
+    () => computeUsedHandles(geomRef.current.nodes, geomRef.current.edges),
+    [geomRef.current.version, dragging]
   )
+
+  /**
+   * 节点 data 复用缓存（T4.5）：拖动一帧就是一次 nodes 变化，过去每个节点都会拿到
+   * 全新的 data 对象，React Flow 于是重渲所有节点。现在只有「used 变了 / 进入退出编辑 /
+   * 上游 data 换了引用」的节点才换 data。
+   */
+  const dataCacheRef = useRef(new Map<string, { key: string; data: TopoNodeData; source: unknown }>())
+
+  const renderNodes = useMemo<Node[]>(() => {
+    const nextCache = new Map<string, { key: string; data: TopoNodeData; source: unknown }>()
+    const out = nodes.map((n) => {
+      const used = usedByNode.get(n.id)
+      const editingFlag = editing.editingId === n.id
+      const usedKey = used ? `${+used.left}${+used.right}${+used.top}${+used.bottom}` : ''
+      const key = `${editingFlag ? 1 : 0}|${usedKey}`
+      const cached = dataCacheRef.current.get(n.id)
+      const data =
+        cached && cached.key === key && cached.source === n.data
+          ? cached.data
+          : {
+              ...(n.data as TopoNodeData),
+              used,
+              editing: editingFlag,
+              commitRename: (name: string) => editing.commitRename(n.id, name),
+              cancelRename: editing.cancelRename
+            }
+      nextCache.set(n.id, { key, data, source: n.data })
+      return { ...n, data }
+    })
+    dataCacheRef.current = nextCache
+    return out
+  }, [nodes, usedByNode, editing.editingId, editing.commitRename, editing.cancelRename])
 
   const onConnect: OnConnect = useCallback(
     (conn: Connection) => {
-      if (!conn.source || !conn.target) return
+      if (editing.locked) return
+      // 自环（起点＝终点）无意义，丢弃避免生成坏边
+      if (!conn.source || !conn.target || conn.source === conn.target) return
+      const key = linkKeyStr(conn.source, conn.target)
+      // 该端点对已有链路（live）→ 忽略重复拖线，避免叠线
+      if (topology.links.some((l) => linkKeyStr(l.from, l.to) === key)) return
+      // 手动链路基于「当前 store 的手动集」追加（而非 memo 快照），
+      // 连续快速拖线互相不覆盖；墓碑由主进程 applyManual 按 id 合并并复活
+      const baseLinks = topology.links.filter((l) => l.source === 'manual')
+      const linkId = `m-${Date.now()}`
       const link: TopologyLink = {
-        id: `m-${Date.now()}`,
+        id: linkId,
         from: conn.source,
         to: conn.target,
         label: '手动连线',
         source: 'manual'
       }
-      void saveManual({ nodes: manualNodes, links: [...manualLinks, link] })
+      setEdges((es) => addEdge({ ...conn, id: linkId, type: 'smoothstep' }, es))
+      void saveManual({ nodes: manualNodes, links: [...baseLinks, link] })
     },
-    [manualNodes, manualLinks, saveManual]
+    [editing.locked, topology, manualNodes, saveManual]
   )
 
   const addNode = useCallback(() => {
@@ -178,95 +195,148 @@ export function TopologyCanvas(): ReactNode {
     }
     void saveManual({ nodes: [...manualNodes, node], links: manualLinks })
     setAddName('')
+    editing.setMenu(null)
   }, [addName, addRole, manualNodes, manualLinks, saveManual])
 
-  // v1.0 前置：导入 eNSP 工程文件（F-5.2，来源一，最权威）
-  const onImportFile = useCallback(async () => {
-    setImportNotice('')
-    const r = await importTopology()
-    if (!r) {
-      setImportNotice('已取消或导入失败')
-      return
-    }
-    const w = r.report.warnings.length ? `（${r.report.warnings.length} 条警告）` : ''
-    setImportNotice(`已导入 ${r.report.devices} 设备 / ${r.report.links} 链路${w}；文件层在其他来源之上优先。`)
-  }, [importTopology])
+  // —— 自适应布局 ——
+  const runAutoLayout = useCallback(() => {
+    const pos = computeAutoLayout(topology.nodes, topology.links)
+    const next: TopologyNode[] = topology.nodes.map((n) => {
+      const p = pos.get(n.id)
+      return {
+        id: n.id,
+        name: n.name,
+        role: n.role,
+        ...(n.model ? { model: n.model } : {}),
+        ...(p ? { x: Math.round(p.x), y: Math.round(p.y) } : {}),
+        source: 'manual'
+      }
+    })
+    editing.setMenu(null)
+    void saveManual({ nodes: next, links: manualLinks }).then(() => {
+      window.setTimeout(() => fitView({ padding: 0.2, duration: 300 }), 50)
+    })
+  }, [topology.nodes, topology.links, manualLinks, saveManual, fitView])
+
+  const menuNode =
+    editing.menu?.kind === 'node' ? topology.nodes.find((n) => n.id === editing.menu?.nodeId) : undefined
+
+  // —— 设备详情面板数据 ——
+  const detailNode = editing.detailId ? topology.nodes.find((n) => n.id === editing.detailId) : undefined
+  const detailLinks = detailNode
+    ? topology.links
+        .filter((l) => l.from === detailNode.id || l.to === detailNode.id)
+        .map((l) => ({
+          peer: (l.from === detailNode.id ? l.to : l.from).split(':').pop() ?? '',
+          label: l.label
+        }))
+    : []
+  const detailPort = detailNode?.deviceId ? Number.parseInt(detailNode.deviceId.split(':').slice(-1)[0] ?? '', 10) : NaN
 
   return (
     <div className="topology-wrap">
-      <div className="topology-toolbar">
-        <input
-          className="topology-input"
-          value={addName}
-          onChange={(e) => setAddName(e.target.value)}
-          placeholder="新节点名（如 PC-1）"
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') addNode()
-          }}
-        />
-        <select
-          className="topology-input"
-          value={addRole}
-          onChange={(e) => setAddRole(e.target.value as TopologyRole)}
-        >
-          {(Object.keys(ROLE_LABEL) as TopologyRole[]).map((r) => (
-            <option key={r} value={r}>
-              {ROLE_LABEL[r]}
-            </option>
-          ))}
-        </select>
-        <button className="btn" onClick={addNode}>
-          添加节点
-        </button>
-        <button className="btn" onClick={() => void onImportFile()}>
-          导入工程文件
-        </button>
-        <button className="btn primary" onClick={() => void refresh()} disabled={refreshing}>
-          {refreshing ? '刷新中…' : '从设备刷新'}
-        </button>
-        {importNotice ? (
-          <span className="topology-hint" title={importNotice}>
-            {importNotice}
-          </span>
-        ) : (
-          <span className="topology-hint">拖动节点落位即保存；从节点右侧把手拖到另一节点左侧画链路</span>
-        )}
-      </div>
-      <div className="topology-canvas">
-        <ReactFlow
-          nodes={nodes}
-          edges={edges}
-          nodeTypes={nodeTypes}
-          onNodesChange={onNodesChange}
-          onNodeDragStop={onNodeDragStop}
-          onConnect={onConnect}
-          fitView
-          minZoom={0.2}
-          maxZoom={2}
-          proOptions={{ hideAttribution: true }}
-        >
-          <Background variant={BackgroundVariant.Dots} gap={22} size={1} />
-          <Controls />
-          <MiniMap pannable zoomable />
-        </ReactFlow>
-      </div>
-      <style>{`
-        .topology-wrap { display: flex; flex-direction: column; height: 100%; min-height: 0; }
-        .topology-toolbar { display: flex; gap: 8px; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--border-default); flex-wrap: wrap; }
-        .topology-input { background: var(--bg-surface); color: var(--text-primary); border: 1px solid var(--border-default); border-radius: 4px; padding: 4px 8px; font-size: var(--text-sm, 12px); }
-        .topology-input:focus { outline: 1px solid var(--accent); }
-        .topology-hint { margin-left: auto; color: var(--text-muted); font-size: 11px; }
-        .topology-canvas { flex: 1; min-height: 0; }
-        .topo-node { border: 1.5px solid; border-radius: 8px; padding: 10px 14px; min-width: 120px; text-align: center; box-shadow: var(--shadow-pop); font-size: 12px; }
-        .topo-node-name { font-weight: 600; white-space: nowrap; }
-        .topo-node-sub { font-size: 11px; margin-top: 2px; }
-        .react-flow__edge-text { fill: var(--text-muted); font-size: 10px; }
-        .react-flow__controls button { background: var(--bg-elevated); color: var(--text-secondary); border-bottom: 1px solid var(--border-default); }
-        .react-flow__controls button:hover { background: var(--bg-hover); }
-        .react-flow__attribution { display: none; }
-      `}</style>
+      <TopologyToolbar
+        addInputRef={addInputRef}
+        addName={addName}
+        setAddName={setAddName}
+        addRole={addRole}
+        setAddRole={setAddRole}
+        addNode={addNode}
+        locked={editing.locked}
+        importNotice={finder.importNotice}
+        runAutoLayout={runAutoLayout}
+        onImportFile={finder.onImportFile}
+        openFinder={finder.openFinder}
+        refreshing={refreshing}
+        refresh={refresh}
+      />
+      <TopologyStage
+        canvasRef={canvasRef}
+        renderNodes={renderNodes}
+        edges={edges}
+        nodeTypes={nodeTypes}
+        edgeTypes={edgeTypes}
+        onNodesChange={onNodesChange}
+        onEdgesChange={onEdgesChange}
+        onNodeDragStart={() => setDragging(true)}
+        onNodeDragStop={editing.onNodeDragStop}
+        onConnect={onConnect}
+        onSelectionChange={editing.onSelectionChange}
+        onNodeContextMenu={editing.onNodeContextMenu}
+        onEdgeContextMenu={editing.onEdgeContextMenu}
+        onPaneContextMenu={editing.onPaneContextMenu}
+        onNodeClick={editing.onNodeClick}
+        onNodeDoubleClick={editing.onNodeDoubleClick}
+        onPaneClick={() => {
+          editing.setMenu(null)
+          editing.closeDetail()
+        }}
+        locked={editing.locked}
+        toggleLock={editing.toggleLock}
+      >
+        {detailNode ? (
+          <TopoDetailPanel
+            node={detailNode}
+            port={detailPort}
+            links={detailLinks}
+            onClose={editing.closeDetail}
+            onConnect={(port) => void connect(port)}
+          />
+        ) : null}
+        {finder.finderOpen ? (
+          <TopoFinderPanel
+            finder={finder.finder}
+            loading={finder.finderLoading}
+            onClose={() => finder.setFinderOpen(false)}
+            onRefresh={() => void finder.refreshFinder()}
+            onImport={(path) => void finder.importFromFinder(path)}
+          />
+        ) : null}
+        {editing.menu ? (
+          <TopoContextMenu
+            menu={editing.menu}
+            nodeName={menuNode?.name}
+            locked={editing.locked}
+            onRename={(id) => editing.setEditingId(id)}
+            onSetSub={(sub) => {
+              if (editing.menu) editing.setMenu({ ...editing.menu, sub })
+            }}
+            onDisconnect={(id) => {
+              if (id) editing.disconnectNode(id)
+            }}
+            onDeleteNode={(id) => {
+              if (id) editing.deleteNodes([id])
+            }}
+            onChangeRole={(id, r) => {
+              if (id) editing.changeRole(id, r)
+            }}
+            onDeleteEdge={(id) => {
+              if (id) editing.deleteEdges([id])
+            }}
+            onClose={() => editing.setMenu(null)}
+            onFocusAdd={() => {
+              editing.setMenu(null)
+              addInputRef.current?.focus()
+            }}
+            onRunLayout={runAutoLayout}
+            onFitView={() => {
+              editing.setMenu(null)
+              void fitView({ padding: 0.2, duration: 250 })
+            }}
+          />
+        ) : null}
+      </TopologyStage>
     </div>
   )
 }
 
+export function TopologyCanvas(): ReactNode {
+  return (
+    <ReactFlowProvider>
+      <FlowInner />
+    </ReactFlowProvider>
+  )
+}
+
 const nodeTypes = { topo: TopoNodeMemo }
+const edgeTypes = { topo: TopoEdge }

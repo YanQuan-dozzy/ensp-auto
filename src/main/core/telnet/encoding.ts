@@ -101,9 +101,14 @@ export interface EncodingVerdict {
  * （GBK 的后续字节落在 0x40–0xFE，其中约一半不是合法的 UTF-8 后续字节），
  * 所以严格校验是可靠的主判据。
  */
-export function detectEncodingDetailed(buf: Buffer): EncodingVerdict {
-  if (buf.length === 0) return { encoding: 'utf8', confident: false }
-  if (isAscii(buf)) return { encoding: 'utf8', confident: false }
+export function detectEncodingDetailed(rawBuf: Buffer): EncodingVerdict {
+  if (rawBuf.length === 0) return { encoding: 'utf8', confident: false }
+  if (isAscii(rawBuf)) return { encoding: 'utf8', confident: false }
+
+  // T4.3：TCP 分片会把一个汉字劈成两半（前 1~2 字节在这一片、剩下的在下一片），
+  // 此时严格 UTF-8 校验必然失败 → 误锁 GBK，之后所有中文都成乱码。
+  // 判定用的样本先切掉尾部不完整序列，等下一片到了自然能通过校验。
+  const buf = trimIncompleteTail(rawBuf)
 
   if (isValidUtf8(buf)) {
     const text = utf8Loose.decode(buf)
@@ -113,6 +118,27 @@ export function detectEncodingDetailed(buf: Buffer): EncodingVerdict {
   }
 
   return getGbkDecoder() ? { encoding: 'gbk', confident: true } : { encoding: 'utf8', confident: true }
+}
+
+/**
+ * 切掉尾部「不完整的多字节序列」（UTF-8 语义）。
+ *
+ * 只处理结尾最多 3 个字节：找到领头字节后比较它需要几字节、实际还剩几字节，
+ * 不够就截掉。完整的结尾原样返回，因此对正常输入没有任何影响。
+ */
+export function trimIncompleteTail(buf: Buffer): Buffer {
+  for (let back = 1; back <= 4 && back <= buf.length; back++) {
+    const b = buf[buf.length - back]!
+    if ((b & 0x80) === 0) return buf // 结尾是 ASCII → 必定完整
+    if ((b & 0xc0) === 0xc0) {
+      // 领头字节：算出它需要的总长度
+      const need = (b & 0xe0) === 0xc0 ? 2 : (b & 0xf0) === 0xe0 ? 3 : (b & 0xf8) === 0xf0 ? 4 : 0
+      if (need === 0) return buf // 非法领头字节，交给校验器判
+      return back < need ? buf.subarray(0, buf.length - back) : buf
+    }
+    // 0x80..0xbf：后续字节，继续往前找领头
+  }
+  return buf
 }
 
 /**

@@ -1,42 +1,79 @@
 import { randomUUID } from 'node:crypto'
-import type { Message, TextContent } from '@earendil-works/pi-ai'
+import type { AssistantMessage, Message, TextContent } from '@earendil-works/pi-ai'
 import type { AgentEvent, GateDecision, RunInput, SessionNode, Settings } from '@shared/types'
 import { classifyDanger } from '@shared/risk'
+import {
+  GATE_DENIED_REASON,
+  GATE_DENIED_SUMMARY,
+  planDangerGate
+} from '@shared/gate-policy'
+import { activeProfile } from '@shared/profiles'
+import { composeUserMessage } from '@shared/attachments'
+import {
+  describeCompaction,
+  estimateChars,
+  planCompaction,
+  planRetry,
+  truncateToolResult
+} from '@shared/runtime-policy'
 import { toLLMTools, type ToolContext, type ToolSpec } from '../tools/registry'
-import { buildLLM } from './llm/models'
+import { buildLLM, type LLMHandle, type LLMSettings } from './llm/models'
 import { consumeEvent, newTurn, type CollectedToolCall } from './llm/translate'
+import { buildAgentSystemPrompt } from './llm/prompt'
+import {
+  explainFailure,
+  isOverflowFailure,
+  isRetryableFailure,
+  synthError,
+  type ClassifiableMessage as Classifiable
+} from './llm/failure'
 import { EventStream, summarizeToolCall, type AgentDeps, type AgentRuntime } from './runtime.iface'
 
-const SYSTEM_PROMPT = `你是 eNSP 网络实验代理。用户用自然语言下达实验目标，你负责自主完成。
+/**
+ * 可中止的退避等待（v1.7）。
+ *
+ * 为什么不用 `setTimeout` + `await`：用户在重试等待期间点「停止」必须立刻生效，
+ * 否则「停止」按钮看起来是坏的（要等满 1.6s 才有反应）。这里额外监听 abort，
+ * 并且清掉监听与 timer，避免每次重试都留一个悬挂的 timeout。
+ */
+function sleepAbortable(ms: number, signal: AbortSignal): Promise<void> {
+  if (ms <= 0 || signal.aborted) return Promise.resolve()
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(finish, ms)
+    function finish(): void {
+      clearTimeout(timer)
+      signal.removeEventListener('abort', finish)
+      resolve()
+    }
+    signal.addEventListener('abort', finish, { once: true })
+  })
+}
 
-可用设备：本机 eNSP 虚拟设备（Huawei VRP），通过 127.0.0.1 的端口访问。
-
-工作方式：
-1. 先用 list_devices 或 scan_devices 了解有哪些设备可用，不要假设设备已经连接。
-2. 需要了解设备现状时，优先用 get_device_context 一次拿全（型号、版本、视图、接口），
-   不要逐条发 display 命令 —— 每次往返都有成本。
-3. 只读命令（display / show）用 run_show_command，可以自由执行。
-4. 修改配置前必须先 save_config_snapshot 建立快照。这是硬性前提，不可跳过。
-5. 破坏性命令会被闸门拦截并要求人工确认，这是设计如此，不要试图绕过。
-6. 需要了解设备间拓扑关系时，用 get_topology 查看当前拓扑；必要时用 refresh_topology
-   让代理去已连接的设备上采集 LLDP 邻居重新推导。
-
-判定纪律：
-- 工具返回 ok=false 时，说明操作失败了。读 error.code 与 error.raw 判断原因，
-  改道或修正后重试，不要假设失败的操作其实成功了。
-- 工具返回里 settled 为 "quiet" 时说明回显是静默兜底判定的，内容可能不完整。
-  如果结论依赖这段内容的完整性，重新执行一次。
-- awaitingConfirm 为 true 说明命令停在了设备的 [Y/N] 确认提示上，需要用户决策。
-
-回答要求：
-- 用中文，简洁、结构化。涉及配置变更时列出改了什么、依据哪次快照。
-- 不要复述工具原始回显，用你的话总结结论。
-- 任务开始时先用一到三句话说明你的计划。`
+/**
+ * 自研 ReAct 运行时。
+ *
+ * v1.5：模型配置从「全局三件套」改为「活跃档案」，并把用户指令与附件一起注入；
+ * 系统提示词的拼装搬到了 ./llm/prompt.ts（可单测、也被一键增强复用同一口径）。
+ */
 
 export interface ReactRuntimeOptions {
   apiKey: string
-  /** 是否允许危险操作走到闸门（false 时直接拒绝，用于更严格的策略） */
+  /**
+   * 危险工具是否走人工闸门确认。
+   *
+   * false = 用户在设置里关掉了「危险操作需人工确认」→ **直接执行**（决策 D1：以界面文案
+   * 与类型注释为准，而不是把 false 当成"一律拒绝"），跳过的事实会在 tool_end 摘要里显式标注。
+   * 命令级危险清单（classifyDanger）不在此开关的作用域内，始终生效。
+   */
   allowDangerousWithGate?: boolean
+  /**
+   * 覆盖 LLM 装配（默认走 buildLLM）。
+   *
+   * 存在的意义：让「设置项到底有没有进请求」可被自动化验证 ——
+   * 用桩 handle 就能抓住真实下发的 systemPrompt / temperature / model，
+   * 而不必启一个真实 provider 去赌（R53 那类「设置是死的」缺陷正是靠这一层才测得到）。
+   */
+  buildLlm?: (settings: LLMSettings) => Promise<LLMHandle>
 }
 
 interface ToolRunResult {
@@ -84,26 +121,37 @@ export class ReactRuntime implements AgentRuntime {
 
   run(input: RunInput): AsyncIterable<AgentEvent> {
     const stream = new EventStream<AgentEvent>()
-    void this.drive(input, stream).catch((e: unknown) => {
-      stream.push({
-        type: 'error',
-        message: e instanceof Error ? e.message : String(e),
-        recoverable: false
-      })
-      stream.push({ type: 'done', reason: 'failed' })
-      stream.close()
-    })
+    // 两条路径都必须 close()：
+    // - 正常结束：drive 里最后一件事是 push({type:'done'})，但**没有任何地方关流**，
+    //   而宿主（services.startAgent）是 `for await` 到迭代器自然结束、不 break 的写法，
+    //   于是任务看似跑完、其实消费者永远挂住 —— flushAssistant / 任务结束通知 /
+    //   active.delete 全在 finally 里，一个都不会执行（会话会一直显示「运行中」）。
+    // - 异常：补一条 error + done 事件后关流（保持原有语义）。
+    void this.drive(input, stream).then(
+      () => stream.close(),
+      (e: unknown) => {
+        stream.push({
+          type: 'error',
+          message: e instanceof Error ? e.message : String(e),
+          recoverable: false
+        })
+        stream.push({ type: 'done', reason: 'failed' })
+        stream.close()
+      }
+    )
     return stream
   }
 
   private async drive(input: RunInput, out: EventStream<AgentEvent>): Promise<void> {
     const settings = this.deps.getSettings()
+    // v1.5：模型配置按「活跃档案」取 —— provider/端点/模型/轮次/温度都跟着档案走
+    const profile = activeProfile(settings.agent)
 
     // 每个任务新建 LLM 装配（Key 或 provider 变更即时生效；provider 工厂是同步注册）
-    const handle = await buildLLM({
-      provider: settings.agent.provider,
-      baseUrl: settings.agent.baseUrl,
-      model: settings.agent.model,
+    const handle = await (this.options.buildLlm ?? buildLLM)({
+      provider: profile.provider,
+      baseUrl: profile.baseUrl,
+      model: profile.model,
       apiKey: this.options.apiKey
     })
     const model = handle.models.getModel(handle.provider, handle.modelId)
@@ -116,14 +164,48 @@ export class ReactRuntime implements AgentRuntime {
 
     // pi-ai Context：systemPrompt 与 messages、tools 分离的 transcript 结构
     // v0.4：先注入会话树祖先链（历史），再追加本次指令
-    const messages: Message[] = [...historyToMessages(input.history ?? []), {
-      role: 'user',
-      content: input.text,
-      timestamp: Date.now()
-    }]
+    // v1.5：附件清单与文本预览拼进用户消息，完整内容留给 read_attachment 按需取
+    const messages: Message[] = [
+      ...historyToMessages(input.history ?? []),
+      {
+        role: 'user',
+        content: composeUserMessage(input.text, input.attachments ?? []),
+        timestamp: Date.now()
+      }
+    ]
 
     let planEmitted = false
-    const maxRounds = Math.max(1, settings.agent.maxRounds)
+    const maxRounds = Math.max(1, profile.maxRounds)
+    const retry = settings.retry
+    const compaction = settings.compaction
+    const contextWindow = model.contextWindow
+
+    // system prompt 每个任务只拼一次（技能/自定义指令运行期不变）。
+    // D14：字符预算必须把它一并计入 —— transcriptMaxChars 的压缩只作用在 messages 上，
+    // 若 skill 注入无上限，system prompt 再大压缩也追不上，会出现「上下文看着很小却总报溢出」。
+    const systemPrompt = buildAgentSystemPrompt(
+      this.deps.getSkills?.(),
+      // R53：用户在设置里写的自定义指令必须真的进提示词，否则这个设置项是个死开关
+      this.deps.getCustomInstructions?.()
+    )
+
+    /**
+     * 就地压缩 transcript（v1.7）。只改内容不改条数，所以 `messages` 的引用与顺序都不变 ——
+     * 调用方（以及 pi-ai 的 provider 适配层）看到的仍是一条合法的消息序列。
+     */
+    const compactNow = (maxChars: number, keepRounds: number): boolean => {
+      const plan = planCompaction(messages, { maxChars, keepRounds })
+      if (!plan.applied) return false
+      messages.splice(0, messages.length, ...plan.messages)
+      out.push({
+        type: 'compact',
+        shrunkMessages: plan.shrunkMessages,
+        beforeChars: plan.beforeChars,
+        afterChars: plan.afterChars,
+        detail: describeCompaction(plan)
+      })
+      return true
+    }
 
     for (let round = 0; round < maxRounds; round++) {
       if (input.signal.aborted) {
@@ -134,53 +216,127 @@ export class ReactRuntime implements AgentRuntime {
       // v0.4 排队插话：每个 round 取模型前把队列里的纠偏消息注入为 user 消息
       appendQueuedUserMessages(messages, this.pendingInput.splice(0, this.pendingInput.length))
 
-      const acc = newTurn()
+      // v1.7 主动压缩：在取模型之前把 transcript 拉回预算内。
+      // 放在这里而不是「等 provider 报错」是因为溢出报错往往一次就废掉整轮，
+      // 而这个判断是纯粹的字符估算，零成本。预算 = messages + system prompt（D14）。
+      if (compaction.enabled && estimateChars(messages) + systemPrompt.length > compaction.transcriptMaxChars) {
+        compactNow(compaction.transcriptMaxChars, compaction.keepRounds)
+      }
+
+      // —— 一个 round 内的尝试循环：失败分类 → 压缩 / 退避重试 / 如实失败 ——
+      // 每次尝试都用全新的累加器：失败尝试的半截输出不该进入 transcript（只留在界面里）。
+      let acc = newTurn()
       let roundDone = false
-      let roundFailedExternally: string | null = null
+      let failed: Classifiable | null = null
+      let finalMessage: AssistantMessage | null = null
+      let retried = 0
+      let overflowRetried = false
 
-      const evStream = handle.models.stream(model, {
-        systemPrompt: SYSTEM_PROMPT,
-        messages,
-        tools
-      }, {
-        apiKey: this.options.apiKey,
-        temperature: settings.agent.temperature,
-        signal: input.signal
-      })
+      for (;;) {
+        acc = newTurn()
+        roundDone = false
+        failed = null
 
-      try {
-        for await (const ev of evStream) {
-          for (const e of consumeEvent(acc, ev)) out.push(e)
-          if (ev.type === 'done') {
-            roundDone = true
-          } else if (ev.type === 'error') {
-            roundFailedExternally =
-              ev.error?.errorMessage ??
-              (ev.reason === 'aborted' ? '请求已中止' : '模型请求失败')
+        const evStream = handle.models.stream(
+          model,
+          {
+            systemPrompt,
+            messages,
+            tools
+          },
+          {
+            apiKey: this.options.apiKey,
+            temperature: profile.temperature,
+            signal: input.signal
+          }
+        )
+
+        try {
+          for await (const ev of evStream) {
+            for (const e of consumeEvent(acc, ev)) out.push(e)
+            if (ev.type === 'done') {
+              roundDone = true
+            } else if (ev.type === 'error') {
+              // 错误事件里带的是完整的 AssistantMessage，pi 的两套判定器都吃这个形状
+              failed = ev.error
+            }
+          }
+        } catch (e) {
+          // 请求层抛异常（网络中断/认证缺失等）：造一个最小错误对象，让分类器统一处理，
+          // 不在这里另开一套「网络失败要不要重试」的判断（那就是两份会漂移的知识）
+          failed = synthError(e instanceof Error ? e.message : String(e))
+        }
+
+        if (failed === null && roundDone) {
+          // 只有成功的那一次才去取最终消息：失败尝试的 result() 拿到的是一条错误消息，
+          // 推进 transcript 会污染后续每一轮
+          finalMessage = await evStream.result()
+          break
+        }
+
+        if (input.signal.aborted || failed?.stopReason === 'aborted') {
+          out.push({ type: 'done', reason: 'aborted' })
+          return
+        }
+
+        // 1) 上下文溢出：先压缩再重试。**不消耗重试预算** —— 这不是 provider 的临时故障，
+        //    是本地把上下文撑爆了，退避等待只会白等。
+        if (compaction.enabled && !overflowRetried && failed && isOverflowFailure(failed, contextWindow)) {
+          overflowRetried = true
+          // D14：预算口径与主动压缩一致 —— messages + system prompt
+          const before = estimateChars(messages) + systemPrompt.length
+          const shrunk = compactNow(Math.max(20_000, Math.floor(before * 0.5)), 2)
+          if (!shrunk) {
+            out.push({
+              type: 'error',
+              message:
+                explainFailure(failed, contextWindow) +
+                ' —— 已无历史内容可压缩，请新开一个会话，或让工具单次输出更少。',
+              recoverable: false
+            })
+            out.push({ type: 'done', reason: 'failed' })
+            return
+          }
+          continue
+        }
+
+        // 2) 临时性失败（限流/超时/5xx/连接中断）：指数退避重试
+        if (failed && isRetryableFailure(failed)) {
+          const plan = planRetry(retry, retried, failed.errorMessage ?? '')
+          if (plan.retry) {
+            retried = plan.attempt
+            out.push({
+              type: 'retry',
+              attempt: plan.attempt,
+              maxAttempts: retry.maxRetries,
+              delayMs: plan.delayMs,
+              reason: failed.errorMessage ?? '临时性失败'
+            })
+            await sleepAbortable(plan.delayMs, input.signal)
+            // 退避期间用户可能点了「停止」：这里就收工，不要再发一次注定被中止的请求
+            if (input.signal.aborted) {
+              out.push({ type: 'done', reason: 'aborted' })
+              return
+            }
+            continue
           }
         }
-      } catch (e) {
-        // 请求层异常（认证缺失/网络失败等）
+
+        // 3) 重试预算用尽或确定性失败：如实报告，并说清「该改什么」
         out.push({
           type: 'error',
-          message: e instanceof Error ? e.message : String(e),
-          recoverable: true
+          message: failed ? explainFailure(failed, contextWindow) : '模型请求失败（未收到任何事件）',
+          recoverable: failed !== null && isRetryableFailure(failed)
         })
         out.push({ type: 'done', reason: 'failed' })
         return
       }
 
-      if (roundFailedExternally !== null) {
-        if (input.signal.aborted) {
-          out.push({ type: 'done', reason: 'aborted' })
-          return
-        }
-        out.push({ type: 'error', message: roundFailedExternally, recoverable: false })
+      if (!finalMessage) {
+        out.push({ type: 'error', message: '模型请求失败（未收到任何事件）', recoverable: true })
         out.push({ type: 'done', reason: 'failed' })
         return
       }
-
-      const final = await evStream.result()
 
       // 首轮助手文本若是列表形态，作为「计划」呈现
       if (!planEmitted && acc.text.trim()) {
@@ -189,7 +345,7 @@ export class ReactRuntime implements AgentRuntime {
         planEmitted = true
       }
 
-      messages.push(final)
+      messages.push(finalMessage)
 
       if (acc.toolCalls.length === 0 || !roundDone) {
         out.push({ type: 'done', reason: 'completed' })
@@ -202,11 +358,17 @@ export class ReactRuntime implements AgentRuntime {
           return
         }
         const result = await this.runToolCall(call, toolMap, ctx, out)
+        // v1.7：单条结果先做长度截断再进 transcript —— eNSP 的 display 类命令
+        // 一条就能几十万字符，单条不截断的话「压缩」永远追不上它撑爆上下文的速度。
+        // 界面上（tool_end.raw）仍是完整输出，截断只发生在给模型看的那一份。
+        const payload = compaction.enabled
+          ? truncateToolResult(JSON.stringify(result), compaction.toolResultMaxChars).text
+          : JSON.stringify(result)
         messages.push({
           role: 'toolResult',
           toolCallId: call.id,
           toolName: call.name,
-          content: [{ type: 'text', text: JSON.stringify(result) }],
+          content: [{ type: 'text', text: payload }],
           isError: !result.ok,
           timestamp: Date.now()
         })
@@ -227,10 +389,20 @@ export class ReactRuntime implements AgentRuntime {
       ...base,
       signal,
       requestGate: async (req) => {
-        if (this.options.allowDangerousWithGate === false) return false
+        // 已停止时不再请求闸门：避免「批准 Promise 永不 resolve → drive() 挂死、流永不关闭」。
+        // 同时也监听 abort，让等待批准期间点「停止」立即生效（与 sleepAbortable 同一约定）。
+        if (signal.aborted) return false
         const gateId = randomUUID()
         const approved = new Promise<boolean>((resolve) => {
-          this.gates.set(gateId, (d) => resolve(d === 'approve'))
+          const onAbort = (): void => {
+            signal.removeEventListener('abort', onAbort)
+            resolve(false)
+          }
+          signal.addEventListener('abort', onAbort, { once: true })
+          this.gates.set(gateId, (d) => {
+            signal.removeEventListener('abort', onAbort)
+            resolve(d === 'approve')
+          })
         })
         out.push({
           type: 'gate_request',
@@ -240,6 +412,7 @@ export class ReactRuntime implements AgentRuntime {
           reason: req.consequence ? `${req.reason}\n${req.consequence}` : req.reason
         })
         const decision = await approved
+        this.gates.delete(gateId)
         out.push({
           type: 'gate_resolved',
           gateId,
@@ -284,8 +457,30 @@ export class ReactRuntime implements AgentRuntime {
 
     const t0 = Date.now()
 
-    // 危险命令闸门：拦在 handler 执行之前，不依赖提示词
-    if (spec.risk === 'danger') {
+    // 危险命令闸门：拦在 handler 执行之前，不依赖提示词。
+    // 该问 / 该跳过 / 该拒绝的判定在 shared/gate-policy.ts（纯函数，有对应用例）：
+    // 关掉确认框 = 「跳过确认直接执行」（决策 D1），不是「一律拒绝」。
+    // D15：把「任务已中止」也传进去 —— 中止时连闸门都不发（上轮已由 requestGate 的
+    // abort 监听与 drive 的提前 return 兜住行为，但 deny 分支因此在进程内永远不可达，
+    // 语义暴露不出来；这里让纯函数的判定与运行时实际一致，分支也能被用例覆盖）。
+    const gatePlan = planDangerGate({
+      risk: spec.risk,
+      confirmDanger: this.options.allowDangerousWithGate !== false,
+      aborted: ctx.signal?.aborted ?? false
+    })
+    if (gatePlan.kind === 'deny') {
+      const result = failResult('GATE_REJECTED', gatePlan.reason, Date.now() - t0)
+      out.push({
+        type: 'tool_end',
+        callId: call.id,
+        ok: false,
+        ms: result.meta.ms,
+        summary: gatePlan.summary,
+        errorCode: 'GATE_REJECTED'
+      })
+      return result
+    }
+    if (gatePlan.kind === 'ask') {
       const approved = await ctx.requestGate({
         toolName: spec.name,
         args: parsedArgs,
@@ -293,27 +488,31 @@ export class ReactRuntime implements AgentRuntime {
         consequence: '该操作不可撤销，可能造成设备配置或数据丢失。'
       })
       if (!approved) {
-        const result = failResult('GATE_REJECTED', '用户拒绝了该危险操作', Date.now() - t0)
+        // 措辞必须同时覆盖「用户点了拒绝」与「任务已中止 / 出口无闸门」两种来源，
+        // 否则轨迹里会出现与事实不符的"用户拒绝"（R3）。
+        const result = failResult('GATE_REJECTED', GATE_DENIED_REASON, Date.now() - t0)
         out.push({
           type: 'tool_end',
           callId: call.id,
           ok: false,
           ms: result.meta.ms,
-          summary: '用户拒绝执行',
+          summary: GATE_DENIED_SUMMARY,
           errorCode: 'GATE_REJECTED'
         })
         return result
       }
     }
+    const gateSkippedByPolicy = gatePlan.kind === 'skip-confirm'
 
     try {
       const result = await spec.handler(parsedArgs as never, ctx)
+      const summary = summarizeToolCall(spec, parsedArgs, result, spec.name)
       out.push({
         type: 'tool_end',
         callId: call.id,
         ok: result.ok,
         ms: Date.now() - t0,
-        summary: summarizeToolCall(spec, parsedArgs, result, spec.name),
+        summary: gateSkippedByPolicy ? `${summary}（确认框已关闭，按策略跳过确认）` : summary,
         ...(result.error?.raw ? { raw: result.error.raw } : {}),
         ...(result.error?.code ? { errorCode: String(result.error.code) } : {})
       })
@@ -343,6 +542,9 @@ export function extractPlan(text: string): string[] {
   }
   return steps.slice(0, 8)
 }
+
+/** v1.5：提示词拼装已移到 ./llm/prompt.ts，这里保留同名导出以免调用方迁移 */
+export { buildAgentSystemPrompt } from './llm/prompt'
 
 /**
  * 会话树祖先链 → pi-ai 消息。

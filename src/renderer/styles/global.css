@@ -1,6 +1,8 @@
 @import './theme.css';
 
-* {
+*,
+*::before,
+*::after {
   box-sizing: border-box;
 }
 
@@ -15,16 +17,19 @@ body,
 body {
   font-family: var(--font-sans);
   font-size: var(--text-base);
-  line-height: 1.6;
+  line-height: 1.55;
   color: var(--text-primary);
   background: var(--bg-base);
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
   overflow: hidden;
 }
 
+/* 优雅紧凑的滚动条系统 */
 ::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
+  width: 8px;
+  height: 8px;
 }
 ::-webkit-scrollbar-track {
   background: transparent;
@@ -34,6 +39,7 @@ body {
   border-radius: var(--radius-full);
   border: 2px solid transparent;
   background-clip: content-box;
+  transition: background var(--dur-fast) var(--ease);
 }
 ::-webkit-scrollbar-thumb:hover {
   background: var(--border-strong);
@@ -47,6 +53,7 @@ button {
   border: none;
   background: none;
   color: inherit;
+  user-select: none;
 }
 
 button:focus-visible,
@@ -54,8 +61,8 @@ input:focus-visible,
 select:focus-visible,
 textarea:focus-visible,
 [tabindex]:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 1px;
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-subtle), 0 0 0 1px var(--accent);
 }
 
 input,
@@ -68,6 +75,7 @@ select {
   border: 1px solid var(--border-default);
   border-radius: var(--radius-sm);
   padding: 5px 8px;
+  transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease);
 }
 
 input::placeholder,
@@ -78,14 +86,17 @@ textarea::placeholder {
 input:focus,
 textarea:focus {
   border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-subtle);
   outline: none;
 }
 
 h1,
 h2,
-h3 {
+h3,
+h4 {
   margin: 0;
-  font-weight: 500;
+  font-weight: 600;
+  letter-spacing: -0.015em;
 }
 
 p {
@@ -95,7 +106,19 @@ p {
 code,
 kbd {
   font-family: var(--font-mono);
-  font-size: 0.95em;
+  font-size: 0.92em;
+}
+
+/* 统一等宽数字，确保所有计数、耗时、端口与状态垂直对齐 */
+.tabular-nums,
+.kbd-badge,
+.chip,
+.device-meta,
+.tool-ms,
+.statusbar,
+.attach-meta,
+.scan-range-box input {
+  font-variant-numeric: tabular-nums;
 }
 
 @media (prefers-reduced-motion: reduce) {

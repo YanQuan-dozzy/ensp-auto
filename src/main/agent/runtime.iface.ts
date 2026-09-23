@@ -1,5 +1,6 @@
 import type { AgentEvent, GateDecision, RunInput, Settings } from '@shared/types'
 import type { ToolContext, ToolSpec } from '../tools/registry'
+import type { SkillContent } from '../skills/prompt'
 
 /**
  * AgentRuntime 抽象。
@@ -15,6 +16,15 @@ import type { ToolContext, ToolSpec } from '../tools/registry'
 
 export interface AgentDeps {
   tools: readonly ToolSpec[]
+  /** v1.3：已启用技能内容（注入 system prompt；缺省 = 无技能） */
+  getSkills?: () => SkillContent[]
+  /**
+   * v1.5：活跃档案的自定义指令（设置「模型」页填的那段），注入 system prompt。
+   *
+   * 做成「取函数」而不是启动时快照：档案随时可切换/编辑，运行期取值才与设置页一致。
+   * R53：这个字段曾经在最后一跳被漏传，导致用户写的指令从未进入任何一次请求。
+   */
+  getCustomInstructions?: () => string
   /** 每轮构建工具执行上下文（含闸门回调与中断信号） */
   buildContext: (signal: AbortSignal) => ToolContext
   getSettings: () => Settings

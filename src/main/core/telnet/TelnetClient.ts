@@ -1,6 +1,6 @@
-import net from 'node:net'
 import { randomUUID } from 'node:crypto'
 import type { CommandResult, Encoding, PromptInfo } from '@shared/types'
+import { type ByteChannel, connectTcp } from '../transport/ByteChannel'
 import {
   AUTH_RE,
   CONFIRM_RE,
@@ -90,7 +90,7 @@ function lastVisibleLine(text: string): string {
 }
 
 export class TelnetClient {
-  private sock: net.Socket | null = null
+  private channel: ByteChannel | null = null
   private opts: TelnetOptions
   private encodingPref: 'auto' | Encoding
 
@@ -102,6 +102,8 @@ export class TelnetClient {
   private active: ActiveState | null = null
   private closed = false
   private closeReason = ''
+  /** 握手唤醒定时器（连接后无数据则补发回车） */
+  private nudgeTimer: NodeJS.Timeout | null = null
 
   // 当前命令的累积缓冲：head 保留前段，tail 滚动保留后段，便于截断时头尾都留
   private head: Buffer[] = []
@@ -110,12 +112,35 @@ export class TelnetClient {
   private tailLen = 0
   private totalLen = 0
   private truncated = false
+  /**
+   * concat 结果缓存（T4.2）。
+   *
+   * head/tail 是分片数组，每调一次 combined() 就要 concat 一遍；
+   * 而一次 handleData 里 evaluate / armQuietTimer→onQuiet / buildResult 会各调一次，
+   * 512KB 回显下就是同一份内容被反复拼 3 遍。缓存由 append/resetBuffer 失效，
+   * 保证「一个 chunk 只拼一次」。
+   */
+  private combinedCache: Buffer | null = null
 
   // 交互通道按行累积
   private interactiveLine = ''
 
+  /** 中断（Ctrl+C）发出后的排空窗口：此期间 pump 停止推进，避免设备迟到输出污染下一条命令缓冲（D11） */
+  private drainingUntil = 0
+
   private rawSubs = new Set<(chunk: Uint8Array) => void>()
   private closeSubs = new Set<(reason: string) => void>()
+
+  /**
+   * 设备停在 [Y/N]（或认证）提示上时挂起队列推进。
+   *
+   * 为什么需要：resolveActive 结尾会无条件 pump()，于是队列里的下一条命令
+   * 会被立刻写进设备 —— 而设备此时把它当成确认应答吃掉（R6）。
+   * 挂起后必须由「上层显式应答」来解除：见 exec() / writeInteractive() 的说明。
+   */
+  private confirmPaused = false
+  /** 最近一次命中的确认提示原文（仅在 confirmPaused 期间有效，供应答工具回显） */
+  private confirmPromptText = ''
 
   constructor(options: TelnetClientOptions = {}) {
     this.opts = { ...DEFAULT_TELNET_OPTIONS, ...options }
@@ -132,6 +157,16 @@ export class TelnetClient {
     return this.queue.length + (this.active ? 1 : 0)
   }
 
+  /** 设备是否正停在 [Y/N] / 认证提示上（队列已挂起） */
+  get isAwaitingConfirm(): boolean {
+    return this.confirmPaused
+  }
+
+  /** 挂起中的确认提示原文；无挂起时为空串 */
+  get awaitingConfirmText(): string {
+    return this.confirmPaused ? this.confirmPromptText : ''
+  }
+
   onRawData(cb: (chunk: Uint8Array) => void): () => void {
     this.rawSubs.add(cb)
     return () => this.rawSubs.delete(cb)
@@ -142,40 +177,49 @@ export class TelnetClient {
     return () => this.closeSubs.delete(cb)
   }
 
+  /**
+   * telnet 便捷入口：按默认主机（127.0.0.1）建 TCP 管道后走 connectChannel。
+   * 保留此签名以兼容既有调用（含 telnet.test.mjs）。
+   */
   async connect(port: number): Promise<ConnectResult> {
-    if (this.sock) throw new Error('已经连接')
+    const ch = await connectTcp(DEFAULT_HOST, port, this.opts.connectTimeoutMs)
+    return this.connectChannel(ch)
+  }
 
-    const sock = net.createConnection({ host: DEFAULT_HOST, port })
-    sock.setNoDelay(true)
-    this.sock = sock
+  /**
+   * 通用入口：接收任何已就绪的字节管道（telnet 或 SSH）完成握手。
+   * 握手、关分页、编码锁定等状态机逻辑与此处共用的状态无关，只换字节来源。
+   */
+  async connectChannel(ch: ByteChannel): Promise<ConnectResult> {
+    if (this.channel) {
+      ch.destroy()
+      throw new Error('已经连接')
+    }
+    this.channel = ch
 
-    await new Promise<void>((resolve, reject) => {
-      const onErr = (e: Error): void => {
-        cleanup()
-        reject(e)
+    ch.onData((chunk) => this.handleData(Buffer.from(chunk)))
+    ch.onError((e) => this.shutdown(`连接错误：${e.message}`))
+    ch.onClose(() => this.shutdown('连接已关闭'))
+
+    // 握手唤醒：部分 eNSP 设备连接后不主动推 banner/提示符，必须收到输入才回话。
+    // 短窗口（connectNudgeMs，默认 200ms）内握手还没拿到首个提示符就补发一个回车；
+    // 正常首发 banner 的设备此时已结束握手，不受影响。
+    // 参照参考实现的 connect() 里 send(b'\r\n')。
+    this.nudgeTimer = setTimeout(() => {
+      const handshakePending = this.active?.item.kind === 'handshake'
+      if (!this.closed && handshakePending && this.channel && this.channel.writable) {
+        this.channel.write(Buffer.from('\r\n'))
       }
-      const onConn = (): void => {
-        cleanup()
-        resolve()
-      }
-      const cleanup = (): void => {
-        sock.off('error', onErr)
-        sock.off('connect', onConn)
-      }
-      sock.once('error', onErr)
-      sock.once('connect', onConn)
-    })
+      this.nudgeTimer = null
+    }, this.opts.connectNudgeMs)
 
-    sock.on('data', (chunk: Buffer) => this.handleData(chunk))
-    sock.on('error', (e: Error) => this.shutdown(`连接错误：${e.message}`))
-    sock.on('close', () => this.shutdown('连接已关闭'))
-
-    // 握手：不写入任何内容，只等首个提示符，banner 一并丢弃
+    // 握手：先静候提示符；唤醒窗口过了仍无声则已由上面的定时器补发回车
     const hs = await this.enqueue({
       kind: 'handshake',
       command: '',
       timeoutMs: this.opts.connectTimeoutMs
     })
+    this.clearNudge()
 
     const m = matchPromptTail(stripAnsi(decode(this.combined(), this.encoding).text))
     if (!m) {
@@ -208,7 +252,13 @@ export class TelnetClient {
     }
   }
 
-  /** 程序通道：给代理 / 工具层用，返回清洗后的结构化结果 */
+  /**
+   * 程序通道：给代理 / 工具层用，返回清洗后的结构化结果。
+   *
+   * 若上一条命令停在 [Y/N] 上（confirmPaused），本次调用即视为「显式应答」：
+   * 解除挂起，并把这条命令**插到队首** —— 设备只会把紧接着的输入当成对提示的回答，
+   * 若让它排在早先入队的命令后面，被吃掉的就会是那条无辜的命令（R6 的同一个坑）。
+   */
   exec(command: string, opts: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<CommandResult> {
     if (this.closed) {
       return Promise.resolve(this.synthetic('CLOSED', '连接已关闭'))
@@ -216,12 +266,17 @@ export class TelnetClient {
     if (this.queue.length >= MAX_QUEUE) {
       return Promise.resolve(this.synthetic('UNKNOWN', `命令队列已满（${MAX_QUEUE}），拒绝入队`))
     }
-    return this.enqueue({
-      kind: 'program',
-      command,
-      timeoutMs: opts.timeoutMs ?? this.opts.timeoutMs,
-      signal: opts.signal
-    })
+    const isConfirmAnswer = this.confirmPaused
+    this.confirmPaused = false
+    return this.enqueue(
+      {
+        kind: 'program',
+        command,
+        timeoutMs: opts.timeoutMs ?? this.opts.timeoutMs,
+        signal: opts.signal
+      },
+      isConfirmAnswer
+    )
   }
 
   /**
@@ -244,19 +299,39 @@ export class TelnetClient {
         return { accepted: true, queued: true }
       }
       this.interactiveLine += data
-      this.sock?.write(data)
+      this.channel?.write(Buffer.from(data))
       return { accepted: true, queued: false }
     }
 
-    // 含回车：把该行作为一条交互命令入队
-    const line = this.interactiveLine + data.replace(/[\r\n]+$/, '')
+    // 含回车：按行拆开，每行作为一条交互命令入队。
+    // 粘贴多行文本时设备本来就是逐行执行，拆开入队可让每一行都走完整判定，
+    // 也保证入队项永远不会带内嵌换行（writeCommand 会拒绝这种载荷）。
+    const raw = this.interactiveLine + data
     this.interactiveLine = ''
-    if (!line.trim()) {
-      // 空行：仅回一个回车
-      this.sock?.write('\r\n')
+    const lines = raw.split(/[\r\n]+/).filter((l) => l.trim().length > 0)
+    if (lines.length === 0) {
+      // 空行回车（D12）：
+      // ① 程序命令执行中 → 只缓冲不发送（设备此刻的回显边界属于命令，回车会错位）；
+      // ② 停在 [Y/N] 上 → 视为显式应答，走队列插队（与 exec() 同路径），不直写 socket ——
+      //    否则这个回车会绕过挂起机制，落到设备上又被本地当成「默认应答已解决」，
+      //    队列顺序与设备状态从此对不上；
+      // ③ 平时 → 直写回车，保持终端手感。
+      if (programRunning) {
+        return { accepted: true, queued: true }
+      }
+      if (this.confirmPaused) {
+        this.confirmPaused = false
+        this.enqueueInteractive([''], true)
+        return { accepted: true, queued: true }
+      }
+      this.channel?.write(Buffer.from('\r\n'))
       return { accepted: true, queued: false }
     }
-    this.enqueue({ kind: 'interactive', command: line, timeoutMs: this.opts.timeoutMs })
+    // 用户在确认提示上按回车（此时 lines 非空）= 显式应答：解除挂起并插队
+    const isConfirmAnswer = this.confirmPaused
+    this.confirmPaused = false
+    // D13：批量整体入队（首插/追加一次完成），保证粘贴顺序与执行顺序一致
+    this.enqueueInteractive(lines, isConfirmAnswer)
     return { accepted: true, queued: programRunning || this.queue.length > 0 }
   }
 
@@ -267,12 +342,16 @@ export class TelnetClient {
 
   // ———————————————————————————— 队列 ————————————————————————————
 
-  private enqueue(partial: {
-    kind: QueueItem['kind']
-    command: string
-    timeoutMs: number
-    signal?: AbortSignal
-  }): Promise<CommandResult> {
+  private enqueue(
+    partial: {
+      kind: QueueItem['kind']
+      command: string
+      timeoutMs: number
+      signal?: AbortSignal
+    },
+    /** 插队：仅用于「对设备确认提示的显式应答」，见 exec() 的说明 */
+    toFront = false
+  ): Promise<CommandResult> {
     return new Promise<CommandResult>((resolve, reject) => {
       const item: QueueItem = {
         id: randomUUID(),
@@ -284,13 +363,67 @@ export class TelnetClient {
         reject,
         signal: partial.signal
       }
-      this.queue.push(item)
+      if (toFront && !this.active) this.queue.unshift(item)
+      else this.queue.push(item)
       this.pump()
     })
   }
 
+  /**
+   * 交互通道多行批量入队（D13）。
+   *
+   * 旧实现是逐行 enqueue：只有第一行能 unshift 到队首（此时 active 为空），
+   * 第二行起 conn 已非空 → push 到队尾 —— 粘贴顺序与执行顺序被反转。
+   * 这里一次性构造并整体前插/追加，且**每一行都占 MAX_QUEUE 预算**（与 exec() 同口径，
+   * 交互通道不得绕过队列上限——D12 修法 3 要的不变量）。
+   * 交互项的结果无人消费（fire-and-forget），但 resolve/reject 必须挂接，
+   * 否则 pump→resolveActive 结算时会因 undefined 崩溃。
+   * 返回值忽略：交互通道不向调用方回传命令结果。
+   */
+  private enqueueInteractive(lines: string[], toFront: boolean): void {
+    const room = MAX_QUEUE - (this.queue.length + (this.active ? 1 : 0))
+    if (lines.length > room) {
+      // 超预算：丢弃超出的行（保持信号完整；一行粘贴 201 行的场景现实中不会发生）
+      lines = lines.slice(0, room)
+      if (lines.length === 0) return
+    }
+    const items: QueueItem[] = lines.map((command) => {
+      let resolve: (r: CommandResult) => void = () => {}
+      let reject: (e: Error) => void = () => {}
+      new Promise<CommandResult>((res, rej) => {
+        resolve = res
+        reject = rej
+      })
+      return {
+        id: randomUUID(),
+        kind: 'interactive' as const,
+        command,
+        enqueuedAt: Date.now(),
+        timeoutMs: this.opts.timeoutMs,
+        resolve,
+        reject
+      }
+    })
+    if (toFront && !this.active) this.queue.unshift(...items)
+    else this.queue.push(...items)
+    this.pump()
+  }
+
   private pump(): void {
-    if (this.closed || this.active || !this.sock) return
+    if (this.closed || this.active || !this.channel) return
+    if (Date.now() < this.drainingUntil) {
+      // D11：刚发过中断，等一个 quiet 窗口让设备的迟到输出先流完，
+      // 否则它们会落进下一条命令的缓冲，污染回显边界与提示符判定。
+      const wait = Math.min(this.drainingUntil - Date.now(), 250)
+      setTimeout(() => this.pump(), wait)
+      return
+    }
+    if (this.confirmPaused) {
+      // 设备停在 [Y/N] 上：不推进队列（否则下一条命令会被当成确认应答吃掉），
+      // 但要让已中止的排队项及时结算，避免它们永远悬挂。
+      this.settleAbortedQueue()
+      return
+    }
     const item = this.queue.shift()
     if (!item) return
 
@@ -309,8 +442,18 @@ export class TelnetClient {
     this.active = state
 
     if (item.signal) {
+      // D11：中止不只是结算本地 Promise —— 设备可能仍在吐字节（长输出被打断）。
+      // 尽力向设备发 Ctrl+C（\x03）打断执行，并留一个 quiet 窗口给迟到输出排水，
+      // 否则它们会污染下一条命令的缓冲区（旧实现全仓无任何中断序列，R13）。
       const onAbort = (): void => {
         if (this.active === state) {
+          this.confirmPaused = false
+          try {
+            this.channel?.write(Buffer.from('\x03'))
+          } catch {
+            /* 尽力而为 */
+          }
+          this.drainingUntil = Date.now() + this.opts.quietMs
           this.resolveActive({ errorCode: 'ABORTED', error: '命令被中断' })
         }
       }
@@ -328,25 +471,57 @@ export class TelnetClient {
       }
     }, item.timeoutMs)
 
-    if (item.command) this.writeCommand(item.command)
-    // 命令为空（握手）时只等数据
+    // 握手项（command 为空）只等数据，不下发任何字节；
+    // 其余项目（含空命令的 [Y/N] 回车应答）一律走 writeCommand ——
+    // 空 command 会写出裸 \r\n（≈ 用户在设备提示上按了一次回车，D12）。
+    // 只用 kind 分流而不是 `command 非空` 判断：否则「空命令应答」会被跳过永不下发。
+    if (item.kind !== 'handshake' && !this.writeCommand(item.command)) {
+      this.resolveActive({
+        errorCode: 'INVALID_INPUT',
+        error:
+          '命令包含换行符（\\r / \\n），已拒绝下发：设备会把一行之内的多段内容当成多条命令依次执行'
+      })
+      return
+    }
   }
 
-  private writeCommand(command: string): void {
-    if (!this.sock) return
-    const payload = `${command}\r\n`
+  /**
+   * 下发一条命令行。
+   *
+   * 返回 false 表示载荷被拒（含 \r / \n）。这是「命令不得跨行」的最后一道防线：
+   * 上层（风险判定 / 白名单）已经会拦多行命令，这里兜住任何漏判的调用方。
+   */
+  private writeCommand(command: string): boolean {
+    if (!this.channel) return false
+    if (/[\r\n]/.test(command)) return false
+    const payload = Buffer.from(`${command}\r\n`)
     if (this.opts.charDelayMs > 0) {
       let i = 0
       const tick = (): void => {
-        if (!this.sock || this.closed || i >= payload.length) return
-        this.sock.write(payload[i]!)
+        if (!this.channel || this.closed || i >= payload.length) return
+        this.channel.write(payload.subarray(i, i + 1))
         i++
         setTimeout(tick, this.opts.charDelayMs)
       }
       tick()
-      return
+      return true
     }
-    this.sock.write(payload)
+    this.channel.write(payload)
+    return true
+  }
+
+  /** 队列挂起期间，把已被中止（signal.aborted）的排队项结算掉，不留悬挂 Promise */
+  private settleAbortedQueue(): void {
+    if (!this.queue.length) return
+    const kept: QueueItem[] = []
+    for (const item of this.queue) {
+      if (item.signal?.aborted) {
+        item.resolve(this.synthetic('ABORTED', '命令被中断'))
+      } else {
+        kept.push(item)
+      }
+    }
+    this.queue = kept
   }
 
   // ———————————————————————————— 数据流入 ————————————————————————————
@@ -384,6 +559,7 @@ export class TelnetClient {
   private append(chunk: Buffer): void {
     const halfLimit = Math.floor(this.opts.maxBytes / 2)
     this.totalLen += chunk.length
+    this.combinedCache = null
 
     if (!this.truncated && this.totalLen > this.opts.maxBytes) {
       this.truncated = true
@@ -417,10 +593,14 @@ export class TelnetClient {
     this.tailLen = 0
     this.totalLen = 0
     this.truncated = false
+    this.combinedCache = null
   }
 
   private combined(): Buffer {
-    return Buffer.concat([...this.head, ...this.tail], this.headLen + this.tailLen)
+    if (!this.combinedCache) {
+      this.combinedCache = Buffer.concat([...this.head, ...this.tail], this.headLen + this.tailLen)
+    }
+    return this.combinedCache
   }
 
   private armQuietTimer(): void {
@@ -480,17 +660,19 @@ export class TelnetClient {
       if (state.advancedAtLen !== this.totalLen && state.hops < this.opts.maxPagingHops) {
         state.hops++
         state.advancedAtLen = this.totalLen
-        this.sock?.write(PAGING_ADVANCE)
+        this.channel?.write(Buffer.from(PAGING_ADVANCE))
         this.armQuietTimer()
       }
       return
     }
 
-    // 2) 交互确认提示：绝不被自动应答，交由上层裁决
+    // 2) 交互确认提示：绝不被自动应答，交由上层裁决；同时挂起队列（R6）
     if (CONFIRM_RE.test(tailText)) {
+      this.confirmPaused = true
+      this.confirmPromptText = lastVisibleLine(tailText)
       this.resolveActive({
         awaitingConfirm: true,
-        confirmText: lastVisibleLine(tailText),
+        confirmText: this.confirmPromptText,
         settled: 'quiet'
       })
       return
@@ -498,9 +680,11 @@ export class TelnetClient {
 
     // 3) 认证提示
     if (AUTH_RE.test(tailText)) {
+      this.confirmPaused = true
+      this.confirmPromptText = lastVisibleLine(tailText)
       this.resolveActive({
         awaitingConfirm: true,
-        confirmText: lastVisibleLine(tailText),
+        confirmText: this.confirmPromptText,
         settled: 'quiet'
       })
       return
@@ -600,16 +784,31 @@ export class TelnetClient {
 
   // ———————————————————————————— 生命周期 ————————————————————————————
 
+  private clearNudge(): void {
+    if (this.nudgeTimer) {
+      clearTimeout(this.nudgeTimer)
+      this.nudgeTimer = null
+    }
+  }
+
   private shutdown(reason: string): void {
     if (this.closed) return
     this.closed = true
     this.closeReason = reason
+    this.confirmPaused = false
+    this.confirmPromptText = ''
+    this.clearNudge()
 
     const state = this.active
     this.active = null
     if (state) {
       if (state.quietTimer) clearTimeout(state.quietTimer)
       if (state.hardTimer) clearTimeout(state.hardTimer)
+      // T4.2：这里过去漏摘 abort 监听。每次「执行中异常断开」都会在调用方的
+      // AbortSignal 上留一个永不释放的监听（长任务里越积越多）。
+      if (state.abortHandler && state.item.signal) {
+        state.item.signal.removeEventListener('abort', state.abortHandler)
+      }
       const result = this.buildResult(state, { errorCode: 'CLOSED', error: reason })
       state.item.resolve({ ...result, ok: false })
     }
@@ -621,11 +820,11 @@ export class TelnetClient {
     }
 
     try {
-      this.sock?.destroy()
+      this.channel?.destroy()
     } catch {
       /* 忽略 */
     }
-    this.sock = null
+    this.channel = null
 
     for (const cb of this.closeSubs) cb(reason)
     this.rawSubs.clear()

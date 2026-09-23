@@ -7,8 +7,10 @@
  * 再按段做行级差异，原因：
  * - 配置里的 `undo ip address ...` 之类子行必须在其所属视图（interface/ospf…）里执行，
  *   纯行集合 diff 会丢失视图上下文，生成出一堆从系统视图跑必失败的裸命令。
- * - 以「段」为粒度 diff，新加的整个段可以直接 `undo <段头>` 整体移除，
- *   不需要也没法逐行 undo。
+ * - 以「段」为粒度 diff，新加的整个段**只有在段头本身可被 undo 时**才能整体移除
+ *   （`undo vlan 10` / `undo ospf 1`）；`interface GigabitEthernet0/0/0` 这类
+ *   视图入口在 VRP 里**没有** `undo interface` 命令，必须走「进段 + 逐行 undo」
+ *   的等价路径，见 UNDOABLE_HEADER_RE 与 genRollbackCommands 第 3 步。
  *
  * 明确的边界（v0.2 的可接受范围，TOOLS.md 已声明「best-effort」）：
  * - 顶层散命令的 undo 是尽力而为（如 `sysname`、`snmp-agent`），部分命令的撤销
@@ -35,6 +37,23 @@ export interface ParsedConfig {
  */
 export const STANZA_HEADER_RE =
   /^(?:interface\s+\S+|ospf\s+\d+|vlan\s+\d+|acl\s+number\s+\d+|acl\s+name\s+\S+|acl\s+\S+|route-policy\s+\S+\s+\S+|isis\s+\d+|rip\s+\d+|bgp\s+\S+|ip\s+ip-prefix\s+\S+|traffic\s+(?:classifier|behavior)\s+\S+|firewall\s+zone\s+name\s+\S+|nat\s+address-group\s+\S+|dhcp\s+server\s+ip-pool\s+\S+|keychain\s+\S+|user-interface\s+\S+|aaa|mpls|bridge-domain)\b/i
+
+/**
+ * 「段头本身可被 undo」的视图入口白名单（D1）。
+ *
+ * 为什么必须区分：`genRollbackCommands` 对**新增的整段**原本一律发 `undo <段头>`，
+ * 但 VRP 里只有一部分视图入口存在 `undo` 形式（`undo vlan 10` / `undo ospf 1` /
+ * `undo acl 3000`…）。`interface GigabitEthernet0/0/0`、`firewall zone name X`、
+ * `nat address-group N`、`dhcp server ip-pool X`、`keychain`、`user-interface`、
+ * `aaa`、`mpls` 这些**都没有** `undo interface` 一类命令。
+ *
+ * 而 executeCommands 是「任一命令失败即整体停止」，于是回滚会在第一条上中断，
+ * 设备停在半回滚状态、只报一条 failed —— 比不提供回滚更危险（人会以为回滚过了）。
+ *
+ * 未命中本白名单的段头走「进段 + 逐行 undo」，与「段内新增行」的处理同构。
+ */
+export const UNDOABLE_HEADER_RE =
+  /^(?:vlan\s+\d+|ospf\s+\d+|acl\s+(?:number\s+)?\d+|acl\s+name\s+\S+|rip\s+\d+|isis\s+\d+|bgp\s+\S+|ip\s+ip-prefix\s+\S+|route-policy\s+\S+\s+\S+|traffic\s+(?:classifier|behavior)\s+\S+|bridge-domain\s+\S+)\b/i
 
 export function parseConfigStanzas(text: string): ParsedConfig {
   const out: ParsedConfig = { top: [], stanzas: [] }
@@ -106,7 +125,9 @@ export function genRollbackCommands(snapshotText: string, currentText: string): 
   const added: string[] = []
   const removed: string[] = []
 
-  // 1) 仍存在的段：先撤销段内新增行，再补回段内被删行（顺序不能反，防止同参覆盖）
+  // 1) 仍存在的段：先撤销段内新增行，再补回段内被删行（顺序不能反，防止同参覆盖）。
+  //    这里发的是「进段 + 逐行 undo」——它同时也是**所有**段的统一撤销路径，
+  //    第 3 步对不可 undo 的段头会复用同一种写法。
   for (const [k, s] of oldStanza) {
     const n = nowStanza.get(k)
     if (!n) continue
@@ -129,12 +150,18 @@ export function genRollbackCommands(snapshotText: string, currentText: string): 
     removed.push(s.header, ...s.lines)
   }
 
-  // 3) 新增的整段：整体撤销（只发 undo 段头，子行随段消失）
+  // 3) 新增的整段：能整体 undo 的段头（vlan / ospf / acl…）只发 `undo <段头>`，
+  //    子行随段消失；其余（interface / firewall zone / nat address-group / aaa…）
+  //    没有 `undo <段头>` 这条命令，改为「进段 + 逐行 undo」，否则回滚会在第一条
+  //    就因 `Error: Unrecognized command` 中断，设备停在半回滚状态（D1）。
   for (const n of now.stanzas) {
-    if (!oldStanza.has(keyOf(n.header))) {
+    if (oldStanza.has(keyOf(n.header))) continue
+    if (UNDOABLE_HEADER_RE.test(n.header)) {
       commands.push(`undo ${n.header}`)
-      added.push(n.header, ...n.lines)
+    } else {
+      commands.push(n.header, ...n.lines.map(invertCommand))
     }
+    added.push(n.header, ...n.lines)
   }
 
   // 4) 顶层散命令：先撤销新增、再补回被删

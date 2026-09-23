@@ -24,7 +24,10 @@ await build({
   sourcemap: false,
   logLevel: 'warning',
   // MCP SDK 保持外部（node_modules 运行时解析），避免把 express/hono 打进测试包
-  external: ['@modelcontextprotocol/sdk'],
+  // ssh2 同理：CJS + 可选原生 cpu-features，测试进程直接 require node_modules 里的包
+  // 与 electron.vite.config.ts 的 external 口径保持一致：
+    // 这三者都有 CJS 动态 require，打进 bundle 会在 ESM 里炸
+    external: ['@modelcontextprotocol/sdk', 'zod', 'ssh2'],
   alias: {
     '@shared': path.join(root, 'src/shared')
   }

@@ -13,13 +13,15 @@ import {
 } from '@modelcontextprotocol/sdk/types.js'
 import type { ToolSpec } from '../tools/registry'
 import type { AgentDeps } from '../agent/runtime.iface'
+import { isExternalToolName } from '../core/mcp/client'
 
 /**
  * MCP 对外接口（v0.4 / F-：被 Trae / Claude 等客户端按 URL 调用）。
  *
  * 形态：Streamable HTTP，node:http 手装传输（SDK 自带 transport，无需 express），
  * 仅绑定 127.0.0.1，端口来自设置。工具来自 Tool Registry 的 toMcpTools 出口：
- * danger 工具已过滤（外部客户端权限 ≤ 应用内），调用时 requestGate 一律返回 false。
+ * danger 工具既不列出也不允许调用（外部客户端权限 ≤ 应用内），其余工具调用时
+ * requestGate 一律返回 false —— MCP 出口没有人工确认 UI，凡需确认的一律视为拒绝。
  */
 
 export interface McpServerHandle {
@@ -35,7 +37,19 @@ export interface McpServerOptions {
 
 export async function createMcpServer(opts: McpServerOptions): Promise<McpServerHandle> {
   const { deps, port } = opts
-  const toolMap = new Map<string, ToolSpec>(deps.tools.map((t) => [t.name, t]))
+
+  /**
+   * 唯一的外露口径，两道闸口：
+   * 1. danger 工具既不列出、也不允许调用（外部客户端权限 ≤ 应用内）；
+   * 2. 外部 MCP 工具（`mcp__<server>__<tool>`）一律不外露 —— 正常装配下这里
+   *    只会收到 builtinTools()，但这是一道与调用方解耦的防线：哪天有人把
+   *    agentTools 塞进来，也不会重新制造自环（D7，2026-09-23）。
+   *
+   * ListTools 与 CallTool 必须共用这一份判断（R31）—— 分开写迟早会漂移，
+   * 而漂移的后果是「列表里看不到、但照着名字仍然调得动」这种最坏组合。
+   */
+  const exposedTools = deps.tools.filter((s) => s.risk !== 'danger' && !isExternalToolName(s.name))
+  const toolMap = new Map<string, ToolSpec>(exposedTools.map((t) => [t.name, t]))
 
   // 低层 Server：ListTools / CallTool 两个处理器直接吃 registry 的数据
   const server = new Server(
@@ -44,13 +58,11 @@ export async function createMcpServer(opts: McpServerOptions): Promise<McpServer
   )
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: deps.tools
-      .filter((s) => s.risk !== 'danger')
-      .map((s) => ({
-        name: s.name,
-        description: s.description,
-        inputSchema: s.schema as Record<string, unknown>
-      }))
+    tools: exposedTools.map((s) => ({
+      name: s.name,
+      description: s.description,
+      inputSchema: s.schema as Record<string, unknown>
+    }))
   }))
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -63,7 +75,7 @@ export async function createMcpServer(opts: McpServerOptions): Promise<McpServer
       }
     }
 
-    // 外部客户端无闸门 UI：requestGate 强制拒绝（danger 已过滤；restore 等内部闸门在此直接拒绝）
+    // 外部客户端无闸门 UI：requestGate 强制拒绝（restore 等内部闸门在此直接拒绝）
     const signal = new AbortController().signal
     const ctx = {
       ...deps.buildContext(signal),
@@ -124,6 +136,9 @@ export async function createMcpServer(opts: McpServerOptions): Promise<McpServer
     url: `http://127.0.0.1:${actualPort}/mcp`,
     close: async () => {
       await transport.close()
+      // Streamable HTTP 的长连接（keep-alive / 挂起的 SSE）会挂住 close 回调，
+      // 让 applyMcp 的「关旧端口 → 起新端口」永远等不到 resolve（D7 备注）
+      httpServer.closeAllConnections?.()
       await new Promise<void>((resolve) => httpServer.close(() => resolve()))
     }
   }

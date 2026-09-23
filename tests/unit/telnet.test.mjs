@@ -1,6 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { TelnetClient } from '../.build/harness.mjs'
+import net from 'node:net'
+import { once } from 'node:events'
+import { TelnetClient, detectEncoding, trimIncompleteTail, matchPromptTail } from '../.build/harness.mjs'
 import { MockVrp } from '../mock-device/MockVrp.mjs'
 
 /**
@@ -266,4 +268,126 @@ test('命令回显含 ANSI 时不影响判定', async () => {
   } finally {
     await teardown(ctx)
   }
+})
+
+test('握手唤醒：设备不主动推 banner，超窗补发回车后握手成功', async () => {
+  // “哑巴设备”：连接后不发任何字节，收到第一条输入才回话（参照参考实现的行为）
+  const server = net.createServer((sock) => {
+    sock.once('data', () => {
+      sock.write('Info: The max number of VTY users is 10.\r\n<Huawei>')
+    })
+    sock.on('error', () => {})
+  })
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  const addr = server.address()
+  const port = typeof addr === 'object' && addr ? addr.port : 0
+  const client = new TelnetClient({
+    disablePagingOnConnect: false,
+    connectNudgeMs: 50,
+    connectTimeoutMs: 3000
+  })
+  try {
+    const info = await client.connect(port)
+    assert.equal(info.prompt.raw, '<Huawei>', '补发回车后应能读到首个提示符')
+    assert.equal(info.prompt.view, 'user')
+  } finally {
+    client.close()
+    server.close()
+  }
+})
+
+test('握手唤醒：设备始终沉默时仍按连接超时报错，不挂死', async () => {
+  const server = net.createServer((sock) => {
+    sock.on('error', () => {})
+  })
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  const addr = server.address()
+  const port = typeof addr === 'object' && addr ? addr.port : 0
+  const client = new TelnetClient({
+    disablePagingOnConnect: false,
+    connectNudgeMs: 20,
+    connectTimeoutMs: 200
+  })
+  try {
+    await assert.rejects(() => client.connect(port), /未能在超时内读到提示符/)
+  } finally {
+    client.close()
+    server.close()
+  }
+})
+
+// ———————————————————— T4.2 / T4.3（第 4 轮：热路径与判定加固） ————————————————————
+
+/** 鸭子类型的 AbortSignal：只为数监听数量（真实 AbortSignal 不暴露监听表） */
+function fakeSignal() {
+  const listeners = new Set()
+  return {
+    aborted: false,
+    count: () => listeners.size,
+    addEventListener: (_t, fn) => listeners.add(fn),
+    removeEventListener: (_t, fn) => listeners.delete(fn)
+  }
+}
+
+test('T4.2 执行中异常断开：abort 监听被摘掉，反复 10 次不积累', async () => {
+  for (let i = 0; i < 10; i++) {
+    const mock = new MockVrp()
+    const port = await mock.listen()
+    const client = new TelnetClient()
+    const sig = fakeSignal()
+    try {
+      await client.connect(port)
+      const p = client.exec('display version', { signal: sig })
+      mock.killConnections()
+      const r = await p
+      assert.equal(r.errorCode, 'CLOSED')
+      assert.equal(sig.count(), 0, `第 ${i + 1} 次断开后仍留着 abort 监听 → 长任务里会越积越多`)
+    } finally {
+      client.close()
+      await mock.close()
+    }
+  }
+})
+
+test('T4.2 正常收尾也不留下 abort 监听', async () => {
+  const mock = new MockVrp()
+  const port = await mock.listen()
+  const client = new TelnetClient()
+  const sig = fakeSignal()
+  try {
+    await client.connect(port)
+    const r = await client.exec('display version', { signal: sig })
+    assert.equal(r.ok, true)
+    assert.equal(sig.count(), 0)
+  } finally {
+    client.close()
+    await mock.close()
+  }
+})
+
+test('T4.3 汉字被分片劈开时不得误锁 GBK（尾部不完整序列先切掉）', () => {
+  const full = Buffer.from('配置中文描述', 'utf8')
+  const partial = full.subarray(0, full.length - 1)
+  // 尾部那个残缺汉字的 3 个字节（领头 + 2 个后续中只剩 2 个）整体被切掉
+  assert.equal(trimIncompleteTail(partial).length, full.length - 3)
+  assert.equal(detectEncoding(partial), 'utf8', '分片边界不能把 UTF-8 判成 GBK')
+  assert.equal(detectEncoding(full), 'utf8')
+
+  // 完整的 UTF-8 结尾必须原样返回（修法不能变成"永远砍尾巴"）
+  const tail = Buffer.from('abc中', 'utf8')
+  assert.deepEqual(trimIncompleteTail(tail), tail)
+
+  // 真 GBK 内容仍要判 gbk，别把修法做成"一律 utf8"
+  const gbk = Buffer.from([0xd6, 0xd0, 0xce, 0xc4, 0xc5, 0xe4, 0xd6, 0xc3, 0xcb, 0xb5, 0xc3, 0xf7])
+  assert.equal(detectEncoding(gbk), 'gbk')
+})
+
+test('T4.3 提示符：握手期不锁 [OK] 之类的输出短语，正常宿主名照常识别', () => {
+  assert.equal(matchPromptTail('\n[OK]'), null)
+  assert.equal(matchPromptTail('\n[Failed]'), null)
+  assert.equal(matchPromptTail('\n[--]'), null)
+  assert.ok(matchPromptTail('\n<Huawei>'))
+  assert.ok(matchPromptTail('\n[Huawei-Vlanif10]'))
 })

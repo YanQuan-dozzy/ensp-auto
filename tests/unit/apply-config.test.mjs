@@ -395,3 +395,41 @@ test('save_configuration：获闸门批准后代答 [Y/N] 并留变更记录', a
     await teardown()
   }
 })
+
+// ———————————————— v1.8：快照存储的信任边界回归 ————————————————
+
+test('SnapshotStore.read：恶意/越权 id 一律拒绝（路径逃逸防护）', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensp-auto-snap-'))
+  try {
+    const store = new SnapshotStore(dir)
+    const meta = store.save('127.0.0.1:2008', 'host config', 'base')
+    // 合法 id 正常读
+    assert.equal(store.read('127.0.0.1:2008', meta.id), 'host config')
+    // 目录穿越 / 非法字符 / 超长 id 一律 null，不触碰磁盘
+    assert.equal(store.read('127.0.0.1:2008', '../../etc/passwd'), null)
+    assert.equal(store.read('127.0.0.1:2008', 'secret.txt'), null)
+    assert.equal(store.read('127.0.0.1:2008', 'a'.repeat(100)), null)
+    // 跨设备归属校验：别的设备读不到
+    assert.equal(store.read('127.0.0.1:2009', meta.id), null)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('SnapshotStore：save 的 .txt 与索引原子一致，无孤儿文件（v1.8）', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensp-auto-snap-atom-'))
+  try {
+    const store = new SnapshotStore(dir)
+    const meta = store.save('127.0.0.1:2008', 'cfg', 'base')
+    // 正文落盘 + 索引可见
+    assert.equal(store.latest('127.0.0.1:2008').id, meta.id)
+    assert.equal(store.get('127.0.0.1:2008', meta.id).sizeBytes > 0, true)
+    // 索引文件是唯一 JSON（无残留 .tmp）
+    const leftovers = fs
+      .readdirSync(dir)
+      .filter((f) => f.endsWith('.tmp') || f.includes('.tmp'))
+    assert.deepEqual(leftovers, [])
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})

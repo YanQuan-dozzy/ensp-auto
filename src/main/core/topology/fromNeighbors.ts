@@ -116,12 +116,18 @@ export async function deriveTopology(
         (byId.has(`neighbor:${e.neighborName}`)
           ? byId.get(`neighbor:${e.neighborName}`)
           : (() => {
+              // v1.8：确定性坐标（按名字散列），替代 Math.random —— 随机坐标会让
+              // 每次 refresh/derive 时占位节点乱跳，既不持久也无稳定性
+              let hash = 0
+              for (let i = 0; i < e.neighborName.length; i++) {
+                hash = (hash * 31 + e.neighborName.charCodeAt(i)) >>> 0
+              }
               const stub: TopologyNode = {
                 id: `neighbor:${e.neighborName}`,
                 name: e.neighborName,
                 role: guessRole(e.neighborName),
-                x: Math.random() * 400,
-                y: Math.random() * 300
+                x: (hash % 5) * 180 + 40,
+                y: (Math.floor(hash / 5) % 4) * 120 + 40
               }
               nodes.push(stub)
               byId.set(stub.id, stub)

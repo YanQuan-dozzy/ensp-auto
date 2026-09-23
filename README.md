@@ -14,6 +14,9 @@
 - **安全的配置变更**：只读命令自由执行；配置走「快照 → 下发 → 期望校验 → 失败回滚」；破坏性命令需人工闸门批准
 - **设备通信层重写**：Node `net` + 提示符状态机，支持 VRP 分页（`---- More ----`）、GBK 编码、错误识别、并发与断线保护
 - **拓扑三层降级**：工程文件解析（`.topo`，兼容真机格式）→ LLDP 邻居实采推导 → React Flow 画布手补，三层自动合并；导入的拓扑可直接喂给代理
+- **任务级一键封装**：execute_task 支持 pc_connectivity / ospf / vlan / dhcp / static_route / rip / acl_nat / eth_trunk，结构化生成配置并逐台走安全管道
+- **结构化验证**：verify_ping / route / arp / nat / eth_trunk 只读判定 + collect_device_diagnostics 一键病灶采集
+- **实验模板一键搭建**：内置静态路由互通 / RIP 三路由 / NAT Easy IP / 双链路聚合模板，list_lab_templates + run_lab_template 一句话起整场实验
 - **会话树持久化**：全量落盘 + 历史回溯，任一节点可「从这里继续」换路重走
 - **数据可控**：报告导出（md / json）；可选内置 MCP 出口（Streamable HTTP，仅绑定 127.0.0.1），供 Trae / Claude 等客户端接入
 
@@ -84,9 +87,14 @@ $env:ELECTRON_MIRROR="https://npmmirror.com/mirrors/electron/"; npm install
 
 | 命令 | 结论 |
 |---|---|
-| `npm run typecheck` | 通过（node / web 两个 tsconfig 均无错误） |
+| `npm run typecheck` | 通过（node / web / tests 三套 tsconfig 均无错误） |
 | `npm run build` | 通过 |
-| `npm test` | **108 项全绿**：单元、通信层集成、配置链路、拓扑解析、会话树、MCP 端到端、工程文件解析 |
+| `npm test` | 全绿：单元、通信层集成（Mock VRP / Mock SSH）、配置链路、拓扑解析、会话树、MCP 端到端、工程文件解析、任务计划、验证解析、实验模板、落盘与安全管道 |
+
+用例数不写死在这里（历史上写死过一次，很快就过期了）：跑 `npm test` 看末尾的 `# pass`，
+或 `ls tests/unit/*.test.mjs | wc -l` 看用例文件数。
+注意 `tsconfig.tests.json` 也是门禁的一部分 —— 它专门覆盖 `tests/harness/**`，
+否则「删了源码模块却漏改 harness」这类问题只能等 `npm test` 才炸。
 
 ## 已知限制
 

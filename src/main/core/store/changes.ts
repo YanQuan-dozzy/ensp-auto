@@ -1,6 +1,13 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import type { DeviceId, Expectation } from '@shared/types'
+import {
+  describeShapeWarning,
+  isFiniteNumber,
+  isNonEmptyString,
+  sanitizeIndexItems
+} from './index-shape'
+import { atomicWriteJsonSync } from '../fs/atomic'
 
 /**
  * 变更记录（F-4.5：谁在何时改了什么、依据哪次快照）。
@@ -40,10 +47,36 @@ interface IndexFile {
 
 const MAX_PER_DEVICE = 200
 
+const CHANGE_KINDS: readonly ChangeKind[] = ['apply', 'restore', 'save']
+
+/** 索引条目的形状判定：id/deviceId/kind/result 是后续逻辑的硬依赖 */
+function isChangeRecord(v: unknown): v is ChangeRecord {
+  if (!v || typeof v !== 'object') return false
+  const c = v as Partial<ChangeRecord>
+  return (
+    isNonEmptyString(c.id) &&
+    isNonEmptyString(c.deviceId) &&
+    isFiniteNumber(c.at) &&
+    CHANGE_KINDS.includes(c.kind as ChangeKind) &&
+    (c.result === 'ok' || c.result === 'failed' || c.result === 'rejected' || c.result === 'blocked')
+  )
+}
+
 export class ChangeStore {
   private index: IndexFile = { version: 1, items: [] }
+  /** 加载期发现的问题，与 SnapshotStore 同口径 */
+  private loadWarnings: string[] = []
 
-  constructor(private readonly baseDir: string) {
+  constructor(private baseDir: string) {
+    this.load()
+  }
+
+  get warnings(): readonly string[] {
+    return this.loadWarnings
+  }
+
+  setBaseDir(newDir: string): void {
+    this.baseDir = newDir
     this.load()
   }
 
@@ -52,20 +85,28 @@ export class ChangeStore {
   }
 
   private load(): void {
+    this.loadWarnings = []
     try {
       if (!fs.existsSync(this.indexFile)) return
-      const parsed = JSON.parse(fs.readFileSync(this.indexFile, 'utf8')) as IndexFile
-      this.index = { version: 1, items: parsed.items ?? [] }
+      const parsed = JSON.parse(fs.readFileSync(this.indexFile, 'utf8')) as Partial<IndexFile>
+      // R22：形状校验（同 SnapshotStore 的说明）
+      const shaped = sanitizeIndexItems(parsed?.items, isChangeRecord)
+      this.index = { version: 1, items: shaped.items }
+      const warning = describeShapeWarning('变更记录', shaped)
+      if (warning) {
+        this.loadWarnings.push(warning)
+        console.warn(`[changes] ${warning}（${this.indexFile}）`)
+      }
     } catch {
       this.index = { version: 1, items: [] }
+      this.loadWarnings.push('变更记录索引无法解析（文件损坏），已按空列表处理')
+      console.warn(`[changes] 变更记录索引无法解析，已按空列表处理：${this.indexFile}`)
     }
   }
 
   private persist(): void {
-    fs.mkdirSync(this.baseDir, { recursive: true })
-    const tmp = `${this.indexFile}.tmp`
-    fs.writeFileSync(tmp, JSON.stringify(this.index, null, 2), 'utf8')
-    fs.renameSync(tmp, this.indexFile)
+    // T2.5：统一原子写
+    atomicWriteJsonSync(this.indexFile, this.index)
   }
 
   /** 追加一条变更记录，返回完整记录 */
@@ -75,9 +116,17 @@ export class ChangeStore {
       id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
       at: Date.now()
     }
+    const before = this.index.items.slice()
     this.index.items.unshift(full)
     this.prune(record.deviceId)
-    this.persist()
+    // R21：变更记录写失败时回滚内存 —— 否则「界面上有这条记录、磁盘上没有」，
+    // 报告导出与会话回溯会给出互相矛盾的结论
+    try {
+      this.persist()
+    } catch (e) {
+      this.index.items = before
+      throw e
+    }
     return full
   }
 

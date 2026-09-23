@@ -3,6 +3,7 @@ import path from 'node:path'
 import { buildJson, buildMarkdown } from '../core/session-tree/report'
 import type { SessionTreeStore } from '../core/session-tree/store'
 import { fail, ok, Type, type ToolSpec } from './registry'
+import { safeFileName } from '@shared/naming'
 
 /**
  * 会话与报告工具（v0.4 / TOOLS.md §4.5）。
@@ -25,7 +26,8 @@ export function collectSessionReport(
   const nodes = store.getTree(rootId)
   const body = format === 'json' ? buildJson(meta, nodes) : buildMarkdown(meta, nodes)
 
-  const safe = meta.title.replace(/[\\/:*?"<>|]/g, '_').slice(0, 40) || 'session'
+  // T5.3 / R48：导出目录名与其它文件名走同一套规则（含 Windows 保留名与结尾点）
+  const safe = safeFileName(meta.title, { fallback: 'session', maxLen: 40 })
   const ext = format === 'json' ? 'json' : 'md'
   const dir = path.join(exportsDir, safe)
   fs.mkdirSync(dir, { recursive: true })

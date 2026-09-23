@@ -31,6 +31,13 @@ export interface TelnetOptions {
   disablePagingOnConnect: boolean
   /** 连接阶段的超时（等待首个提示符） */
   connectTimeoutMs: number
+  /**
+   * 握手“唤醒”窗口：TCP 连上后若这段时间内握手还没读到首个提示符，
+   * 补发一个回车（\r\n）把设备踹醒。部分 eNSP 设备连接后不主动推
+   * banner/提示符，必须收到输入才回话 —— 与参考实现 connect() 里
+   * send(b'\r\n') 等价，区别是只对“哑巴设备”补发，不打扰正常首发 banner 的设备。
+   */
+  connectNudgeMs: number
 }
 
 export const DEFAULT_TELNET_OPTIONS: TelnetOptions = {
@@ -41,7 +48,9 @@ export const DEFAULT_TELNET_OPTIONS: TelnetOptions = {
   charDelayMs: 0,
   maxPagingHops: 200,
   disablePagingOnConnect: true,
-  connectTimeoutMs: 10000
+  connectTimeoutMs: 10000,
+  // 必须小于 quietMs(300) —— 否则「有 banner 无提示符」的设备会先被静默兜底收尾
+  connectNudgeMs: 200
 }
 
 // ——————————————————————————————————————————————
@@ -57,6 +66,15 @@ export const PROMPT_TAIL_RE = /(?:^|\n)[ \t]*([<[])([^\n<>[\]]{1,80})([>\]])[ \t
 
 /** 提示符内容中不允许出现的字符（出现则基本可断定是输出正文而非提示符） */
 export const PROMPT_REJECT_RE = /[\s=,;:'"]/
+
+/**
+ * 内容整体是「设备输出短语」而不是宿主名（T4.3）。
+ *
+ * `[OK]` / `[ERROR]` / `[Y/N]` 这类括号内容形状上与提示符一模一样，
+ * 握手期（还没锁定宿主名）会把它们当成宿主名，之后整段会话的提示符判定都跟着错。
+ */
+export const PROMPT_REJECT_WORDS =
+  /^(?:ok|okay|error|fail|failed|success|warning|warn|info|information|yes|no|y\/n|n\/y|confirm|confirmed|done|quit|exit|abort|retry)$/i
 
 /**
  * 视图关键字表。识别到关键字时，宿主名 = 关键字之前的全部文本。

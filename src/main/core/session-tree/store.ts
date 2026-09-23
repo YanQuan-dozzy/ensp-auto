@@ -2,6 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import type { SessionNode, SessionNodeMeta } from '@shared/types'
+import { atomicWriteJsonSync } from '../fs/atomic'
 
 /**
  * 会话树存储（v0.4 / F-6.2）。
@@ -62,9 +63,8 @@ export class SessionTreeStore {
 
   private persistIndex(): void {
     const data: IndexFile = { version: 1, sessions: Object.fromEntries(this.index) }
-    const tmp = `${this.indexFile()}.tmp`
-    fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8')
-    fs.renameSync(tmp, this.indexFile())
+    // T2.5：统一原子写（此前是 `${indexFile}.tmp` 固定名，并发写会互相顶掉半成品）
+    atomicWriteJsonSync(this.indexFile(), data)
   }
 
   private notify(): void {
@@ -193,5 +193,38 @@ export class SessionTreeStore {
 
   childrenOf(rootId: string, nodeId: string): SessionNode[] {
     return this.tree(rootId).filter((n) => n.parentId === nodeId)
+  }
+
+  // ———————————————————— 维护（v1.6） ————————————————————
+
+  /**
+   * 清空全部会话（设置 → 通用 → 数据与存储）。
+   *
+   * 内存里的三张表必须和磁盘一起清：只删文件的话，进程内还留着旧索引，
+   * 之后任何一次 append/notify 都会把已经不存在的会话重新列出来 ——
+   * 用户看到的就是「点了清空，列表还在」。
+   * 返回删掉的会话文件数（一个会话一个 jsonl）。
+   */
+  resetAll(): number {
+    let removed = 0
+    try {
+      for (const f of fs.readdirSync(this.opts.dir)) {
+        if (!/^tree-.*\.jsonl$/.test(f)) continue
+        try {
+          fs.rmSync(path.join(this.opts.dir, f), { force: true })
+          removed += 1
+        } catch {
+          /* 被占用就跳过，不中断清理 */
+        }
+      }
+      fs.rmSync(this.indexFile(), { force: true })
+    } catch {
+      /* 目录不存在等：按「已经是空的」处理 */
+    }
+    this.index.clear()
+    this.cache.clear()
+    this.owner.clear()
+    this.notify()
+    return removed
   }
 }

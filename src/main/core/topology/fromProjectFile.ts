@@ -91,24 +91,109 @@ interface ParsedDevice {
 
 const ATTR_RE = /([\w:-]+)\s*=\s*"([^"]*)"/gi
 
+/** 最小 XML 实体解码（写回自产的 &amp;/&lt;/&gt;/&quot;/&apos; 与真机同名） */
+function decodeEntities(s: string): string {
+  return s
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+}
+
 function parseAttrs(tag: string): Record<string, string> {
   const out: Record<string, string> = {}
   for (const m of tag.matchAll(ATTR_RE)) {
-    out[m[1]!.toLowerCase()] = m[2] ?? ''
+    out[m[1]!.toLowerCase()] = decodeEntities(m[2] ?? '')
   }
   return out
 }
 
-/** 在 XML 里提取设备元素（优先 <devices> 容器；找不到则排除 interfacePair 块后全量扫） */
-function extractDeviceTags(xml: string): string[] {
+interface DeviceElement {
+  /** 开标签属性原文（进 parseAttrs） */
+  attrs: string
+  /** 成对元素内部 XML（含 <slot>/<interface> 等接口定义），自闭合为空串 */
+  inner: string
+}
+
+/** 在 XML 里提取设备元素（优先 <devices> 容器；找不到则排除 interfacePair 块后全量扫）。
+ *  兼容成对 `<dev …>…</dev>`（取内部接口定义）与自闭合 `<dev …/>` 两种形态。 */
+function extractDeviceElements(xml: string): DeviceElement[] {
   const devBlock = /<devices[^>]*>([\s\S]*?)<\/devices>/i.exec(xml)
   const source = devBlock ? devBlock[1]! : xml.replace(/<interfacePair[\s\S]*?<\/interfacePair>/gi, '')
-  const tags: string[] = []
-  // 真机用 <dev id=…>，旧版/他版用 <device …>：两种都认
-  for (const m of source.matchAll(/<\s*(?:device|dev)\b([^>]*?)\/?\s*>/gi)) {
-    tags.push(m[1] ?? '')
+  const out: DeviceElement[] = []
+  // 成对优先（非贪婪取到首个闭合标签），否则按自闭合
+  const re =
+    /<\s*(?:device|dev)\b([^>]*)>([\s\S]*?)<\/\s*(?:device|dev)\s*>|<\s*(?:device|dev)\b([^>]*?)\/\s*>/gi
+  for (const m of source.matchAll(re)) {
+    if (m[1] !== undefined) out.push({ attrs: m[1] ?? '', inner: m[2] ?? '' })
+    else out.push({ attrs: m[3] ?? '', inner: '' })
   }
-  return tags
+  return out
+}
+
+/**
+ * 从设备元素内部 XML 解析「有序接口名数组」。
+ * - 标准格式：<slot …><interface sztype="Ethernet" interfacename="GE" count="4"/></slot>
+ *   → 按 count 展开（interfacename + 0/0/{n}，与 ensp-mcp interface_mapping 同构）；
+ *     同名类型跨多个 <interface> 分组时连续编号不减号（如 AR2220 的 GE×1 + GE×2
+ *     → GE0/0/0、GE0/0/1、GE0/0/2），避免 0/0/0 重复重置
+ * - 编号起点对齐 VRP 真机命名（关键修复，参照 ensp-mcp）：
+ *     GE：交换机从 GE0/0/1 起（eNSP 交换机端口标签 1-based），路由器等从 GE0/0/0 起；
+ *     Ethernet/Eth：一律从 0/0/1 起（eNSP 中仅交换机出现 Ethernet 口）；
+ *     其他类型（Serial/POS/…）：保持 0/0/{n} 原样
+ * - 防火墙格式：<interface type="GE" slotIndex="0" cardIndex="0" interfaceIndex="0"/>
+ *   → GE0/0/0（slot/card/interface 三段拼接，不做偏移）
+ * - 无任何接口定义 → 返回 []（调用方不写 interfaces 字段）
+ */
+export function parseDeviceInterfaces(innerXml: string, opts?: { isSwitch?: boolean }): string[] {
+  const out: string[] = []
+  const nameCounters = new Map<string, number>() // interfacename → 已累计数量（同名字段跨分组连续编号）
+  const isSwitch = opts?.isSwitch ?? false
+  for (const m of innerXml.matchAll(/<interface\b([^>]*?)\/?\s*>/gi)) {
+    const a = parseAttrs(m[1] ?? '')
+    const base = a['interfacename'] || a['name'] || a['sztype'] || a['type'] || ''
+    if (!base) continue
+    const hasTriplet = a['slotindex'] !== undefined || a['cardindex'] !== undefined || a['interfaceindex'] !== undefined
+    if (hasTriplet) {
+      out.push(`${base}${a['slotindex'] ?? 0}/${a['cardindex'] ?? 0}/${a['interfaceindex'] ?? 0}`)
+      continue
+    }
+    const countRaw = a['count']
+    const count = countRaw && Number.isFinite(Number(countRaw)) ? Number.parseInt(countRaw, 10) : 1
+    const total = Math.max(1, count)
+    const start = nameCounters.get(base) ?? 0
+    const baseUpper = base.toUpperCase()
+    const offset =
+      baseUpper === 'GE'
+        ? isSwitch
+          ? 1
+          : 0
+        : baseUpper === 'ETHERNET' || baseUpper === 'ETH'
+          ? 1
+          : 0
+    for (let k = 0; k < total; k++) out.push(`${base}0/0/${start + k + offset}`)
+    nameCounters.set(base, start + total)
+  }
+  return out
+}
+
+/** 端口序号 → 接口名；越界容错返回 GE0/0/{index}（真机端口序号与接口表不对位时不抛错）。
+ *  isSwitch 时兜底也加 1（交换机无 GE0/0/0）。 */
+export function resolveInterfaceName(ifaces: string[], index: number, isSwitch?: boolean): string {
+  if (index >= 0 && index < ifaces.length && ifaces[index]) return ifaces[index]!
+  return `GE0/0/${index + (isSwitch ? 1 : 0)}`
+}
+
+/** 从 interfacePair 属性提端口序号 (src, tar)；缺任一/非数字 → null */
+function extractPairIndices(attrs: Record<string, string>): [number, number] | null {
+  const sRaw = attrs['srcindex'] ?? attrs['src'] ?? attrs['fromindex']
+  const tRaw = attrs['tarindex'] ?? attrs['dstindex'] ?? attrs['targetindex'] ?? attrs['toindex']
+  if (sRaw === undefined || tRaw === undefined) return null
+  const s = Number.parseInt(sRaw, 10)
+  const t = Number.parseInt(tRaw, 10)
+  if (!Number.isFinite(s) || !Number.isFinite(t)) return null
+  return [s, t]
 }
 
 /** 解析设备标签的属性（容错字段名变体） */
@@ -190,19 +275,26 @@ export function parseTopoXml(xml: string): TopoParseResult {
   const nodes: TopologyNode[] = []
   const links: TopologyLink[] = []
   const idByKey = new Map<string, string>() // name/devid → node id
+  const ifacesById = new Map<string, string[]>() // node id → 有序接口名数组
+  const switchByKey = new Map<string, boolean>() // node key → 是否交换机（接口编号从 1 起）
 
-  const tags = extractDeviceTags(xml)
-  for (const tagAttr of tags) {
-    const d = parseDevice(parseAttrs(tagAttr))
+  const elements = extractDeviceElements(xml)
+  for (const el of elements) {
+    const d = parseDevice(parseAttrs(el.attrs))
     if (!d) continue
     const id = d.name
     idByKey.set(id.toLowerCase(), id)
     if (d.devid) idByKey.set(d.devid.toLowerCase(), id)
+    const isSwitch = guessRole(d.name, d.model) === 'switch'
+    switchByKey.set(id.toLowerCase(), isSwitch)
+    const ifaces = parseDeviceInterfaces(el.inner, { isSwitch })
+    if (ifaces.length > 0) ifacesById.set(id, ifaces)
     nodes.push({
       id,
       name: d.name,
       role: guessRole(d.name, d.model),
       ...(d.model ? { model: d.model } : {}),
+      ...(ifaces.length > 0 ? { interfaces: ifaces } : {}),
       ...(d.comPort ? { deviceId: `127.0.0.1:${d.comPort}` } : {}),
       ...(d.x !== undefined ? { x: d.x } : {}),
       ...(d.y !== undefined ? { y: d.y } : {})
@@ -212,26 +304,67 @@ export function parseTopoXml(xml: string): TopoParseResult {
     warnings.push('未识别到任何设备。若为新版格式或压缩变体，需按真机 .topo 样例校准解析器。')
   }
 
+  // label 合并器：同端点对多条 interfacePair → 「ifA ↔ ifB / ifA2 ↔ ifB2 …」，全部保留
+  // （与 ensp- 参考实现每个 interfacePair 一条独立连线的展示等价：并联链路每对都有标注，不截断）
+  const labelByKey = new Map<string, string[]>()
   const seen = new Set<string>()
-  const addFileLink = (rawA: string, rawB: string): void => {
+  const resolveFor = (raw: string): string[] => {
+    const id = idByKey.get(raw.toLowerCase()) ?? raw
+    return ifacesById.get(id) ?? []
+  }
+  /** 端口序号 → 接口名（含交换机 1-based 偏移） */
+  const resolveIfLabel = (raw: string, index: number): string => {
+    const id = idByKey.get(raw.toLowerCase()) ?? raw
+    return resolveInterfaceName(resolveFor(raw), index, switchByKey.get(id.toLowerCase()) ?? false)
+  }
+  const addFileLink = (rawA: string, rawB: string, label?: string): void => {
     const a = idByKey.get(rawA.toLowerCase()) ?? rawA
     const b = idByKey.get(rawB.toLowerCase()) ?? rawB
     if (a === b) return
     const key = a < b ? `${a}|${b}` : `${b}|${a}`
-    if (seen.has(key)) return // 同端点对去重（一条 line 可有多个 interfacePair）
-    seen.add(key)
-    links.push({ id: `file-${a}->${b}`, from: a, to: b, source: 'file' })
+    if (!seen.has(key)) {
+      seen.add(key)
+      links.push({ id: `file-${a}->${b}`, from: a, to: b, source: 'file', ...(label ? { label } : {}) })
+      return
+    }
+    const prev = links.find((l) => l.id === `file-${a}->${b}`)
+    if (prev && label) {
+      labelByKey.set(key, labelByKey.get(key) ?? (prev.label ? [prev.label] : []))
+      const parts = labelByKey.get(key)!
+      if (!parts.includes(label)) {
+        parts.push(label)
+        prev.label = parts.join(' / ')
+      }
+    }
   }
 
-  // 1) 真机新版：<line srcDeviceID destDeviceID>（内部是自闭合 interfacePair，仅含端口序号）
-  for (const m of xml.matchAll(/<\s*line\b([^>]*?)\/?\s*>/gi)) {
+  // 1) 真机新版：<line srcDeviceID destDeviceID>（内部 interfacePair 仅含端口序号，无 name 端点）
+  for (const m of xml.matchAll(/<\s*line\b([^>]*?)(?:\/>|>([\s\S]*?)<\/\s*line\s*>)/gi)) {
     const ids = extractLineEndpoints(m[1] ?? '')
-    if (ids) addFileLink(ids[0], ids[1])
+    if (!ids) continue
+    const inner = m[2] ?? ''
+    let matched = false
+    for (const ip of inner.matchAll(/<interfacePair\b([^>]*?)\/?\s*>/gi)) {
+      const idx = extractPairIndices(parseAttrs(ip[1] ?? ''))
+      if (!idx) continue
+      matched = true
+      addFileLink(
+        ids[0],
+        ids[1],
+        `${resolveIfLabel(ids[0], idx[0])} ↔ ${resolveIfLabel(ids[1], idx[1])}`
+      )
+    }
+    if (!matched) addFileLink(ids[0], ids[1])
   }
   // 2) 旧版/他版：interfacePair 自带 name 端点（<fromdevice name="…"/>），兼容自闭合与成对
   for (const m of xml.matchAll(/<\s*interfacePair\b([^>]*?)(?:\/>|>([\s\S]*?)<\/interfacePair>)/gi)) {
     const pair = extractLinkEndpoints(`${m[1] ?? ''} ${m[2] ?? ''}`)
-    if (pair) addFileLink(pair[0], pair[1])
+    if (!pair) continue
+    const idx = extractPairIndices(parseAttrs(m[1] ?? ''))
+    const label = idx
+      ? `${resolveIfLabel(pair[0], idx[0])} ↔ ${resolveIfLabel(pair[1], idx[1])}`
+      : undefined
+    addFileLink(pair[0], pair[1], label)
   }
 
   return {

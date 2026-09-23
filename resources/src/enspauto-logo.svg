@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="enspGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#3b82f6" />
+      <stop offset="100%" stop-color="#8b5cf6" />
+    </linearGradient>
+    <clipPath id="squircleClip">
+      <rect x="0" y="0" width="1024" height="1024" rx="292.57" ry="292.57" />
+    </clipPath>
+  </defs>
+
+  <!-- Background squircle (border-radius: 8/28 * 1024 = 292.57) -->
+  <rect x="0" y="0" width="1024" height="1024" rx="292.57" ry="292.57" fill="url(#enspGradient)" />
+
+  <!-- Top edge subtle highlight (inset 0 1px 0 rgba(255, 255, 255, 0.22)) -->
+  <rect x="0" y="0" width="1024" height="1024" rx="292.57" ry="292.57" fill="none" stroke="rgba(255, 255, 255, 0.22)" stroke-width="24" clip-path="url(#squircleClip)" />
+
+  <!-- Central IconLogo (scale = 658.28 / 24, offset = 182.86) -->
+  <g transform="translate(182.86, 182.86) scale(27.4285)" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="12" cy="12" r="3" />
+    <path d="M12 3v6M12 15v6M3 12h6M15 12h6" />
+    <circle cx="12" cy="3" r="1.5" fill="#ffffff" />
+    <circle cx="12" cy="21" r="1.5" fill="#ffffff" />
+    <circle cx="3" cy="12" r="1.5" fill="#ffffff" />
+    <circle cx="21" cy="12" r="1.5" fill="#ffffff" />
+  </g>
+</svg>

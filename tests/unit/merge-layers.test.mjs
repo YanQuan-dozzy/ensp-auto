@@ -83,3 +83,183 @@ test('mergeLayers：无 file 层时行为等同旧两层合并', () => {
   assert.equal(t.nodes[0].name, 'A-改')
   assert.equal(t.nodes[0].source, 'manual')
 })
+
+test('mergeLayers：手动覆盖坐标/角色不丢 file 层解析的 interfaces（拓扑展示增强）', () => {
+  const file = {
+    nodes: [
+      { id: 'SW1', name: 'SW1', role: 'switch', interfaces: ['GE0/0/0', 'GE0/0/1', 'GE0/0/2', 'GE0/0/3'], x: 1, y: 2 }
+    ],
+    links: [],
+    updatedAt: 1
+  }
+  // 手动层拖动落位：仅坐标，无 interfaces → 应保留 file 层接口表
+  const t = mergeLayers(
+    file,
+    { nodes: [], links: [], updatedAt: 1 },
+    { nodes: [{ id: 'SW1', name: 'SW1', role: 'switch', x: 99, y: 99, source: 'manual' }], links: [] }
+  )
+  const sw1 = t.nodes.find((n) => n.id === 'SW1')
+  assert.equal(sw1.x, 99)
+  assert.deepEqual(sw1.interfaces, ['GE0/0/0', 'GE0/0/1', 'GE0/0/2', 'GE0/0/3'])
+})
+
+test('mergeLayers：deleted 墓碑过滤节点（v0.6 F-5.6）', () => {
+  // file 层有 AR1，manual 层打删除墓碑 → 合并结果不含 AR1
+  const t = mergeLayers(
+    { nodes: [{ id: 'AR1', name: 'AR1', role: 'router', x: 1, y: 2 }], links: [], updatedAt: 1 },
+    { nodes: [], links: [], updatedAt: 1 },
+    { nodes: [{ id: 'AR1', name: 'AR1', role: 'router', deleted: true, source: 'manual' }], links: [] }
+  )
+  assert.equal(t.nodes.length, 0)
+  assert.equal(t.links.length, 0)
+})
+
+test('mergeLayers：deleted 墓碑过滤节点；链路由调用方（TopologyStore.remove）连带墓碑', () => {
+  const file = {
+    nodes: [
+      { id: 'AR1', name: 'AR1', role: 'router' },
+      { id: 'SW1', name: 'SW1', role: 'switch' },
+      { id: 'PC1', name: 'PC1', role: 'pc' }
+    ],
+    links: [
+      { id: 'l1', from: 'AR1', to: 'SW1', source: 'file' },
+      { id: 'l2', from: 'SW1', to: 'PC1', source: 'file' }
+    ],
+    updatedAt: 1
+  }
+  // 只墓碑节点 SW1：节点消失，链路保留在结构里（渲染层按端点存在性过滤）
+  const t = mergeLayers(
+    file,
+    { nodes: [], links: [], updatedAt: 1 },
+    { nodes: [{ id: 'SW1', name: 'SW1', role: 'switch', deleted: true, source: 'manual' }], links: [] }
+  )
+  assert.deepEqual(t.nodes.map((n) => n.id).sort(), ['AR1', 'PC1'])
+  // 链路墓碑显式给出时同样被过滤
+  const t2 = mergeLayers(
+    file,
+    { nodes: [], links: [], updatedAt: 1 },
+    {
+      nodes: [{ id: 'SW1', name: 'SW1', role: 'switch', deleted: true, source: 'manual' }],
+      links: [
+        { from: 'AR1', to: 'SW1', deleted: true, source: 'manual' },
+        { from: 'SW1', to: 'PC1', deleted: true, source: 'manual' }
+      ]
+    }
+  )
+  assert.equal(t2.nodes.length, 2)
+  assert.equal(t2.links.length, 0)
+})
+
+test('mergeLayers：链路墓碑只删该链路，节点保留', () => {
+  const file = {
+    nodes: [
+      { id: 'AR1', name: 'AR1', role: 'router' },
+      { id: 'SW1', name: 'SW1', role: 'switch' }
+    ],
+    links: [{ id: 'l1', from: 'AR1', to: 'SW1', source: 'file' }],
+    updatedAt: 1
+  }
+  const t = mergeLayers(
+    file,
+    { nodes: [], links: [], updatedAt: 1 },
+    {
+      nodes: [],
+      links: [{ from: 'AR1', to: 'SW1', deleted: true, source: 'manual' }]
+    }
+  )
+  assert.equal(t.nodes.length, 2)
+  assert.equal(t.links.length, 0)
+})
+
+test('mergeLayers：手动复活被删链路（manual 非 deleted 覆盖墓碑）', () => {
+  const file = {
+    nodes: [
+      { id: 'AR1', name: 'AR1', role: 'router' },
+      { id: 'SW1', name: 'SW1', role: 'switch' }
+    ],
+    links: [{ id: 'l1', from: 'AR1', to: 'SW1', source: 'file' }],
+    updatedAt: 1
+  }
+  const t = mergeLayers(
+    file,
+    { nodes: [], links: [], updatedAt: 1 },
+    {
+      nodes: [],
+      links: [
+        { from: 'AR1', to: 'SW1', deleted: true, source: 'manual' },
+        { from: 'AR1', to: 'SW1', label: '重连', source: 'manual' }
+      ]
+    }
+  )
+  assert.equal(t.links.length, 1)
+  assert.equal(t.links[0].deleted, false) // 手动非 deleted 覆盖墓碑
+  assert.equal(t.links[0].label, '重连')
+})
+
+test('mergeLayers：旧持久化数据自愈——墓碑在前、复活条目在后（活条目优先）', () => {
+  const file = {
+    nodes: [
+      { id: 'SW1', name: 'SW1', role: 'switch' },
+      { id: 'PC3', name: 'PC3', role: 'pc' }
+    ],
+    links: [{ id: 'f1', from: 'SW1', to: 'PC3', source: 'file' }],
+    updatedAt: 1
+  }
+  // 模拟修复前 applyManual 追加顺序：活条目在前、墓碑在后面（后写覆盖前写 → 链路被删）
+  const t = mergeLayers(
+    file,
+    { nodes: [], links: [], updatedAt: 1 },
+    {
+      nodes: [],
+      links: [
+        { from: 'SW1', to: 'PC3', label: '重连', source: 'manual' },
+        { from: 'SW1', to: 'PC3', deleted: true, source: 'manual' }
+      ]
+    }
+  )
+  assert.equal(t.links.length, 1)
+  assert.ok(!t.links[0].deleted) // 活条目不被同端点墓碑压掉
+  assert.equal(t.links[0].label, '重连')
+})
+
+test('mergeLayers：旧持久化节点自愈——墓碑与同名手动节点并存时节点复活', () => {
+  const file = {
+    nodes: [{ id: 'PC3', name: 'PC3', role: 'pc' }],
+    links: [],
+    updatedAt: 1
+  }
+  const t = mergeLayers(
+    file,
+    { nodes: [], links: [], updatedAt: 1 },
+    {
+      nodes: [
+        { id: 'PC3', name: 'PC3', role: 'pc', source: 'manual', x: 1, y: 2 },
+        { id: 'PC3', name: 'PC3', role: 'pc', deleted: true, source: 'manual' }
+      ],
+      links: []
+    }
+  )
+  assert.equal(t.nodes.length, 1)
+  assert.ok(!t.nodes[0].deleted)
+})
+
+test('mergeLayers：墓碑压制 file/discovered 同端点链路——文件重导入不自动复活已删除链路', () => {
+  const file = {
+    nodes: [
+      { id: 'AR1', name: 'AR1', role: 'router' },
+      { id: 'SW1', name: 'SW1', role: 'switch' }
+    ],
+    links: [{ id: 'l1', from: 'AR1', to: 'SW1', source: 'file' }],
+    updatedAt: 1
+  }
+  // 墓碑在手动层，file 层也有同端点链路（重新导入后的文件）→ 墓碑生效，链路仍被删
+  const t = mergeLayers(
+    file,
+    { nodes: [], links: [], updatedAt: 1 },
+    {
+      nodes: [],
+      links: [{ from: 'AR1', to: 'SW1', deleted: true, source: 'manual' }]
+    }
+  )
+  assert.equal(t.links.length, 0)
+})

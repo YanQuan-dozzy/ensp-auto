@@ -12,13 +12,18 @@
 - **多 LLM Provider**：内置 DeepSeek / OpenAI / Anthropic / Google 及自定义 OpenAI 兼容端点（基于 `@earendil-works/pi-ai`，动态懒加载）
 - **自研 ReAct 内核**：精简 ReAct 循环 + 领域闸门，不依赖通用 Agent 框架
 - **安全的配置变更**：只读命令自由执行；配置走「快照 → 下发 → 期望校验 → 失败回滚」；破坏性命令需人工闸门批准
-- **设备通信层重写**：Node `net` + 提示符状态机，支持 VRP 分页（`---- More ----`）、GBK 编码、错误识别、并发与断线保护
+- **传输层双通道**：Telnet（Node `net` + 提示符状态机，支持 VRP 分页 `---- More ----`、GBK 编码、错误识别、并发与断线保护）+ SSH（ssh2）；连接凭据本机加密存放
 - **拓扑三层降级**：工程文件解析（`.topo`，兼容真机格式）→ LLDP 邻居实采推导 → React Flow 画布手补，三层自动合并；导入的拓扑可直接喂给代理
 - **任务级一键封装**：execute_task 支持 pc_connectivity / ospf / vlan / dhcp / static_route / rip / acl_nat / eth_trunk，结构化生成配置并逐台走安全管道
-- **结构化验证**：verify_ping / route / arp / nat / eth_trunk 只读判定 + collect_device_diagnostics 一键病灶采集
-- **实验模板一键搭建**：内置静态路由互通 / RIP 三路由 / NAT Easy IP / 双链路聚合模板，list_lab_templates + run_lab_template 一句话起整场实验
+- **结构化验证**：verify_ping / route / arp / dhcp / nat / eth_trunk 只读判定 + collect_device_diagnostics 一键病灶采集
+- **实验模板一键搭建**：内置静态路由互通 / RIP 三路由 / NAT Easy IP / 双链路聚合模板，list_lab_templates + run_lab_template 一句话起整场实验；export_lab_guide 一键导出图文实验手册
+- **抓包与 Wireshark 联动**：内置依赖检测与自动拉包，抓包 payload 直接入库并喂给代理辅助定位
+- **技能（Skills）系统**：内置技能清单锁定（skills-lock.json）+ 本地技能导入，按需注入上下文
+- **实验目标与附件**：实验目标（goals）持久化追踪；抓包 / 截图 / 日志等附件分页读写
+- **参考配置分析**：analyze_reference_configs 自动抽取参考配置中的一致性要点
+- **eNSP 生命周期托管**：主进程内置 eNSP 检测与启动器，一键拉起模拟器
 - **会话树持久化**：全量落盘 + 历史回溯，任一节点可「从这里继续」换路重走
-- **数据可控**：报告导出（md / json）；可选内置 MCP 出口（Streamable HTTP，仅绑定 127.0.0.1），供 Trae / Claude 等客户端接入
+- **数据可控**：报告导出（md / json）；内置 MCP 双向——Streamable HTTP Server 出口（仅绑定 127.0.0.1）供 Trae / Claude 等客户端接入，亦可导入外部 MCP 服务器（client 模式）丰富代理工具
 
 ## 快速开始
 
@@ -60,12 +65,12 @@ $env:ELECTRON_MIRROR="https://npmmirror.com/mirrors/electron/"; npm install
 | 技术栈 | Electron + React 19 + TypeScript，无 Python 运行时依赖 |
 | AI 角色 | 纯代理（一句话到结果），非副驾 |
 | Agent 内核 | 自研精简 ReAct 循环 + `@earendil-works/pi-ai`，不引 `pi-agent-core` |
-| 通信层 | Node `net` + 提示符状态机整体重写 |
+| 通信层 | 双通道：Telnet（Node `net` + 提示符状态机）+ SSH（ssh2），提示符状态机统一处理 VRP 会话 |
 | 拓扑 | 结构化领域模型：工程文件 / LLDP 实采 / 画布手补三层降级合并 |
 | 执行边界 | 只读自由 / 配置走快照事务校验回滚 / 破坏性命令人工闸门 |
-| 界面 | 三栏布局（设备树 / 主舞台 tab / AI 常驻），深色为主可切浅色 |
-| 持久化 | JSON KV + JSONL 快照目录，无需原生模块 |
-| MCP | 内置 Streamable HTTP（127.0.0.1，设置开关），一份 TypeBox schema 双出口 |
+| 界面 | 三栏布局（设备树 / 主舞台 tab / AI 常驻），深色为主可切浅色；支持快捷键与自适应面板 |
+| 持久化 | JSON KV + JSONL 快照目录，带版本迁移（当前 v19），无需原生模块 |
+| MCP | 双向：内置 Streamable HTTP Server（127.0.0.1，设置开关）+ 可导入外部 MCP 服务器；一份 TypeBox schema 复用 |
 
 分层硬边界：渲染进程不持有任何 Node 权限，所有特权操作经 preload 白名单 + IPC 进入主进程。
 
@@ -79,7 +84,7 @@ $env:ELECTRON_MIRROR="https://npmmirror.com/mirrors/electron/"; npm install
 | 终端 | xterm.js |
 | 拓扑图 | React Flow（`@xyflow/react`） |
 | 状态 | Zustand |
-| 设备通信 | Node `net` + 内置 `TextDecoder`（GBK） |
+| 设备通信 | Telnet：Node `net` + 内置 `TextDecoder`（GBK）；SSH：`ssh2` |
 | Schema | TypeBox（一份 schema 同时喂 LLM 与 MCP） |
 | 打包 | electron-builder → 单 exe 便携版 |
 
@@ -98,7 +103,7 @@ $env:ELECTRON_MIRROR="https://npmmirror.com/mirrors/electron/"; npm install
 
 ## 已知限制
 
-- **eNSP 真机联调待做**：通信层行为由 Mock VRP 设备覆盖（分页 / 编码 / 兜底 / 并发 / 断线），但真机提示符与错误文案的形态仍需按真机实测校准一次，差异回写 `patterns.ts`
+- **eNSP 真机联调待做**：通信层行为由 Mock VRP / Mock SSH 设备覆盖（分页 / 编码 / 兜底 / 并发 / 断线），但真机提示符与错误文案的形态仍需按真机实测校准一次，差异回写 `patterns.ts`
 - **真实模型调用待配 Key 验证**：各 provider 已接入并通过类型检查 / 构建 / 事件翻译单测，流式工具调用尚未用真实 API Key 端到端跑过；认证缺失、模型名不在目录等失败分支已在代码中显式处理
 - **检查点恢复（P2）**：崩溃 / 退出后任务不自动续跑，但会话树已全量落盘，可通过「从这里继续」重放
 

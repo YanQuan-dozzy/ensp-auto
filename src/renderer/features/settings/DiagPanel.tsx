@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import type { DiagCheck, DiagLevel, DiagReport } from '@shared/types'
 import { useApp } from '@/stores/app'
-import { Chip, Dot, IconRefresh } from '@/components/ui'
+import { Chip, DismissibleBanner, Dot, IconRefresh } from '@/components/ui'
 
 /**
  * 环境体检面板。
@@ -131,7 +131,11 @@ export function DiagPanel(): ReactNode {
       </div>
 
       <div className="settings-card">
-        {error ? <div className="banner danger">体检执行失败：{error}</div> : null}
+        {error ? (
+          <DismissibleBanner tone="danger" onDismiss={() => setError(null)}>
+            体检执行失败：{error}
+          </DismissibleBanner>
+        ) : null}
         {checks.map((c) => (
           <DiagRow key={c.id} check={c} onFixEnsp={() => void fixEnsp()} fixing={picking} />
         ))}

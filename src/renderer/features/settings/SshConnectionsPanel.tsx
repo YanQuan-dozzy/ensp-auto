@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { useApp } from '@/stores/app'
 import type { SshAuthInput, SshCredentialMeta } from '@shared/api'
+import { DismissibleBanner } from '@/components/ui'
 import { Row, Section } from '@/components/settings-kit'
 
 /**
@@ -304,9 +305,9 @@ export function SshConnectionsPanel(): ReactNode {
               </>
             )}
             {error ? (
-              <div className="banner danger" style={{ marginTop: 4 }}>
+              <DismissibleBanner tone="danger" style={{ marginTop: 4 }} onDismiss={() => setError(null)}>
                 {error}
-              </div>
+              </DismissibleBanner>
             ) : null}
             <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
               <button className="btn primary sm" onClick={() => void submit()}>

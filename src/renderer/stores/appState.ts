@@ -26,7 +26,8 @@ import type {
   TopoImportPayload
 } from '@shared/api'
 import type { Attachment } from '@shared/attachments'
-import type { ConnectAllProgress, GateView, MainTab, UiMessage } from './storeUtil'
+import type { ConnectAllProgress, GateView, MainTab, QuestionView, UiMessage } from './storeUtil'
+import type { QuestionAnswers, TodoItem } from '@shared/interaction'
 
 export interface AppState {
   ready: boolean
@@ -52,6 +53,24 @@ export interface AppState {
   agentRunning: boolean
   agentRuntime: 'react' | 'mock'
   gate: GateView | null
+  /**
+   * v2.7：待回答的结构化提问（模型提问 / 计划模式方案评审）。
+   * 与 gate 同级别：都是「任务正在等用户」的状态，同一时刻只可能有一个。
+   */
+  question: QuestionView | null
+  /** v2.7：当前会话的任务清单（界面上常驻展示进度） */
+  agentTodos: TodoItem[]
+  /** v2.7：计划模式开关（下一条指令以「只探索、出方案」的方式执行） */
+  planMode: boolean
+  /**
+   * v2.11：引用待插入输入框的文本（引用消息气泡的 hover 操作条写入）。
+   *
+   * 为什么走 store 而不是回调：`MessageView` 是 `React.memo` 的，往它的 props 里
+   * 塞一个「引用」回调会让**每一条**历史消息的回调都变引用 → 整个消息流失去 memo 优化。
+   * 走 store 则只有 AgentPanel 顶层订阅一次，消息组件完全不用知道这件事。
+   * 消费端（AgentPanel）读走之后**必须清空**，否则会重复插入。
+   */
+  quoteDraft: string | null
   queueHint: number
   /**
    * 快捷键录制中（R24）。
@@ -69,6 +88,11 @@ export interface AppState {
   /** 回溯起始节点（非 null 时下一轮 run 从该节点继续） */
   activeStartNodeId: string | null
   queueCount: number
+  /**
+   * v2.8：可续跑会话（上次任务未收尾）。null = 还没查过；[] = 查过但无可续跑。
+   * 与 sessions 分开：这个是「启动时的一次性提示」，用户点了「忽略」或「继续」后就清掉。
+   */
+  resumable: SessionNodeMeta[] | null
   /** v0.4：MCP 服务运行态（对外提供服务） */
   mcpStatus: { running: boolean; url: string; error: string | null }
   /** v1.5：输入框待发送附件（导入即归档到主进程附件目录） */
@@ -85,6 +109,8 @@ export interface AppState {
 
   topology: Topology
   topologyRefreshing: boolean
+  /** F11 回放：高亮当前步骤操作的设备；null = 不高亮 */
+  topoHighlightDeviceId: string | null
 
   /** v1.3：技能列表（不含内容，编辑时按需 get） */
   skills: SkillSummary[]
@@ -97,11 +123,14 @@ export interface AppState {
   connectSsh: (input: SshConnectInput) => Promise<void>
   /** v一键连接：批量连接所有已发现但未连接的 telnet 设备（SSH 设备需凭据，不批量） */
   connectAll: () => Promise<void>
+  /** v2.21：清空扫描 / 单设备连接的错误提示（提示条点击别处即消失） */
+  clearScanError: () => void
   disconnect: (deviceId: DeviceId) => Promise<void>
   rename: (deviceId: DeviceId, name: string) => Promise<void>
   /** 右键删除设备：断开连接 + 从列表移除（下次扫描仍可重新发现） */
   forgetDevice: (deviceId: DeviceId) => Promise<void>
 
+  clearTopology: () => Promise<void>
   refreshTopology: () => Promise<void>
   saveManualTopology: (input: { nodes: TopologyNode[]; links: TopologyLink[] }) => Promise<void>
   /** v0.6 F-5.6：删除节点/链路（主进程打墓碑，跨刷新持久生效） */
@@ -119,6 +148,8 @@ export interface AppState {
     name?: string
     description?: string
     content: string
+    /** F12：绑定目录；缺省 = 不改动现有绑定，空数组 = 全局技能 */
+    scope?: string[]
   }) => Promise<{ id: string } | null>
   removeSkill: (id: string) => Promise<boolean>
   toggleSkill: (id: string, enabled: boolean) => Promise<void>
@@ -131,9 +162,40 @@ export interface AppState {
   newSession: () => void
   /** 从历史节点「换路重走」：载入该会话视图并设置回溯起点 */
   continueFrom: (rootId: string, node: SessionNode) => Promise<void>
+  /** v2.2：进入旧会话 —— 载入完整消息流，后续发送追加到该会话尾部 */
+  openSession: (rootId: string) => Promise<void>
+  /** v2.2：删除会话（删的是当前活跃会话时同步清空视图） */
+  deleteSession: (rootId: string) => Promise<void>
+  /** v2.2：重命名会话标题 */
+  renameSession: (rootId: string, title: string) => Promise<void>
+  /** v2.2：置顶 / 取消置顶会话 */
+  togglePinSession: (rootId: string) => Promise<void>
+  /** v2.2：在资源管理器打开该会话的数据文件 */
+  openSessionFile: (rootId: string) => Promise<void>
+  /** v2.2：打开会话数据目录 */
+  openSessionsDir: () => Promise<void>
+  /** v2.8：查一次可续跑会话（启动时调） */
+  loadResumable: () => Promise<void>
+  /** v2.8：继续上次未完成的任务（进入该会话并重发上一次的指令） */
+  resumeSession: (rootId: string) => Promise<void>
+  /** v2.8：忽略续跑提示（不删会话，只是这次不续跑） */
+  dismissResume: () => void
+  /**
+   * v2.12：删除一条消息（及其后整条分支）。
+   * 需要会话树定位（activeRootId + 树节点映射）；执行中不可用。
+   */
+  deleteMessage: (msgId: string) => Promise<void>
+  /**
+   * v2.12：从产生这条回答的用户指令起重跑（重新生成）。
+   * 对 assistant 回答：回到它的 user 指令，截断旧回答分支后用原指令重新执行。
+   * 对 user 指令：直接截断该指令及其后所有内容并重发。
+   */
+  regenerateMessage: (msgId: string) => Promise<void>
 
   setActiveDevice: (deviceId: DeviceId | null) => void
   setTab: (tab: MainTab) => void
+  /** F11 回放：高亮当前步骤操作的设备（null = 不高亮） */
+  setTopoHighlight: (deviceId: string | null) => void
 
   send: (text: string) => Promise<void>
   /** v1.5：附件导入（弹框 / 按路径）与移除；导入后由主进程复制归档 */
@@ -153,8 +215,18 @@ export interface AppState {
   loadMcpServers: () => Promise<void>
   syncMcpServers: () => Promise<void>
   testMcpServer: (id: string) => Promise<McpServerStatus | null>
+  /** v2.21：收起某台服务器的「上次连接失败」结论（提示条点击别处即消失） */
+  clearMcpServerError: (id: string) => void
   abort: () => void
   resolveGate: (decision: GateDecision) => Promise<void>
+  /** v2.7：回答一次结构化提问；answers 传 null = 取消（模型会退回按最合理假设继续） */
+  answerQuestion: (answers: QuestionAnswers | null) => Promise<void>
+  /** v2.7：计划模式开关 */
+  setPlanMode: (on: boolean) => void
+  /** v2.11：把一条消息的正文引用到输入框（气泡 hover 操作条用） */
+  quoteIntoInput: (text: string) => void
+  /** v2.11：引用已被输入框消费，清空待插入文本 */
+  clearQuoteDraft: () => void
   clearConversation: () => void
 
   setTheme: (theme: 'dark' | 'light') => Promise<void>

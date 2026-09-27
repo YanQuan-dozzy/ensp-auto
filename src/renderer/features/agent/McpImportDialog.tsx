@@ -1,7 +1,13 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import type { McpServerConfig } from '@shared/types'
 import { MCP_IMPORT_EXAMPLE, parseMcpServersJson } from '@shared/mcp-import'
-import { IconAlertTriangle, IconCheck, IconClose, IconUpload } from '@/components/ui'
+import {
+  DismissibleBanner,
+  IconAlertTriangle,
+  IconCheck,
+  IconClose,
+  IconUpload
+} from '@/components/ui'
 
 /**
  * 手动配置：粘贴一段 JSON 导入外部 MCP 服务器（v1.6）。
@@ -134,7 +140,11 @@ export function McpImportDialog({
             </span>
           </div>
 
-          {error ? <div className="banner danger">{error}</div> : null}
+          {error ? (
+            <DismissibleBanner tone="danger" onDismiss={() => setError('')}>
+              {error}
+            </DismissibleBanner>
+          ) : null}
           {warnings.length > 0 ? (
             <div className="mcp-import-notes">
               {warnings.map((w, i) => (

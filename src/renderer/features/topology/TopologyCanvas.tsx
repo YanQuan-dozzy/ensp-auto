@@ -36,9 +36,12 @@ import { TopoContextMenu, TopoDetailPanel, TopoFinderPanel } from './TopoOverlay
 function FlowInner(): ReactNode {
   const topology = useApp((s) => s.topology)
   const refreshing = useApp((s) => s.topologyRefreshing)
+  // F11 回放：由「轨迹」标签页写入，这里只读并传导到节点 data 上
+  const topoHighlightDeviceId = useApp((s) => s.topoHighlightDeviceId)
   const refresh = useApp((s) => s.refreshTopology)
   const saveManual = useApp((s) => s.saveManualTopology)
   const removeTopology = useApp((s) => s.removeTopology)
+  const clearTopology = useApp((s) => s.clearTopology)
   const importTopology = useApp((s) => s.importTopology)
   const discoverTopoFiles = useApp((s) => s.discoverTopoFiles)
   const importTopoPath = useApp((s) => s.importTopoPath)
@@ -73,11 +76,13 @@ function FlowInner(): ReactNode {
     [topology.nodes]
   )
 
-  // 拓扑数据变化（刷新 / 合并 / 加载 / 手动保存）时重建画布
+  // 拓扑数据变化（刷新 / 合并 / 加载 / 手动保存）或回放高亮变化时重建画布。
+  // 高亮也走这里重建而不是改已有节点：data 是 React Flow 判断重渲的输入，
+  // 就地改会把 renderNodes 的 data 缓存判据（引用相等）搅乱。
   useEffect(() => {
-    setNodes(toFlowNodes(topology.nodes))
+    setNodes(toFlowNodes(topology.nodes, topoHighlightDeviceId))
     setEdges(toFlowEdges(topology.links, roleOf, positionsOf))
-  }, [topology, roleOf, positionsOf])
+  }, [topology, roleOf, positionsOf, topoHighlightDeviceId])
 
   const onNodesChange: OnNodesChange = useCallback((changes: NodeChange[]) => {
     setNodes((ns) => applyNodeChanges(changes, ns))
@@ -233,6 +238,15 @@ function FlowInner(): ReactNode {
     : []
   const detailPort = detailNode?.deviceId ? Number.parseInt(detailNode.deviceId.split(':').slice(-1)[0] ?? '', 10) : NaN
 
+  const onClear = useCallback(async () => {
+    if (editing.locked) return
+    if (window.confirm('确定要清空拓扑画布吗？当前工程数据与手动连线将被重置。')) {
+      editing.setMenu(null)
+      editing.closeDetail()
+      await clearTopology()
+    }
+  }, [editing, clearTopology])
+
   return (
     <div className="topology-wrap">
       <TopologyToolbar
@@ -249,6 +263,7 @@ function FlowInner(): ReactNode {
         openFinder={finder.openFinder}
         refreshing={refreshing}
         refresh={refresh}
+        onClear={onClear}
       />
       <TopologyStage
         canvasRef={canvasRef}

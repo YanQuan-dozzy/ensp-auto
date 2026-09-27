@@ -344,6 +344,69 @@ export function networkPrefix(network: string): number {
   return m ? Number.parseInt(m[1]!, 10) : 0
 }
 
+export interface OspfPeer {
+  areaId: string
+  interface: string
+  /** 邻居 Router ID */
+  neighborId: string
+  /** 规范化后的邻居状态：Down / Init / 2-Way / ExStart / Exchange / Loading / Full */
+  state: string
+}
+
+const OSPF_PEER_STATE_RE = /^(?:Down|Attempt|Init|2-?Way|ExStart|Exchange|Loading|Full)$/i
+
+/** 把 VRP 回显里的邻居状态统一成规范写法（2way → 2-Way 等），便于判定与展示 */
+function canonicalOspfState(s: string): string {
+  const x = s.toLowerCase().replace(/[-\s]/g, '')
+  switch (x) {
+    case 'down':
+      return 'Down'
+    case 'attempt':
+      return 'Attempt'
+    case 'init':
+      return 'Init'
+    case '2way':
+      return '2-Way'
+    case 'exstart':
+      return 'ExStart'
+    case 'exchange':
+      return 'Exchange'
+    case 'loading':
+      return 'Loading'
+    case 'full':
+      return 'Full'
+    default:
+      return s
+  }
+}
+
+/**
+ * 解析 `display ospf peer brief` 的邻居表行（`Area Id | Interface | Neighbor id | State`）。
+ *
+ * 只认「首列是 IPv4 且末列是合法邻居状态」的四列行 —— 表头
+ * （`Area Id  Interface  Neighbor id  State`）与分隔线都会因首列非 IPv4 被跳过，
+ * 因此不需要额外的表头/分隔线判断，回显排版变化也不会误吞行。
+ */
+export function parseOspfPeers(text: string): OspfPeer[] {
+  const out: OspfPeer[] = []
+  for (const raw of text.split('\n')) {
+    const line = raw.trim()
+    if (!line) continue
+    const tok = line.split(/\s+/)
+    if (tok.length !== 4) continue
+    if (!IPV4_TOKEN_RE.test(tok[0]!)) continue
+    if (!OSPF_PEER_STATE_RE.test(tok[3]!)) continue
+    out.push({
+      areaId: tok[0]!,
+      interface: tok[1]!,
+      neighborId: tok[2]!,
+      state: canonicalOspfState(tok[3]!)
+    })
+    if (out.length >= 64) break
+  }
+  return out
+}
+
 /** 判断路由表条目是否匹配目标：支持网段（含掩码）或裸 IP（按最长前缀） */
 export function routeMatches(entry: RoutingEntry, target: string): boolean {
   const net = parseNetwork(entry.network)

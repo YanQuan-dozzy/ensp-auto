@@ -51,6 +51,7 @@ export const getDeviceContext: ToolSpec<{ deviceId: string }> = {
     '需要了解设备现状时优先用本工具，不要逐条发 display 命令。',
   risk: 'read',
   scope: 'device',
+  concurrencySafe: true,
   schema: Type.Object(
     { deviceId: Type.String({ description: '设备 ID，形如 127.0.0.1:2008' }) },
     { additionalProperties: false }
@@ -107,6 +108,7 @@ export const runShowCommand: ToolSpec<{ deviceId: string; command: string }> = {
     '返回清洗后的回显、当前视图与成败判定。修改配置需使用配置类工具。',
   risk: 'read',
   scope: 'device',
+  concurrencySafe: true,
   schema: Type.Object(
     {
       deviceId: Type.String({ description: '设备 ID' }),
@@ -313,6 +315,7 @@ export const listSnapshots: ToolSpec<{ deviceId: string }> = {
   description: '列出指定设备的配置快照。',
   risk: 'read',
   scope: 'local',
+  concurrencySafe: true,
   schema: Type.Object(
     { deviceId: Type.String({ description: '设备 ID' }) },
     { additionalProperties: false }
@@ -353,11 +356,15 @@ export function diffLines(oldText: string, newText: string): { added: string[]; 
   return { added, removed }
 }
 
+/** H（v2.14）：分色对比卡落盘的**单侧最大行数**（超过则只留前 N 行 + 总数） */
+export const DIFF_CARD_LIMIT = 40
+
 export const diffWithSnapshot: ToolSpec<{ deviceId: string; snapshotId?: string }> = {
   name: 'diff_with_snapshot',
   description: '把设备当前运行配置与指定快照（默认最近一份）做对比，看出改了什么。',
   risk: 'read',
   scope: 'device',
+  concurrencySafe: true,
   schema: Type.Object(
     {
       deviceId: Type.String({ description: '设备 ID' }),
@@ -368,6 +375,29 @@ export const diffWithSnapshot: ToolSpec<{ deviceId: string; snapshotId?: string 
   summarize: (args, result) => {
     const d = result.data as { changed?: boolean } | undefined
     return `对比 ${args.deviceId}：${d?.changed ? '有变化' : '无变化'}`
+  },
+  /**
+   * H（v2.14）：把「改了哪几行」落进会话树，供回放/演示模式重画分色对比卡。
+   *
+   * 为什么要截断：整份配置全换时 `added`/`removed` 可能有上千行，超过 `cardMetaOf`
+   * 的 4000 字符上限会被**整块丢弃** —— 卡片凭空消失，比「只显示前 40 行 + 总数」糟得多。
+   */
+  presentationMeta: (args, result) => {
+    const d = result.data as
+      | { snapshotId?: string; changed?: boolean; added?: string[]; removed?: string[] }
+      | undefined
+    if (!result.ok || !d) return undefined
+    const added = d.added ?? []
+    const removed = d.removed ?? []
+    return {
+      deviceId: args.deviceId,
+      ...(d.snapshotId ? { snapshotId: d.snapshotId } : {}),
+      changed: d.changed === true,
+      added: added.slice(0, DIFF_CARD_LIMIT),
+      removed: removed.slice(0, DIFF_CARD_LIMIT),
+      addedTotal: added.length,
+      removedTotal: removed.length
+    }
   },
   handler: async (args, ctx) => {
     const t0 = Date.now()

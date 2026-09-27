@@ -26,11 +26,18 @@ export class MockRuntime implements AgentRuntime {
 
   private async drive(input: RunInput, stream: EventStream<AgentEvent>): Promise<void> {
     const text = input.text.trim()
+    const startedAt = Date.now()
     const wantConnect = /连接|connect|接入/i.test(text)
     const wantScan = /扫描|scan|发现|设备列表/i.test(text)
 
     try {
       await sleep(200)
+
+      // v2.2：mock 也走 thinking 通道，界面才能看到「思考」折叠行
+      stream.push({
+        type: 'thinking',
+        text: `（mock 思考）指令包含「${text.slice(0, 24)}」：${wantConnect ? '需要先扫描再连接目标设备' : wantScan ? '需要扫描本机设备' : '直接读取上下文'}，然后汇总结论。`
+      })
 
       const plan: string[] = []
       if (wantScan || wantConnect) plan.push('扫描本机 eNSP 设备')
@@ -146,10 +153,10 @@ export class MockRuntime implements AgentRuntime {
         })
       }
 
-      stream.push({ type: 'done', reason: 'completed' })
+      stream.push({ type: 'done', reason: 'completed', ms: Date.now() - startedAt })
     } catch (e) {
       stream.push({ type: 'error', message: (e as Error).message, recoverable: false })
-      stream.push({ type: 'done', reason: 'failed' })
+      stream.push({ type: 'done', reason: 'failed', ms: Date.now() - startedAt })
     } finally {
       stream.close()
     }
@@ -162,6 +169,7 @@ function sleep(ms: number): Promise<void> {
 
 /** 供测试断言用：mock 运行时的事件序列契约 */
 export const MOCK_EVENT_ORDER: AgentEvent['type'][] = [
+  'thinking',
   'plan',
   'tool_start',
   'tool_end',

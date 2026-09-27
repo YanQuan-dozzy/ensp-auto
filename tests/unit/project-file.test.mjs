@@ -9,7 +9,15 @@ import { gzipSync } from 'node:zlib'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { decodeTopo, parseTopoXml, readTopoFile, parseDeviceInterfaces, resolveInterfaceName } from '../.build/harness.mjs'
+import {
+  decodeTopo,
+  parseTopoXml,
+  readTopoFile,
+  parseDeviceInterfaces,
+  resolveInterfaceName,
+  importTopologyFile,
+  MAX_TOPO_FILE_BYTES
+} from '../.build/harness.mjs'
 
 const XML_PLAIN = `<?xml version="1.0" encoding="UNICODE"?>
 <topo version="1.3.00.100">
@@ -315,4 +323,25 @@ test('parseTopoXml：旧版 interfacePair 自带 name 端点 + srcIndex/tarIndex
   const { topology } = parseTopoXml(xml)
   const link = topology.links.find((l) => l.from === 'AR1' && l.to === 'SW1')
   assert.equal(link.label, 'GE0/0/2 ↔ GE0/0/4') // AR1 路由器 0-based；SW1 交换机 tarIndex=3 → GE0/0/4
+})
+
+/**
+ * v2.13：.topo 体积守卫。
+ *
+ * 旧实现对工程文件整份 `readFileSync`（且 gzip 分支无输出上限）—— 一个误选的大文件
+ * 或 gzip 炸弹就能把主进程撑爆。这里守「超过上限明确拒绝，不进入读取」。
+ */
+test('v2.13 import_topology_file：超过体积上限的 .topo 被拒绝（不再整份读入）', async () => {
+  const file = path.join(os.tmpdir(), `ensp-topo-big-${Date.now()}.topo`)
+  try {
+    fs.writeFileSync(file, '<topo/>')
+    // truncate 造稀疏大文件，避免真的写 20 MB 内容
+    fs.truncateSync(file, MAX_TOPO_FILE_BYTES + 1)
+    const res = await importTopologyFile.handler({ path: file }, {})
+    assert.equal(res.ok, false)
+    assert.equal(res.error.code, 'BAD_PARAM')
+    assert.match(res.error.message, /MB 上限/)
+  } finally {
+    fs.rmSync(file, { force: true })
+  }
 })

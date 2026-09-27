@@ -94,8 +94,8 @@ const TAB_META: Record<SettingsTab, { title: string; desc: string; foot: string 
   },
   model: {
     title: '模型',
-    desc: '模型档案、密钥与运行参数',
-    foot: '所有配置改动即时生效'
+    desc: '模型管理、密钥与运行参数',
+    foot: '模型改动点「保存模型」生效；开关与其余配置即时生效'
   },
   integration: {
     title: '集成',

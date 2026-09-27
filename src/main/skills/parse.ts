@@ -10,19 +10,40 @@
 export interface ParsedSkillMeta {
   name: string
   description: string
+  /** F12：绑定目录（frontmatter 的 `scope` 键，`;` 分隔；空 = 全局技能） */
+  scope: string[]
   /** 剥离 frontmatter 后的正文（用于描述兜底） */
   body: string
 }
 
 const FRONTMATTER_RE = /^\uFEFF?---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/
 
+/**
+ * 解析 `scope` 的值：以 `;` 分隔（也接受换行/中文分号，容错用户手写）。
+ * 去空去重，保持书写顺序。
+ */
+export function parseScopeValue(raw: string): string[] {
+  const parts = (raw ?? '')
+    .split(/[;\n；]/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+  return [...new Set(parts)]
+}
+
+/** 序列化 `scope`：`;` 分隔；空数组返回空串（调用方据此不写该键） */
+export function formatScopeValue(scope: readonly string[] | undefined): string {
+  const list = (scope ?? []).map((s) => s.trim()).filter(Boolean)
+  return [...new Set(list)].join(';')
+}
+
 /** 宽松解析 frontmatter 键值：`name: xxx` 或 `description: "xxx"`，其余键忽略 */
 export function parseSkillContent(raw: string): ParsedSkillMeta {
   const m = FRONTMATTER_RE.exec(raw.replace(/^\uFEFF/, ''))
-  if (!m) return { name: '', description: '', body: raw.trim() }
+  if (!m) return { name: '', description: '', scope: [], body: raw.trim() }
 
   let name = ''
   let description = ''
+  let scope: string[] = []
   for (const line of m[1]!.split(/\r?\n/)) {
     const kv = /^[\s]*([A-Za-z_-]+)[\s]*:[\s]*(.*)$/.exec(line)
     if (!kv) continue
@@ -31,8 +52,9 @@ export function parseSkillContent(raw: string): ParsedSkillMeta {
     if (!val) continue
     if (key === 'name') name = val
     else if (key === 'description' || key === 'desc') description = val
+    else if (key === 'scope' || key === 'paths') scope = parseScopeValue(val)
   }
-  return { name, description, body: (m[2] ?? '').trim() }
+  return { name, description, scope, body: (m[2] ?? '').trim() }
 }
 
 /** 从 Markdown 正文里提取首个标题行（# / ## 级别）作为候选描述 */
@@ -60,7 +82,7 @@ export function deriveSkillMeta(raw: string, fallbackName: string): ParsedSkillM
   const name = parsed.name || fallbackName || '未命名技能'
   const description =
     parsed.description || firstHeading(parsed.body) || firstLine(parsed.body, 120) || ''
-  return { name, description, body: parsed.body }
+  return { name, description, scope: parsed.scope, body: parsed.body }
 }
 
 /** 从文件名（如 ensp-config.skill.md / SKILL.md）整理出可读名称 */
@@ -130,9 +152,17 @@ export function stripFrontmatter(raw: string): string {
 }
 
 /** 把「正文 + 元信息」组装成带 frontmatter 的完整技能 Markdown */
-export function buildSkillMarkdown(name: string, description: string, body: string): string {
+export function buildSkillMarkdown(
+  name: string,
+  description: string,
+  body: string,
+  scope?: readonly string[]
+): string {
   const meta = [`name: ${quoteValue(name || '未命名技能')}`]
   if ((description || '').trim()) meta.push(`description: ${quoteValue(description.trim())}`)
+  // F12：绑定目录写在 frontmatter（空数组不写该键 —— 保持老文件的形状不变，diff 干净）
+  const scopeValue = formatScopeValue(scope)
+  if (scopeValue) meta.push(`scope: ${quoteValue(scopeValue)}`)
   const normalizedBody = (body ?? '').replace(/^\uFEFF?/, '').trim()
   return `---\n${meta.join('\n')}\n---\n${normalizedBody ? `\n${normalizedBody}\n` : ''}`
 }

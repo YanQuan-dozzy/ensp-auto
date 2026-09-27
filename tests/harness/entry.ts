@@ -51,8 +51,12 @@ export {
 } from '../../src/main/core/telnet/patterns'
 
 export { parseInterfaces, diffLines } from '../../src/main/tools/command'
-export { saveTopoFile } from '../../src/main/tools/topology'
+export { saveTopoFile, importTopologyFile } from '../../src/main/tools/topology'
 export { parseVersion, DeviceSession } from '../../src/main/core/session/DeviceSession'
+export {
+  TerminalBuffer,
+  DEFAULT_TERMINAL_BUFFER_BYTES
+} from '../../src/main/core/session/TerminalBuffer'
 export {
   SessionManager,
   DEVICE_LOCK_TTL_MS,
@@ -114,11 +118,11 @@ export { consumeEvent, newTurn } from '../../src/main/agent/llm/translate'
 export { parseLldpNeighbors, deriveTopology } from '../../src/main/core/topology/fromNeighbors'
 export { guessRole, mergeTopology, mergeLayers, emptyTopology, linkKey } from '../../src/main/core/topology/model'
 export { TopologyStore } from '../../src/main/core/topology/store'
-export { decodeTopo, parseTopoXml, readTopoFile, parseDeviceInterfaces, resolveInterfaceName } from '../../src/main/core/topology/fromProjectFile'
+export { decodeTopo, parseTopoXml, readTopoFile, parseDeviceInterfaces, resolveInterfaceName, MAX_TOPO_FILE_BYTES } from '../../src/main/core/topology/fromProjectFile'
 export { topologyToXml, writeTopoFile, stableGuid } from '../../src/main/core/topology/toProjectFile'
 export { findTopologyFiles, defaultSearchRoots } from '../../src/main/core/topology/findFiles'
 export { TOOLS } from '../../src/main/tools/index'
-export { toLLMTools, toMcpTools } from '../../src/main/tools/registry'
+export { toLLMTools, toMcpTools, normalizeToolSchema, Type } from '../../src/main/tools/registry'
 
 // —— v1.2：ensp-mcp 借鉴（参考配置学习 + 结构化验证） ——
 
@@ -138,6 +142,7 @@ export {
   parseNatOutbound,
   parseNatServer,
   parseEthTrunk,
+  parseOspfPeers,
   ipToInt,
   parseNetwork,
   routeMatches,
@@ -169,12 +174,36 @@ export {
   findLabTemplate
 } from '../../src/main/core/lab/templates'
 export { executeTask, batchConfigure } from '../../src/main/tools/tasks'
+export { rollbackTask } from '../../src/main/tools/rollback-task'
 export { registerDevice, autoDiscoverDevices, unregisterDevice } from '../../src/main/tools/register'
 
 // —— v0.4：会话树 + 报告 + 消息队列 + MCP ——
 
 export { SessionTreeStore } from '../../src/main/core/session-tree/store'
 export { buildMarkdown, buildJson } from '../../src/main/core/session-tree/report'
+// v2.12（F8）：分支对比（工具调用序列逐项 diff）+ 书签
+export {
+  stableArgsKey,
+  toolStepsOf,
+  compareBranches,
+  renderComparisonMarkdown,
+  branchLabelOf
+} from '../../src/main/core/session-tree/compare'
+export { writeCompareReport } from '../../src/main/tools/sessions'
+// v2.20：设备配置命令报告（纯函数正文 + 与 IPC 共用的写盘 helper）
+export { buildChangeReport, parseAddressPools, parseInterfaceIps, prefixOfMask } from '../../src/main/core/store/change-report'
+export { collectChangeReport, deviceLabelsOf } from '../../src/main/tools/changes'
+// v2.12（F13）：经验沉淀 —— 从会话轨迹抽「失败 → 修正」片段
+export {
+  findTroubleshootEpisodes,
+  fixedEpisodes,
+  buildTroubleshootTranscript,
+  troubleshootDraftTitle,
+  troubleshootDraftDescription,
+  cleanDistilled
+} from '../../src/main/core/session-tree/troubleshoot'
+// v2.2：会话树节点 → 界面消息（历史载入时「思考」行能否还原，靠这条映射）
+export { nodesToMessages, formatMessageTime } from '../../src/renderer/stores/storeUtil'
 export { historyToMessages, appendQueuedUserMessages, extractPlan, buildAgentSystemPrompt } from '../../src/main/agent/react.runtime'
 export { ReactRuntime } from '../../src/main/agent/react.runtime'
 export type { ReactRuntimeOptions } from '../../src/main/agent/react.runtime'
@@ -211,9 +240,20 @@ export {
   stripFrontmatter,
   buildSkillMarkdown,
   firstHeading,
-  firstLine
+  firstLine,
+  // v2.12（F12）：绑定目录（scope）的解析 / 序列化
+  parseScopeValue,
+  formatScopeValue
 } from '../../src/main/skills/parse'
-export { buildSkillPrompt, SKILL_PROMPT_MAX_CHARS } from '../../src/main/skills/prompt'
+export {
+  buildSkillPrompt,
+  SKILL_PROMPT_MAX_CHARS,
+  // v2.12（F12）：按上下文目录过滤技能
+  normalizeDir,
+  scopeMatches,
+  skillsForContext,
+  contextDirsOf
+} from '../../src/main/skills/prompt'
 export { DEFAULT_SETTINGS, DEFAULT_PROFILES } from '../../src/shared/types'
 export { BUILTIN_SKILLS } from '../../src/main/skills/builtin'
 
@@ -232,7 +272,19 @@ export {
   classifyHttpStatus,
   classifyNetworkError
 } from '../../src/main/core/diagnose/probe'
-export { runDiagnostics } from '../../src/main/core/diagnose'
+export { runDiagnostics, probeModelEndpoint } from '../../src/main/core/diagnose'
+
+// —— v2.3：逐模型思考能力表 ——
+
+export {
+  modelCapability,
+  capabilityOf,
+  capabilityNote,
+  supportsEffort,
+  normalizeThinkingFields,
+  availableEfforts,
+  thinkingLevelMap
+} from '../../src/shared/model-thinking'
 
 // —— v1.5：模型档案 / 附件 / 提示词增强 / 外部 MCP ——
 
@@ -248,10 +300,14 @@ export {
   sanitizeProfile,
   sanitizeProfiles,
   normalizeAgentSettings,
+  upgradeAgentDefaults,
   activeProfile,
   activeProfileOf,
   withActiveProfile,
-  removeProfile
+  removeProfile,
+  enabledProfiles,
+  withProfileEnabled,
+  newProfileDraft
 } from '../../src/shared/profiles'
 
 export {
@@ -269,11 +325,96 @@ export {
   archivedFileName,
   attachmentNoteLine,
   buildAttachmentBlock,
-  composeUserMessage
+  composeUserMessage,
+  // v2.22（F17）：多模态用户消息（有图才返回 parts 数组，无图仍是字符串）
+  composeUserContent,
+  READABLE_DOC_EXTS
 } from '../../src/shared/attachments'
 
+// —— v2.22（F17）：图片读取（嗅探 / 尺寸 / 闸门 / 读取 + read_image 工具） ——
+
+export {
+  MODEL_IMAGE_MIMES,
+  IMAGE_MIME_BY_EXT,
+  UNSUPPORTED_IMAGE_EXTS,
+  MAX_IMAGE_BYTES,
+  MAX_IMAGE_DIMENSION,
+  MAX_IMAGE_PIXELS,
+  modelImageGate,
+  imageAttachmentsOf,
+  imageMimeOfExt,
+  sniffImageMime,
+  parseImageSize,
+  checkImageLimits,
+  unsupportedFormatHint,
+  planUserImages,
+  blockedImagesForSend,
+  type ImageGateCode,
+  type ImageGateResult,
+  type ImageSendPlan
+} from '../../src/shared/image-attach'
+export { encodeImageFile, readImageForModel, readImagesForModel } from '../../src/main/core/attachments/image'
+export { readImage } from '../../src/main/tools/image'
+// 工具结果里「随本结果附一张图」的约定载荷解析（运行时不认识具体工具名，只认这个字段）
+export { toolImageRef } from '../../src/main/agent/runtime.iface'
+
 export { AttachmentStore } from '../../src/main/core/attachments/store'
-export { readLineWindow } from '../../src/main/core/attachments/lineReader'
+// v2.14：溢出归档的子目录名（read_attachment 与清理都靠附件根，这里只补常量）
+export { SPILL_DIR } from '../../src/main/core/attachments/store'
+export {
+  readLineWindow,
+  windowLineArray,
+  isOffsetOutOfRange,
+  READ_MAX_LINE_CHARS,
+  READ_MAX_OUTPUT_BYTES,
+  READ_LIMIT_DEFAULT,
+  READ_LIMIT_MAX
+} from '../../src/main/core/attachments/lineReader'
+// v2.1：PDF 文本抽取（附件里的 .pdf 也能按行读了）
+export {
+  extractPdfText,
+  parseCMap,
+  runContentStream,
+  tokenize,
+  normalizeText
+} from '../../src/main/core/attachments/pdf'
+// v2.1：文档抽取（OOXML / ODF / 老式 doc / RTF）
+export { readZip, type ZipEntry, type ZipReadResult } from '../../src/main/core/attachments/documents/zip'
+export {
+  scanXml,
+  decodeXmlEntities,
+  xmlToText
+} from '../../src/main/core/attachments/documents/xmlText'
+export {
+  sniffZipKind,
+  extractDocx,
+  docxBodyToText,
+  extractXlsx,
+  parseSharedStrings,
+  sheetToText,
+  extractPptx,
+  slideToText,
+  extractOdf,
+  odfContentToText
+} from '../../src/main/core/attachments/documents/ooxml'
+export {
+  readCfb,
+  classifyCfb,
+  extractLegacyDoc,
+  parseClx,
+  parsePlcPcd,
+  piecesToText,
+  filterWordControls
+} from '../../src/main/core/attachments/documents/legacyDoc'
+export { extractRtf, rtfToText } from '../../src/main/core/attachments/documents/rtf'
+export {
+  sniffDocumentKind,
+  extractDocumentText,
+  isDocumentBuffer,
+  documentToLines,
+  DOC_KIND_LABEL
+} from '../../src/main/core/attachments/documents/index'
+export { decodeCp1252, cp1252Char } from '../../src/main/core/charset/cp1252'
 export { JsonStore } from '../../src/main/core/store/store'
 
 export { BASE_SYSTEM_PROMPT, CUSTOM_PROMPT_HEADING } from '../../src/main/agent/llm/prompt'
@@ -291,6 +432,8 @@ export {
 } from '../../src/main/core/mcp/client'
 export { externalToolSpecs, fitExternalTools } from '../../src/main/core/mcp/tools'
 export { readAttachment } from '../../src/main/tools/attachments'
+// v2.13：参考配置文本读取（按内容判编码，GBK 不再读出乱码）
+export { readReferenceTextFile, analyzeReferenceConfigs } from '../../src/main/tools/reference'
 
 // —— v1.6：通用设置（数据占用与清理）+ 权限口径 + 手动配置（粘贴 JSON） ——
 
@@ -337,7 +480,15 @@ export {
   estimateChars,
   truncateToolResult,
   planCompaction,
-  describeCompaction
+  describeCompaction,
+  upgradeCompactionDefaults,
+  roundsLeftWarnAt,
+  roundsLeftNotice,
+  REPRUNE_RATIO,
+  REPRUNE_MIN_CHARS,
+  REPRUNE_MIN_SAVING,
+  repruneBudgetOf,
+  planToolResultReprune
 } from '../../src/shared/runtime-policy'
 export {
   synthError,
@@ -359,10 +510,19 @@ export {
   TOOL_ENV_VAR,
   TOOL_REQUIREMENT
 } from '../../src/main/core/wireshark/provision'
+// v2.12（F10）：任务生命周期抓包（工具名识别 + 起停编排）
+export {
+  pickCaptureTools,
+  startCapture,
+  stopCapture,
+  attachCapture
+} from '../../src/main/core/wireshark/capture'
 
 export { DEFAULT_SHORTCUTS,
   DEFAULT_SHORTCUTS_MAP,
+  INPUT_SCOPED_SHORTCUT_IDS,
   getEffectiveShortcuts,
+  terminalPassthroughShortcuts,
   formatKeys,
   isKeyEqual,
   matchesShortcut,
@@ -380,3 +540,205 @@ export {
   sanitizeGoals,
   pickRandomGoals
 } from '../../src/shared/goals'
+
+// —— v2.5：跨设备只读并发（调度计划 + 分组有界并发） ——
+
+export {
+  DEFAULT_CONCURRENCY,
+  CONCURRENCY_BOUNDS,
+  UNKNOWN_DEVICE_KEY,
+  LOCAL_DEVICE_KEY,
+  sanitizeConcurrency,
+  maxParallelOf,
+  deviceKeyOf,
+  scheduleKeyOf,
+  isParallelSafe,
+  planToolBatches,
+  runGroupedBounded
+} from '../../src/shared/concurrency'
+
+// —— v2.14：重复工具调用防护 ——
+
+export {
+  DEFAULT_REPEAT_GUARD,
+  REPEAT_GUARD_THRESHOLDS,
+  REPEAT_ARGS_PREVIEW_CHARS,
+  EMPTY_REPEAT_CHAIN,
+  sanitizeRepeatGuard,
+  repeatGuardEnabledOf,
+  canonicalizeArgs,
+  observeToolCall
+} from '../../src/shared/repeat-guard'
+
+// —— v2.14：工具结果溢出落盘（行可寻址归档 + 定位符） ——
+
+export {
+  SPILL_HEADER_TITLE,
+  SPILL_MAX_LINE_CHARS,
+  renderSpillDump,
+  spillLocatorNotice,
+  repruneLocatorNotice,
+  extractSpillPath
+} from '../../src/shared/spill'
+
+// —— v2.6：真实 token 计量 + 摘要式压缩（L3） ——
+
+export {
+  DEFAULT_CHARS_PER_TOKEN,
+  CHARS_PER_TOKEN_BOUNDS,
+  SUMMARY_BOUNDS,
+  DEFAULT_SUMMARY_MAX_INPUT_CHARS,
+  SUMMARY_MESSAGE_PREFIX,
+  IMAGE_PART_CHARS,
+  promptTokensOf,
+  charsPerToken,
+  estimatePromptTokens,
+  measurePressure,
+  perMessageBudget,
+  renderSummaryBody,
+  planSummaryCompaction,
+  applySummary,
+  describeSummaryCompaction,
+  describePressure
+} from '../../src/shared/runtime-policy'
+export { SUMMARY_SYSTEM_PROMPT, buildSummaryUserMessage } from '../../src/main/agent/llm/prompt'
+
+// —— v2.7：轮内交互（结构化提问 / 任务清单 / 计划模式） ——
+
+export {
+  MAX_QUESTION_OPTIONS,
+  MAX_QUESTIONS_PER_REQUEST,
+  MAX_TODOS,
+  MAX_TODO_CONTENT,
+  PLAN_APPROVE,
+  PLAN_REVISE,
+  PLAN_STOP,
+  sanitizeQuestions,
+  sanitizeAnswers,
+  unansweredQuestions,
+  sanitizeTodos,
+  todoProgress,
+  formatTodos,
+  describeTodos,
+  buildTodoPromptBlock
+} from '../../src/shared/interaction'
+export {
+  PLAN_MODE_BLOCK_CODE,
+  PLAN_REVIEW_QUESTION_ID,
+  planModeToolDecision,
+  buildPlanReviewOptions
+} from '../../src/shared/plan-mode'
+export { TodoStore } from '../../src/main/core/todo/store'
+export { PLAN_MODE_PROMPT_BLOCK } from '../../src/main/agent/llm/prompt'
+
+// —— v2.8：会话标题（AI 起名） + 断点续跑 ——
+
+export {
+  TITLE_MAX_CHARS,
+  TITLE_TARGET_CHARS,
+  TITLE_FALLBACK_CHARS,
+  TITLE_MAX_TOKENS,
+  DEFAULT_TITLE_TIMEOUT_MS,
+  TITLE_TIMEOUT_BOUNDS,
+  TITLE_BOUNDS,
+  DEFAULT_TITLE_SETTINGS,
+  cleanTitleText,
+  truncateCodePoints,
+  normalizeTitle,
+  fallbackTitle,
+  isUsefulTitle,
+  titleSystemPrompt,
+  buildTitleUserMessage,
+  sanitizeTitleSettings,
+  canGenerateTitle
+} from '../../src/shared/session-title'
+
+// —— v2.9：展示组件（消息切段 / 长回显折叠 / 结构化结果卡） ——
+
+export {
+  groupMessages,
+  segmentKey,
+  hasRenderableContent,
+  dropEmptyMessages,
+  hoistTrailingThinking,
+  planRawCollapse,
+  RAW_COLLAPSE_LINES,
+  resolveTurnBoundary,
+  splitTurns
+} from '../../src/renderer/features/agent/messageSegments'
+export {
+  DIFF_PREVIEW_LINES,
+  buildStructuredView,
+  describeDiff,
+  lineTotalOf
+} from '../../src/renderer/features/agent/structuredResult'
+export { smallToolData, CARD_META_MAX_CHARS, cardMetaOf } from '../../src/main/agent/runtime.iface'
+// H（v2.14）：两个已实现卡片投影的工具所做的截断上限（用例据此断言边界）
+export { DIFF_CARD_LIMIT, diffWithSnapshot } from '../../src/main/tools/command'
+export { CHECK_CARD_LIMIT } from '../../src/main/tools/check'
+
+// —— v2.10：尾部操作栏 + 本轮用量归集 ——
+
+export {
+  EMPTY_TURN_USAGE,
+  accumulateUsage,
+  formatTokens,
+  describeTurnUsage,
+  shouldShowUsage
+} from '../../src/shared/turn-usage'
+export {
+  TURN_FOOTER_ITEMS,
+  buildDivergePrompt,
+  lastUserInstruction
+} from '../../src/shared/turn-footer'
+
+// —— v2.11：工具调用归类汇总 ——
+
+export {
+  categoryOf,
+  isRegisteredTool,
+  summarizeTools,
+  describeCategory,
+  describeToolSummary
+} from '../../src/shared/tool-summary'
+
+// —— v2.12：命令知识库（F1）+ 实验规划器（F4）+ 消息删除/重新生成的纯函数 ——
+
+export {
+  VRP_TOPICS,
+  listTopics,
+  lookupVrpTopic,
+  type VrpTopicEntry,
+  type VrpCommandFact,
+  type LookupOutcome
+} from '../../src/main/core/knowledge/vrp-commands'
+export {
+  inferKind,
+  deviceNumber,
+  parseLinkPorts,
+  routeFirstHop,
+  buildExperimentPlan,
+  type TaskKind,
+  type ExperimentPlan,
+  type NumberedDevice,
+  type PlannedLink,
+  type PlannedHostSegment
+} from '../../src/main/core/tasks/experiment-plan'
+export {
+  stripAttachmentNote,
+  matchTreeNodes,
+  nearestUserAncestor
+} from '../../src/renderer/stores/storeUtil'
+
+// —— v2.12（F7）：实验验收检查（目标清单 → 逐项 ✔/✘ + 证据，纯只读，不打分） ——
+
+export {
+  commandsForCheck,
+  evaluateCheck,
+  describeCheck,
+  checkExperiment,
+  type AcceptanceCheck,
+  type CheckKind,
+  type CheckOutcome,
+  type CheckStatus
+} from '../../src/main/tools/check'

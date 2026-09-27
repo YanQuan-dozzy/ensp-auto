@@ -22,6 +22,7 @@ export const scanDevices: ToolSpec<{ start?: number; end?: number }> = {
     '扫描本机 eNSP 虚拟设备。只能扫描 127.0.0.1，端口范围默认 2000-2050。返回发现的设备端口列表。',
   risk: 'read',
   scope: 'local',
+  concurrencySafe: true,
   schema: Type.Object(
     {
       start: Type.Optional(Type.Integer({ description: '起始端口，默认 2000', default: 2000 })),
@@ -104,6 +105,7 @@ export const listDevices: ToolSpec<Record<string, never>> = {
   description: '列出已知设备及其连接状态、型号、当前视图。',
   risk: 'read',
   scope: 'local',
+  concurrencySafe: true,
   schema: Type.Object({}),
   summarize: (_args, result) => {
     const d = result.data as { devices?: Device[] } | undefined
@@ -232,6 +234,7 @@ export const sshList: ToolSpec<Record<string, never>> = {
   description: '列出已保存的 SSH 连接（只返回名称/主机/端口/用户名，不含密码）。',
   risk: 'read',
   scope: 'local',
+  concurrencySafe: true,
   schema: Type.Object({}),
   summarize: (result) => {
     const c = result.data as { connections?: unknown[] } | undefined

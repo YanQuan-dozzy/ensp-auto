@@ -23,6 +23,7 @@ export const listLabTemplates: ToolSpec = {
     '列出内置实验模板（只读）：返回模板 id / 名称 / 说明 / 角色与设备建议，供 run_lab_template 选用。',
   risk: 'read',
   scope: 'local',
+  concurrencySafe: true,
   schema: Type.Object({}, { additionalProperties: false }),
   summarize: () => `列出 ${LAB_TEMPLATES.length} 个实验模板`,
   handler: async (_args, _ctx) => {

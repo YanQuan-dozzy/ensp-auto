@@ -1,5 +1,6 @@
 import path from 'node:path'
 import fs from 'node:fs'
+import { execFile } from 'node:child_process'
 import { app, BrowserWindow, session, shell, nativeImage } from 'electron'
 import { EVENT } from '@shared/channels'
 import { Services } from './services'
@@ -10,19 +11,49 @@ import { applyBootstrapStorage } from './core/storage/bootstrap'
 applyBootstrapStorage()
 
 // ===== 应用身份（对标 Boss-claw 的图标实现）=====
-// - setName 决定系统（任务栏右键 / 窗口标题 / 通知等）显示的应用名；
-// - setAppUserModelId 决定 Windows 任务栏按钮的分组与图标来源：
-//   打包安装版由 NSIS 注册了同 AUMID 的快捷方式 → 显示项目图标（正常）；
-//   dev / 便携运行（electron.exe .）没有该快捷方式 → Explorer 回退显示 exe 图标
-//   （electron.exe = Electron 默认图标），BrowserWindow.icon 不生效 → 任务栏图标错误。
-//   故仅在打包（app.isPackaged）时设置 AUMID；非打包运行让任务栏跟随窗口图标
-//   （resources/app.ico），从而在 start.cmd / start.exe 下也能显示项目图标。
+// Windows 通知（Toast）的来源名称与图标由「进程 AUMID + 系统里该 AUMID 的注册信息」决定：
+// 1) setAppUserModelId 声明进程身份，**必须与 electron-builder.yml 的 appId 完全一致**——
+//    NSIS 安装版注册的快捷方式/注册表键用的就是 appId，对不上 → 系统查无此身份，
+//    通知回退显示默认的 "Electron" 名称与图标（v2.12 修的正是这个不一致）。
+// 2) dev / start.cmd / 便携版没有安装器代为注册 → 运行时自写
+//    HKCU\Software\Classes\AppUserModelId\<APP_ID> 的 DisplayName + IconUri，
+//    Explorer 查到该键即显示应用名与图标；查不到才回退 Electron 默认值。
+//    ★ 任务栏按钮的名称/图标在设置 AUMID 后按「AUMID → 关联快捷方式」解析，注册表键
+//    只服务 Toast 通知 —— start.ps1 创建 eNSPAuto.lnk 时会把同一 AUMID 写进 .lnk
+//    （IPropertyStore/PKEY_AppUserModel_ID），两处必须一致，任务栏身份才不会退回 Electron。
+// 3) IconUri 是给系统进程（explorer）读的真实文件路径，不能指向 asar 内部虚拟路径
+//    → ico 随包解到 app.asar.unpacked（见 electron-builder.yml 的 asarUnpack），dev 下用项目 resources/。
 const APP_NAME = 'eNSPAuto'
-const APP_ID = 'com.enspauto.desktop'
+const APP_ID = 'cn.enspauto.workbench'
 
 app.setName(APP_NAME)
-if (process.platform === 'win32' && app.isPackaged) {
+
+/** 通知身份用的 ico 真实路径（asar 内的虚拟路径系统进程读不到，读 unpacked）。 */
+function toastIconPath(): string | undefined {
+  const base = app.getAppPath().replace('app.asar', 'app.asar.unpacked')
+  for (const name of ['enspauto.ico', 'app.ico']) {
+    const p = path.join(base, 'resources', name)
+    if (fs.existsSync(p)) return p
+  }
+  return undefined
+}
+
+/** 确保 AUMID 在系统里有 DisplayName + IconUri（幂等覆盖写；失败静默——通知降级为系统默认显示）。 */
+function ensureToastIdentity(): void {
+  const key = `HKCU\\Software\\Classes\\AppUserModelId\\${APP_ID}`
+  const set = (name: string, value: string): void => {
+    execFile('reg', ['add', key, '/v', name, '/t', 'REG_SZ', '/d', value, '/f'], () => undefined)
+  }
+  set('DisplayName', APP_NAME)
+  const icon = toastIconPath()
+  if (icon) set('IconUri', icon)
+}
+
+if (process.platform === 'win32') {
+  // 所有 Windows 场景（安装版 / 便携版 / dev）都声明 AUMID 并自注册身份。
+  // 任务栏分组行为不变：安装版对齐 NSIS 注册的身份；未注册场景仍跟随窗口图标。
   app.setAppUserModelId(APP_ID)
+  ensureToastIdentity()
 }
 
 const DEV_URL = process.env['ELECTRON_RENDERER_URL']

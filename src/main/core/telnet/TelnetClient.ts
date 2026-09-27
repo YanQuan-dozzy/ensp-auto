@@ -122,8 +122,15 @@ export class TelnetClient {
    */
   private combinedCache: Buffer | null = null
 
-  // 交互通道按行累积
+  // 交互通道按行累积（**只放设备还没收到的字符**）
   private interactiveLine = ''
+  /**
+   * 设备行编辑缓冲里是否已有「用户直写进去、但还没提交」的内容。
+   *
+   * 空闲时逐字符直写，那些字符已经在设备上了；用户按回车时**只能补一个回车**，
+   * 若把整行再入队发一遍，设备收到的是 `disp` + `disp\r\n` = `dispdisp`（错位/重复执行）。
+   */
+  private deviceHasUncommittedInput = false
 
   /** 中断（Ctrl+C）发出后的排空窗口：此期间 pump 停止推进，避免设备迟到输出污染下一条命令缓冲（D11） */
   private drainingUntil = 0
@@ -282,23 +289,34 @@ export class TelnetClient {
   /**
    * 交互通道：给 xterm 终端用。
    *
-   * 行为规则（TELNET-SPEC.md §11）：
-   * - 未按回车前：若当前有程序命令在执行，则缓冲不发送（避免代理命令与用户输入串在一行）；
-   *   否则立即写 socket，保持正常终端手感。
-   * - 按下回车：整行作为一条交互命令入队，与代理命令共用同一条串行队列，不享有插队特权。
+   * 行为规则（TELNET-SPEC.md §11，2026-09-25 修订）：
+   * - **设备空闲**：逐字符直写 socket，手感与真实 telnet 一致（Tab 补全、退格、`?`
+   *   都由设备行编辑负责）。此时 `interactiveLine` 保持为空 —— 它只登记「设备还没收到的字符」。
+   * - **设备被占用**（停在 [Y/N]、程序命令在跑、或队列里还排着命令）：只做本地缓冲，
+   *   一个字节都不发 —— 否则用户按键会插到代理命令前面，与队列顺序错位。
+   * - 按下回车：整行作为一条交互命令入队（含 `deviceHasUncommittedInput` 时只补一个回车，
+   *   见该字段说明），与代理命令共用同一条串行队列。
+   *
+   * 旧实现的两个坑（本次修复）：
+   * 1. 直写分支也把字符累加进 `interactiveLine`，回车时 `interactiveLine + '\r'`
+   *    把**已经发出去的整行**又入队发了一遍 → 命令重复执行；
+   * 2. 占用期间积压的 `interactiveLine` 在占用结束后从不补发，
+   *    此后直写的字符与缓冲内容错位（缓冲里有 'dis'，直写的 'p' 却先到设备）。
    */
   writeInteractive(data: string): { accepted: boolean; queued: boolean } {
     if (this.closed) return { accepted: false, queued: false }
+    if (!data) return { accepted: true, queued: false }
 
-    const hasNewline = /[\r\n]/.test(data)
-    const programRunning = this.active?.item.kind === 'program'
+    const busy = this.isBusyForInteractive()
 
-    if (!hasNewline) {
-      if (programRunning) {
+    // 不含回车：空闲直写，占用只缓冲
+    if (!/[\r\n]/.test(data)) {
+      if (busy) {
         this.interactiveLine += data
         return { accepted: true, queued: true }
       }
-      this.interactiveLine += data
+      if (this.interactiveLine) this.flushInteractiveBacklog()
+      this.deviceHasUncommittedInput = true
       this.channel?.write(Buffer.from(data))
       return { accepted: true, queued: false }
     }
@@ -309,30 +327,70 @@ export class TelnetClient {
     const raw = this.interactiveLine + data
     this.interactiveLine = ''
     const lines = raw.split(/[\r\n]+/).filter((l) => l.trim().length > 0)
+
+    // 设备行编辑缓冲里已有用户直写进去的内容 → 这一行只能「补回车」提交，
+    // 不能再发一遍整行（'disp' 已在设备上，重发会变成 'dispdisp'）。
+    // 若用户在占用期间又敲了后半段（lines 非空），把后半段入队即可 ——
+    // 设备会把它接在行缓冲后面，拼成完整的一行。
+    if (this.deviceHasUncommittedInput) {
+      this.deviceHasUncommittedInput = false
+      const isAnswer = this.confirmPaused
+      this.confirmPaused = false
+      this.enqueueInteractive(lines.length > 0 ? lines : [''], isAnswer)
+      return { accepted: true, queued: true }
+    }
+
     if (lines.length === 0) {
       // 空行回车（D12）：
-      // ① 程序命令执行中 → 只缓冲不发送（设备此刻的回显边界属于命令，回车会错位）；
-      // ② 停在 [Y/N] 上 → 视为显式应答，走队列插队（与 exec() 同路径），不直写 socket ——
-      //    否则这个回车会绕过挂起机制，落到设备上又被本地当成「默认应答已解决」，
-      //    队列顺序与设备状态从此对不上；
-      // ③ 平时 → 直写回车，保持终端手感。
-      if (programRunning) {
-        return { accepted: true, queued: true }
-      }
+      // ① 停在 [Y/N] 上 → 视为显式应答，走队列插队（与 exec() 同路径）；
+      // ② 只是被代理占用 → 把这次回车放回缓冲，等 flushInteractiveBacklog 补发；
+      // ③ 完全空闲 → 入队一条空命令（writeCommand('') 正好写出一个回车），
+      //    顺带走完一次判定周期，设备若弹 [Y/N] 能被正确挂起。
       if (this.confirmPaused) {
         this.confirmPaused = false
         this.enqueueInteractive([''], true)
-        return { accepted: true, queued: true }
+      } else if (busy) {
+        this.interactiveLine = '\r'
+      } else {
+        this.enqueueInteractive([''], false)
       }
-      this.channel?.write(Buffer.from('\r\n'))
-      return { accepted: true, queued: false }
+      return { accepted: true, queued: busy }
     }
+
     // 用户在确认提示上按回车（此时 lines 非空）= 显式应答：解除挂起并插队
     const isConfirmAnswer = this.confirmPaused
     this.confirmPaused = false
     // D13：批量整体入队（首插/追加一次完成），保证粘贴顺序与执行顺序一致
     this.enqueueInteractive(lines, isConfirmAnswer)
-    return { accepted: true, queued: programRunning || this.queue.length > 0 }
+    return { accepted: true, queued: busy }
+  }
+
+  /**
+   * 设备侧是否正被占用：停在 [Y/N] 上、有程序命令在跑、或队列里还排着命令。
+   *
+   * 占用期间用户按键只能本地缓冲 —— 直写会让这些字节插到代理命令前面，
+   * 队列顺序与设备实际收到的顺序就此错位。
+   */
+  private isBusyForInteractive(): boolean {
+    if (this.confirmPaused) return true
+    return this.active?.item.kind === 'program' || this.queue.length > 0
+  }
+
+  /**
+   * active 结算、队列跑空后，把占用期间用户敲下的按键补发出去。
+   *
+   * 不补发的话这些字符会一直压在本地：用户看到的是「代理跑完了、我先前打的字没了」，
+   * 更糟的是下一次直写会越过缓冲内容先到设备（'dis' 还在本地、'p' 已到设备）。
+   */
+  private flushInteractiveBacklog(): void {
+    if (!this.interactiveLine) return
+    if (this.active || this.queue.length || this.confirmPaused) return
+    const backlog = this.interactiveLine
+    this.interactiveLine = ''
+    // 补发的是普通字符 → 设备行缓冲从此有未提交内容；补发的是回车 → 正好提交掉
+    if (!/[\r\n]/.test(backlog)) this.deviceHasUncommittedInput = true
+    else this.deviceHasUncommittedInput = false
+    this.channel?.write(Buffer.from(backlog))
   }
 
   close(): void {
@@ -716,6 +774,8 @@ export class TelnetClient {
 
     const result = this.buildResult(state, over)
     state.item.resolve(result)
+    // 设备已回到提示符且没人排队 → 把占用期间用户敲下的按键补发出去（必须早于 pump）
+    this.flushInteractiveBacklog()
     // 让出一次事件循环，避免同步递归过深
     setImmediate(() => this.pump())
   }

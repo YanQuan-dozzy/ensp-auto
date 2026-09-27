@@ -4,6 +4,7 @@ import { parseDeviceId } from '@shared/transport'
 import {
   Chip,
   Dot,
+  DismissibleBanner,
   Empty,
   PanelHeader,
   IconServer,
@@ -47,6 +48,7 @@ export function DevicePanel(): ReactNode {
   const setActive = useApp((s) => s.setActiveDevice)
   const updateSettings = useApp((s) => s.updateSettings)
   const connectSsh = useApp((s) => s.connectSsh)
+  const clearScanError = useApp((s) => s.clearScanError)
 
   const [start, setStart] = useState(String(settings.scanStart))
   const [end, setEnd] = useState(String(settings.scanEnd))
@@ -203,7 +205,11 @@ export function DevicePanel(): ReactNode {
         </div>
       ) : null}
 
-      {scanError ? <div className="banner danger">{scanError}</div> : null}
+      {scanError ? (
+        <DismissibleBanner tone="danger" onDismiss={clearScanError}>
+          {scanError}
+        </DismissibleBanner>
+      ) : null}
 
       <div className="device-list">
         {devices.length === 0 ? (

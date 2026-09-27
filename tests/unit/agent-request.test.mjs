@@ -19,45 +19,47 @@ const MARKER = 'UNIQUE-MARKER-42'
 
 /** 桩 LLM 装配：把每次 stream 的 (model, ctx, opts) 与装配参数记下来，只回一个空 done */
 function stubLlm(requests) {
+  const sink = (via) => (model, ctx, opts) => {
+    requests.push({ model, ctx, opts, via })
+    let finished = false
+    return {
+      [Symbol.asyncIterator]() {
+        return {
+          async next() {
+            if (finished) return { done: true, value: undefined }
+            finished = true
+            return { done: false, value: { type: 'done' } }
+          }
+        }
+      },
+      async result() {
+        return {
+          role: 'assistant',
+          content: [{ type: 'text', text: '' }],
+          api: 'openai-completions',
+          provider: 'compat',
+          model: 'stub-model',
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 0,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
+          },
+          stopReason: 'stop',
+          timestamp: Date.now()
+        }
+      }
+    }
+  }
   return async (cfg) => ({
     provider: 'compat',
     modelId: cfg.model,
     models: {
       getModel: () => ({ id: cfg.model, contextWindow: 100000, maxTokens: 4096 }),
-      stream: (model, ctx, opts) => {
-        requests.push({ model, ctx, opts, cfg })
-        let finished = false
-        return {
-          [Symbol.asyncIterator]() {
-            return {
-              async next() {
-                if (finished) return { done: true, value: undefined }
-                finished = true
-                return { done: false, value: { type: 'done' } }
-              }
-            }
-          },
-          async result() {
-            return {
-              role: 'assistant',
-              content: [{ type: 'text', text: '' }],
-              api: 'openai-completions',
-              provider: 'compat',
-              model: 'stub-model',
-              usage: {
-                input: 0,
-                output: 0,
-                cacheRead: 0,
-                cacheWrite: 0,
-                totalTokens: 0,
-                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
-              },
-              stopReason: 'stop',
-              timestamp: Date.now()
-            }
-          }
-        }
-      }
+      stream: sink('stream'),
+      streamSimple: sink('streamSimple')
     }
   })
 }
@@ -105,7 +107,10 @@ test('T2.1 自定义指令随请求下发：设置里的标记文本出现在 sy
   const prompt = requests[0].ctx.systemPrompt
   assert.ok(prompt.includes(MARKER), 'R53：用户写的自定义指令必须真的进请求')
   assert.ok(prompt.includes(CUSTOM_PROMPT_HEADING), '要带标题，模型才知道这是高优先级指令')
-  assert.ok(events.some((e) => e.type === 'done'), '这一轮应正常收尾')
+  const done = events.find((e) => e.type === 'done')
+  assert.ok(done, '这一轮应正常收尾')
+  assert.equal(done.reason, 'completed')
+  assert.ok(typeof done.ms === 'number' && done.ms >= 0, 'v2.2：done 事件必须带本轮任务耗时 ms')
 })
 
 test('T2.1 清空自定义指令后标记消失（不是被兜底默认值塞回去）', async () => {
@@ -148,6 +153,60 @@ test('切换活跃档案后，下一轮请求用的是新档案', async () => {
 
   const second = await runOnce(settingsWith({ profiles: [a, b], activeProfileId: 'p-bbb' }))
   assert.equal(second.requests[0].model.id, 'model-b')
+})
+
+// ———————————————————— v2.3：逐模型思考能力真的进请求 ————————————————————
+
+/** 用某一档档案跑一轮，返回该轮的请求记录 */
+async function runWithProfile(provider, model, patch) {
+  const base = structuredClone(DEFAULT_SETTINGS.agent.profiles[0])
+  const p = { ...base, id: 'p-think', provider, model, ...patch }
+  const { requests } = await runOnce(
+    settingsWith({ profiles: [p], activeProfileId: 'p-think' })
+  )
+  return requests[0]
+}
+
+test('思考模式 off/on：走 streamSimple，且只有 on 才带强度档位', async () => {
+  const off = await runWithProfile('deepseek', 'deepseek-flash', { thinking: 'off' })
+  assert.equal(off.via, 'streamSimple', '关闭思考要靠 streamSimple 下发各家自己的关闭字段')
+  assert.equal(off.opts.reasoning, undefined)
+
+  const on = await runWithProfile('deepseek', 'deepseek-flash', {
+    thinking: 'on',
+    reasoningEffort: 'max'
+  })
+  assert.equal(on.via, 'streamSimple')
+  assert.equal(on.opts.reasoning, 'max', '用户选的强度必须原样下发')
+})
+
+test('思考模式 auto：一个字都不发（走原始 stream 路径）', async () => {
+  const auto = await runWithProfile('deepseek', 'deepseek-flash', { thinking: 'auto' })
+  assert.equal(auto.via, 'stream')
+  assert.equal(auto.opts.reasoning, undefined)
+})
+
+test('采样参数：模型不接受时不下发（Kimi K3 传 temperature 会报错）', async () => {
+  const kimi = await runWithProfile('kimi', 'kimi-k3', { thinking: 'on', reasoningEffort: 'max' })
+  assert.equal(kimi.opts.temperature, undefined, 'K3 的 temperature 不可修改，不能下发')
+  assert.equal(kimi.opts.samplingParams, undefined, '未设置 Top P/K 时不应出现 samplingParams')
+
+  const deepseek = await runWithProfile('deepseek', 'deepseek-flash', {
+    thinking: 'auto',
+    topP: 0.8,
+    topK: 40
+  })
+  assert.equal(deepseek.opts.temperature, 0.2)
+  assert.deepEqual(deepseek.opts.samplingParams, { top_p: 0.8, top_k: 40 })
+})
+
+test('未核实的服务商（自定义端点）：不声明思考能力，也不下发思考参数', async () => {
+  const custom = await runWithProfile('custom', 'my-model', {
+    thinking: 'on',
+    reasoningEffort: 'max'
+  })
+  assert.equal(custom.via, 'stream')
+  assert.equal(custom.opts.reasoning, undefined)
 })
 
 // ———————————————————— 事件流必须自然关闭（否则宿主 finally 永不执行） ————————————————————

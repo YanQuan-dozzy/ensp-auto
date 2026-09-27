@@ -10,6 +10,7 @@ import { TopologyStore } from '../core/topology/store'
 import { SessionTreeStore } from '../core/session-tree/store'
 import { SkillStore } from '../skills/store'
 import { GoalArchiveStore } from '../goals/store'
+import { TodoStore } from '../core/todo/store'
 import { AttachmentStore } from '../core/attachments/store'
 import { McpClientManager } from '../core/mcp/client'
 import { initSshSecrets } from '../settings/sshSecrets'
@@ -35,6 +36,8 @@ export interface StoreBundle {
   goals: GoalArchiveStore
   attachments: AttachmentStore
   mcpClients: McpClientManager
+  /** v2.7：任务清单（todo_write 的持久化出口） */
+  todos: TodoStore
 }
 
 export interface CreateStoresOptions {
@@ -50,7 +53,7 @@ export interface CreateStoresOptions {
  */
 export function resolveStorageDir(
   settings: Settings,
-  key: 'exportsDir' | 'attachmentsDir' | 'snapshotsDir',
+  key: 'exportsDir' | 'attachmentsDir' | 'snapshotsDir' | 'topologyDir',
   fallback: string
 ): string {
   const custom = settings.storage?.[key]
@@ -74,15 +77,16 @@ function migrateLegacyKey(store: JsonStore): void {
   }
 }
 
-/** 三个受管目录的实时解析（设置项可覆盖；Services 的 getter 直接复用，避免两处口径） */
+/** 受管目录的实时解析（设置项可覆盖；Services 的 getter 直接复用，避免两处口径） */
 export function storageDirs(
   userDataDir: string,
   settings: Settings
-): { exportsDir: string; attachmentsDir: string; snapshotsDir: string } {
+): { exportsDir: string; attachmentsDir: string; snapshotsDir: string; topologyDir: string } {
   return {
     exportsDir: resolveStorageDir(settings, 'exportsDir', path.join(userDataDir, 'exports')),
     attachmentsDir: resolveStorageDir(settings, 'attachmentsDir', path.join(userDataDir, 'attachments')),
-    snapshotsDir: resolveStorageDir(settings, 'snapshotsDir', path.join(userDataDir, 'snapshots-data'))
+    snapshotsDir: resolveStorageDir(settings, 'snapshotsDir', path.join(userDataDir, 'snapshots-data')),
+    topologyDir: resolveStorageDir(settings, 'topologyDir', '')
   }
 }
 
@@ -124,10 +128,11 @@ export function createStores(opts: CreateStoresOptions): StoreBundle {
     onChange: (list) => emit(EVENT.skillsUpdated, list)
   })
   const goals = new GoalArchiveStore(path.join(userDataDir, 'goals.json'))
+  const todos = new TodoStore(path.join(userDataDir, 'todos.json'))
   const sessions = new SessionManager(store, {
     getSettings: () => store.getSettings(),
-    onRaw: (deviceId, chunk, fromAgent) => {
-      emit(EVENT.terminalData, { deviceId, chunk, fromAgent })
+    onRaw: (deviceId, chunk, fromAgent, seq) => {
+      emit(EVENT.terminalData, { deviceId, chunk, fromAgent, seq })
     },
     onClosed: (deviceId, reason) => {
       emit(EVENT.terminalClosed, { deviceId, reason })
@@ -140,6 +145,6 @@ export function createStores(opts: CreateStoresOptions): StoreBundle {
   // 旧格式（单把密钥）迁移到对应档案：老用户不该在升级后发现「模型在、密钥没了」
   migrateLegacyKey(store)
 
-  return { store, snapshots, changes, sessions, topology, sessionTree, skills, goals, attachments, mcpClients }
+  return { store, snapshots, changes, sessions, topology, sessionTree, skills, goals, attachments, mcpClients, todos }
 }
 

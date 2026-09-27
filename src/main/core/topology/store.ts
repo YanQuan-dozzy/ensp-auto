@@ -23,24 +23,36 @@ export interface TopologyStoreOptions {
   onChange?: (t: Topology) => void
 }
 
+interface PersistedProject {
+  sourcePath: string
+  manual: { nodes: TopologyNode[]; links: TopologyLink[] }
+  updatedAt: number
+}
+
 interface Persisted {
-  version: 2 | 3
+  version: 2 | 3 | 4
+  activeFilePath?: string | null
   file?: Topology | null
   discovered?: Topology
   manual?: { nodes: TopologyNode[]; links: TopologyLink[] }
+  projects?: Record<string, PersistedProject>
 }
 
 export class TopologyStore {
   private fileLayer: Topology | null = null
   private discoveredLayer: Topology = emptyTopology()
   private manualLayer: { nodes: TopologyNode[]; links: TopologyLink[] } = { nodes: [], links: [] }
-  /** 最近一次 file 层来源 .topo 路径（仅运行时，不落盘；find_topology_files 用它标 is_active） */
+  /** 当前活动 file 层的来源 .topo 绝对路径（落盘持久化；find_topology_files 用它标 is_active） */
   private fileSourcePathValue: string | null = null
-  /** 最后一次**成功落盘**的三层状态；写失败时用它回滚内存（R21） */
+  /** 按工程文件绝对路径隔离保存的手动层（防止跨工程污染，切回原工程时保留布局微调） */
+  private projects: Record<string, PersistedProject> = {}
+  /** 最后一次**成功落盘**的状态；写失败时用它回滚内存（R21） */
   private committed: {
     file: Topology | null
     discovered: Topology
     manual: { nodes: TopologyNode[]; links: TopologyLink[] }
+    fileSourcePath: string | null
+    projects: Record<string, PersistedProject>
   } | null = null
 
   constructor(private readonly opts: TopologyStoreOptions) {
@@ -49,7 +61,9 @@ export class TopologyStore {
     this.committed = {
       file: this.fileLayer,
       discovered: this.discoveredLayer,
-      manual: this.manualLayer
+      manual: this.manualLayer,
+      fileSourcePath: this.fileSourcePathValue,
+      projects: structuredClone(this.projects)
     }
   }
 
@@ -57,12 +71,35 @@ export class TopologyStore {
     try {
       if (!fs.existsSync(this.opts.file)) return
       const parsed = JSON.parse(fs.readFileSync(this.opts.file, 'utf8')) as Partial<Persisted>
-      if (parsed.version === 3 || parsed.version === 2) {
+      if (parsed.version === 4 || parsed.version === 3 || parsed.version === 2) {
+        this.fileSourcePathValue = typeof parsed.activeFilePath === 'string' ? parsed.activeFilePath : null
         this.fileLayer = parsed.file ? sanitizeTopology(parsed.file) : null
         this.discoveredLayer = parsed.discovered ? sanitizeTopology(parsed.discovered) : emptyTopology()
         this.manualLayer = parsed.manual
           ? { nodes: sanitizeNodes(parsed.manual.nodes), links: sanitizeLinks(parsed.manual.links) }
           : { nodes: [], links: [] }
+        if (parsed.projects && typeof parsed.projects === 'object') {
+          this.projects = sanitizeProjects(parsed.projects)
+        }
+
+        // 数据自愈清洗：若当前存在 fileLayer，清理 manualLayer 中不属于该文件的幽灵节点（非 m-node- 自定义节点）
+        if (this.fileLayer && this.fileLayer.nodes.length > 0) {
+          const fileNodeIds = new Set(this.fileLayer.nodes.map((n) => n.id.toLowerCase()))
+          const fileNodeNames = new Set(this.fileLayer.nodes.map((n) => n.name.toLowerCase()))
+          this.manualLayer.nodes = this.manualLayer.nodes.filter(
+            (n) =>
+              n.id.startsWith('m-node-') ||
+              fileNodeIds.has(n.id.toLowerCase()) ||
+              fileNodeNames.has(n.name.toLowerCase())
+          )
+          const validNodeIds = new Set([
+            ...this.fileLayer.nodes.map((n) => n.id),
+            ...this.manualLayer.nodes.map((n) => n.id)
+          ])
+          this.manualLayer.links = this.manualLayer.links.filter(
+            (l) => validNodeIds.has(l.from) && validNodeIds.has(l.to)
+          )
+        }
       } else {
         // 兼容 v0.3 旧格式 {nodes, links, updatedAt}（当时是合并结果，视为 discovered 层）
         const legacy = sanitizeTopology(parsed as Topology)
@@ -72,6 +109,8 @@ export class TopologyStore {
       this.fileLayer = null
       this.discoveredLayer = emptyTopology()
       this.manualLayer = { nodes: [], links: [] }
+      this.fileSourcePathValue = null
+      this.projects = {}
     }
   }
 
@@ -82,10 +121,12 @@ export class TopologyStore {
     // 否则界面显示的图纸与磁盘上的永远不一致（下一次读到的是旧图，看起来像"随机丢失"）。
     const baseline = this.committed
     const data: Persisted = {
-      version: 3,
+      version: 4,
+      activeFilePath: this.fileSourcePathValue,
       file: this.fileLayer,
       discovered: this.discoveredLayer,
-      manual: this.manualLayer
+      manual: this.manualLayer,
+      projects: this.projects
     }
     try {
       atomicWriteJsonSync(this.opts.file, data)
@@ -94,10 +135,18 @@ export class TopologyStore {
         this.fileLayer = baseline.file
         this.discoveredLayer = baseline.discovered
         this.manualLayer = baseline.manual
+        this.fileSourcePathValue = baseline.fileSourcePath
+        this.projects = structuredClone(baseline.projects)
       }
       throw e
     }
-    this.committed = { file: this.fileLayer, discovered: this.discoveredLayer, manual: this.manualLayer }
+    this.committed = {
+      file: this.fileLayer,
+      discovered: this.discoveredLayer,
+      manual: this.manualLayer,
+      fileSourcePath: this.fileSourcePathValue,
+      projects: structuredClone(this.projects)
+    }
   }
 
   private publish(): void {
@@ -116,16 +165,64 @@ export class TopologyStore {
     this.publish()
   }
 
-  /** 设置 file 层（工程文件解析结果，最权威） */
-  setFile(t: Topology): void {
+  /**
+   * 设置 file 层（工程文件解析结果，最权威）。
+   * 若指定了 sourcePath：
+   * - 切换新文件时暂存旧工程手动层，重置新工程手动层（或加载其既有缓存），
+   *   防止旧工程节点泄漏到新工程画布上（单一文件持久化保存与导入更新）；
+   * - 同文件更新时仅剔除新文件中已不存在的废弃手动节点。
+   */
+  setFile(t: Topology, sourcePath?: string | null): void {
+    const nextPath = sourcePath !== undefined ? sourcePath : this.fileSourcePathValue
+    const switchingProject = !!(nextPath && this.fileSourcePathValue && nextPath !== this.fileSourcePathValue)
+    const isNewFile = !!(nextPath && (!this.fileSourcePathValue || switchingProject))
+
+    if (this.fileSourcePathValue) {
+      this.projects[this.fileSourcePathValue] = {
+        sourcePath: this.fileSourcePathValue,
+        manual: structuredClone(this.manualLayer),
+        updatedAt: Date.now()
+      }
+    }
+
+    this.fileSourcePathValue = nextPath
     this.fileLayer = { ...t, updatedAt: Date.now() }
+
+    if (isNewFile) {
+      const cached = nextPath ? this.projects[nextPath] : undefined
+      if (cached?.manual) {
+        const fileNodeIds = new Set(t.nodes.map((n) => n.id.toLowerCase()))
+        const fileNodeNames = new Set(t.nodes.map((n) => n.name.toLowerCase()))
+        this.manualLayer = {
+          nodes: cached.manual.nodes.filter(
+            (n) => n.id.startsWith('m-node-') || fileNodeIds.has(n.id.toLowerCase()) || fileNodeNames.has(n.name.toLowerCase())
+          ),
+          links: cached.manual.links
+        }
+      } else {
+        this.manualLayer = { nodes: [], links: [] }
+      }
+      this.discoveredLayer = emptyTopology()
+    } else {
+      const fileNodeIds = new Set(t.nodes.map((n) => n.id.toLowerCase()))
+      const fileNodeNames = new Set(t.nodes.map((n) => n.name.toLowerCase()))
+      this.manualLayer = {
+        nodes: this.manualLayer.nodes.filter(
+          (n) => n.id.startsWith('m-node-') || fileNodeIds.has(n.id.toLowerCase()) || fileNodeNames.has(n.name.toLowerCase())
+        ),
+        links: this.manualLayer.links
+      }
+    }
+
     this.persist()
     this.publish()
   }
 
-  /** 记录 file 层来源 .topo 路径（运行时；find_topology_files 用 is_active 区分当前活动拓扑） */
+  /** 记录 file 层来源 .topo 路径并持久化 */
   setFileSource(path: string | null): void {
+    if (this.fileSourcePathValue === path) return
     this.fileSourcePathValue = path
+    this.persist()
   }
 
   get fileSourcePath(): string | null {
@@ -234,12 +331,32 @@ export class TopologyStore {
   }
 
   clear(): void {
+    if (this.fileSourcePathValue) {
+      delete this.projects[this.fileSourcePathValue]
+    }
     this.fileLayer = null
+    this.fileSourcePathValue = null
     this.discoveredLayer = emptyTopology()
     this.manualLayer = { nodes: [], links: [] }
     this.persist()
     this.publish()
   }
+}
+
+function sanitizeProjects(raw: Record<string, unknown>): Record<string, PersistedProject> {
+  const out: Record<string, PersistedProject> = {}
+  for (const [k, v] of Object.entries(raw)) {
+    if (!v || typeof v !== 'object') continue
+    const p = v as Partial<PersistedProject>
+    out[k] = {
+      sourcePath: typeof p.sourcePath === 'string' ? p.sourcePath : k,
+      manual: p.manual
+        ? { nodes: sanitizeNodes(p.manual.nodes), links: sanitizeLinks(p.manual.links) }
+        : { nodes: [], links: [] },
+      updatedAt: typeof p.updatedAt === 'number' ? p.updatedAt : Date.now()
+    }
+  }
+  return out
 }
 
 function sanitizeTopology(t: Partial<Topology>): Topology {

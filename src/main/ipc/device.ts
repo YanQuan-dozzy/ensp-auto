@@ -149,7 +149,26 @@ export function registerDeviceIpc(services: Services, emit: EmitFn): void {
     }
   )
 
-  ipcMain.handle(INVOKE.terminalBuffer, async () => '')
-  ipcMain.handle(INVOKE.terminalClear, async () => true)
+  /**
+   * 终端回放快照。
+   *
+   * 渲染层挂载 xterm 时调用：设备字节流从连接成功那一刻就开始到达，
+   * 而 xterm 实例是后建的（切换设备还会整个重建），没有这一步，
+   * 连接握手期间的 banner / 提示符 / 探针输出就永远看不到。
+   */
+  ipcMain.handle(INVOKE.terminalBuffer, async (_e, args: { deviceId?: string }) => {
+    const segments = services.sessions.terminalBuffer(requireDeviceId(args?.deviceId))
+    const last = segments[segments.length - 1]
+    return { segments, seq: last ? last.seq : 0 }
+  })
+
+  ipcMain.handle(INVOKE.terminalClear, async (_e, args: { deviceId?: string }) => {
+    const deviceId = requireDeviceId(args?.deviceId)
+    const cleared = services.sessions.clearTerminal(deviceId)
+    // 清屏要两手都做：主进程清回放缓冲（否则切走再切回内容会「复活」），
+    // 渲染层清 xterm 画面（xterm 只在渲染层，主进程碰不到）
+    emit(EVENT.terminalClear, { deviceId })
+    return cleared
+  })
 }
 

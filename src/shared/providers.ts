@@ -33,28 +33,34 @@ export interface ProviderMeta {
   defaultBaseUrl: string
   /** 最新官方模型名建议，仅用于 UI 下拉提示（透传线不校验） */
   models: string[]
+  /** 服务商控制台的密钥申请页；'' 表示没有稳定的公开链接（不显示入口） */
+  keyUrl: string
 }
 
 export const COMPAT_PROVIDERS: Record<CompatProvider, ProviderMeta> = {
   deepseek: {
     label: 'DeepSeek（OpenAI 兼容）',
     defaultBaseUrl: 'https://api.deepseek.com',
-    models: ['deepseek-flash', 'deepseek-v4-pro', 'deepseek-v4-flash']
+    models: ['deepseek-flash', 'deepseek-v4-pro', 'deepseek-v4-flash'],
+    keyUrl: 'https://platform.deepseek.com/api_keys'
   },
   zhipu: {
     label: '智谱 GLM（OpenAI 兼容）',
     defaultBaseUrl: 'https://open.bigmodel.cn/api/paas/v4',
-    models: ['glm-5.3', 'glm-5.2', 'glm-5.1', 'glm-4.6', 'glm-4.7-flash', 'glm-4-flash']
+    models: ['glm-5.3', 'glm-5.2', 'glm-5.1', 'glm-4.6', 'glm-4.7-flash', 'glm-4-flash'],
+    keyUrl: 'https://open.bigmodel.cn/usercenter/apikeys'
   },
   qwen: {
     label: '通义千问（OpenAI 兼容）',
     defaultBaseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
-    models: ['qwen3.7-max', 'qwen3-max', 'qwen-plus', 'qwen-flash', 'qwen3-coder-plus']
+    models: ['qwen3.7-max', 'qwen3-max', 'qwen-plus', 'qwen-flash', 'qwen3-coder-plus'],
+    keyUrl: 'https://bailian.console.aliyun.com/?apiKey=1'
   },
   kimi: {
     label: '月之暗面 Kimi（OpenAI 兼容）',
     defaultBaseUrl: 'https://api.moonshot.cn/v1',
-    models: ['kimi-k3', 'kimi-k2.6', 'kimi-k2.7-code', 'kimi-k2.7-code-highspeed']
+    models: ['kimi-k3', 'kimi-k2.6', 'kimi-k2.7-code', 'kimi-k2.7-code-highspeed'],
+    keyUrl: 'https://platform.moonshot.cn/console/api-keys'
   },
   doubao: {
     label: '豆包·火山方舟（OpenAI 兼容）',
@@ -65,12 +71,14 @@ export const COMPAT_PROVIDERS: Record<CompatProvider, ProviderMeta> = {
       'doubao-seed-2-1-turbo-260628',
       'doubao-seed-2-0-lite-260428',
       'doubao-seed-2-0-mini-260428'
-    ]
+    ],
+    keyUrl: 'https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey'
   },
   qianfan: {
     label: '百度千帆（文心 ERNIE）',
     defaultBaseUrl: 'https://qianfan.baidubce.com/v2',
-    models: ['ernie-5.1', 'ernie-5.0', 'ernie-4.5-turbo', 'ernie-4.5', 'ernie-x1']
+    models: ['ernie-5.1', 'ernie-5.0', 'ernie-4.5-turbo', 'ernie-4.5', 'ernie-x1'],
+    keyUrl: 'https://console.bce.baidu.com/iam/#/iam/apikey/list'
   },
   minimax: {
     label: 'MiniMax（OpenAI 兼容）',
@@ -81,12 +89,14 @@ export const COMPAT_PROVIDERS: Record<CompatProvider, ProviderMeta> = {
       'MiniMax-M2.7-highspeed',
       'MiniMax-M2.5',
       'MiniMax-M2.1'
-    ]
+    ],
+    keyUrl: 'https://platform.minimaxi.com/user-center/basic-information/interface-key'
   },
   custom: {
     label: '自定义 OpenAI 兼容端点',
     defaultBaseUrl: '',
-    models: []
+    models: [],
+    keyUrl: ''
   }
 }
 
@@ -94,7 +104,8 @@ export const NATIVE_PROVIDERS: Record<NativeProvider, ProviderMeta> = {
   openai: {
     label: 'OpenAI（官方 API）',
     defaultBaseUrl: '',
-    models: ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5', 'gpt-5-mini', 'gpt-5-nano']
+    models: ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5', 'gpt-5-mini', 'gpt-5-nano'],
+    keyUrl: 'https://platform.openai.com/api-keys'
   },
   anthropic: {
     label: 'Anthropic（Claude）',
@@ -106,12 +117,14 @@ export const NATIVE_PROVIDERS: Record<NativeProvider, ProviderMeta> = {
       'claude-haiku-4-5',
       'claude-opus-4-8',
       'claude-sonnet-4-6'
-    ]
+    ],
+    keyUrl: 'https://console.anthropic.com/settings/keys'
   },
   google: {
     label: 'Google（Gemini）',
     defaultBaseUrl: '',
-    models: ['gemini-3-pro', 'gemini-3-flash', 'gemini-3-flash-lite']
+    models: ['gemini-3-pro', 'gemini-3-flash', 'gemini-3-flash-lite'],
+    keyUrl: 'https://aistudio.google.com/app/apikey'
   }
 }
 

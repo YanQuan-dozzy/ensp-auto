@@ -15,10 +15,10 @@ import type { AppState } from './appState'
 import { deviceActions } from './deviceActions'
 import { agentActions } from './agentActions'
 import { dataActions } from './dataActions'
-import { SESSION_ID, type UiMessage } from './storeUtil'
+import { SESSION_ID, formatMessageTime, type UiMessage } from './storeUtil'
 
 export type { AppState }
-export { SESSION_ID }
+export { SESSION_ID, formatMessageTime }
 export type { UiMessage }
 export type { AgentEvent }
 
@@ -42,6 +42,12 @@ export const useApp = create<AppState>((set, get) => ({
   agentRunning: false,
   agentRuntime: 'react',
   gate: null,
+  // v2.7：结构化提问 / 任务清单 / 计划模式
+  question: null,
+  agentTodos: [],
+  planMode: false,
+  // v2.11：气泡「引用」动作写入，由输入框消费后清空
+  quoteDraft: null,
   queueHint: 0,
   shortcutRecording: false,
 
@@ -49,6 +55,8 @@ export const useApp = create<AppState>((set, get) => ({
   activeRootId: null,
   activeStartNodeId: null,
   queueCount: 0,
+  // v2.8：可续跑会话；null = 尚未查询（启动后由 loadResumable 填）
+  resumable: null,
   mcpStatus: { running: false, url: '', error: null },
   attachments: [],
   enhancing: false,
@@ -60,10 +68,17 @@ export const useApp = create<AppState>((set, get) => ({
 
   topology: { nodes: [], links: [], updatedAt: 0 },
   topologyRefreshing: false,
+  // F11 回放：由「轨迹」标签页写入，拓扑画布只读消费
+  topoHighlightDeviceId: null,
 
   skills: [],
 
   ...deviceActions(set, get),
   ...agentActions(set, get),
-  ...dataActions(set, get)
+  ...dataActions(set, get),
+
+  // 纯 UI 瞬时状态（跨标签页共享），不属于任何一个域 slice，故留在装配层
+  setTopoHighlight(deviceId) {
+    set({ topoHighlightDeviceId: deviceId })
+  }
 }))

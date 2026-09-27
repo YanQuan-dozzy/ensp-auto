@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { useApp } from '@/stores/app'
 import {
+  DismissibleBanner,
   IconAlertTriangle,
   IconCheck,
   IconFolder,
@@ -46,6 +47,21 @@ function stripFrontmatter(raw: string): string {
   return m ? (m[1] ?? '').trim() : raw.trim()
 }
 
+/**
+ * F12：把「绑定目录」输入框的文本解析成数组。
+ *
+ * 与主进程 `skills/parse.ts#parseScopeValue` 同口径（换行 / 分号 / 中文分号都认），
+ * 渲染层不 import main，所以这里留一份最小实现 —— 只做拆分去重，不做路径归一化
+ * （归一化在注入层按前缀匹配时做）。
+ */
+function parseScopeInput(text: string): string[] {
+  const parts = text
+    .split(/[\n;；]/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+  return [...new Set(parts)]
+}
+
 export function SkillsPanel(): ReactNode {
   const skills = useApp((s) => s.skills)
   const loadSkills = useApp((s) => s.loadSkills)
@@ -59,6 +75,8 @@ export function SkillsPanel(): ReactNode {
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
   const [body, setBody] = useState('')
+  /** F12：绑定目录（文本框原文，一行一个）；空 = 全局技能 */
+  const [scope, setScope] = useState('')
   const [loading, setLoading] = useState(false)
   const [notice, setNotice] = useState<Notice | null>(null)
 
@@ -85,6 +103,7 @@ export function SkillsPanel(): ReactNode {
       setName(skill.name)
       setDescription(skill.description)
       setBody(stripFrontmatter(skill.content))
+      setScope(skill.scope.join('\n'))
     } catch (e) {
       flash('error', e instanceof Error ? e.message : String(e))
     } finally {
@@ -97,6 +116,7 @@ export function SkillsPanel(): ReactNode {
     setName('')
     setDescription('')
     setBody(NEW_SKILL_TEMPLATE)
+    setScope('')
   }
 
   const save = async (): Promise<void> => {
@@ -110,7 +130,8 @@ export function SkillsPanel(): ReactNode {
         ...(selectedId ? { id: selectedId } : {}),
         name,
         description,
-        content: body
+        content: body,
+        scope: parseScopeInput(scope)
       })
       flash('ok', selectedId ? '已保存' : '已创建')
       if (r) setSelectedId(r.id)
@@ -135,6 +156,7 @@ export function SkillsPanel(): ReactNode {
       setName('')
       setDescription('')
       setBody('')
+      setScope('')
     }
     flash(ok ? 'ok' : 'error', ok ? '已删除' : '删除失败')
   }
@@ -209,10 +231,13 @@ export function SkillsPanel(): ReactNode {
       </div>
 
       {notice ? (
-        <div className={`banner ${notice.tone === 'error' ? 'danger' : notice.tone === 'ok' ? 'success' : 'info'}`}>
+        <DismissibleBanner
+          tone={notice.tone === 'error' ? 'danger' : notice.tone === 'ok' ? 'success' : 'info'}
+          onDismiss={() => setNotice(null)}
+        >
           {notice.tone === 'error' ? <IconAlertTriangle size={14} /> : <IconCheck size={14} />}
           {notice.text}
-        </div>
+        </DismissibleBanner>
       ) : null}
 
       <div className="skills-body">
@@ -234,6 +259,16 @@ export function SkillsPanel(): ReactNode {
                 <div className="skill-item-main">
                   <div className="skill-item-title">
                     {s.builtin ? <span className="chip" style={{ fontSize: 10 }}>内置</span> : null}
+                    {/* F12：绑定目录数 —— 全局技能不显示该标记，一眼看出「哪些是按实验激活的」 */}
+                    {s.scope.length > 0 ? (
+                      <span
+                        className="chip"
+                        style={{ fontSize: 10 }}
+                        title={`仅在命中这些目录时注入：\n${s.scope.join('\n')}`}
+                      >
+                        绑定 {s.scope.length}
+                      </span>
+                    ) : null}
                     <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{s.name}</span>
                   </div>
                   {s.description ? (
@@ -287,6 +322,15 @@ export function SkillsPanel(): ReactNode {
                     placeholder="一句话说明用途（可选）"
                   />
                 </div>
+              </div>
+              <div className="field skills-editor-scope">
+                <label>绑定目录（留空 = 全局技能，任何实验都注入；一行一个）</label>
+                <textarea
+                  value={scope}
+                  onChange={(e) => setScope(e.target.value)}
+                  placeholder={'D:\\Lab\\OSPF\nD:\\Lab\\VLAN'}
+                  spellCheck={false}
+                />
               </div>
               <div className="field skills-editor-content">
                 <label>内容（Markdown）</label>

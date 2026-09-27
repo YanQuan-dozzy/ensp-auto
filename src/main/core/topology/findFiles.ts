@@ -29,8 +29,10 @@ export interface FindTopologyResult {
 }
 
 export interface FindTopologyOptions {
-  /** 指定目录（相对路径按用户主目录解析）；缺省扫描桌面/文档/下载 */
+  /** 指定目录（相对路径按用户主目录解析）；缺省扫描拓扑工程目录/桌面/文档/下载 */
   directory?: string
+  /** 用户配置的拓扑工程目录（若未指定 directory，排在扫描首位） */
+  topologyDir?: string
   /** 当前活动拓扑路径，命中者排最前并标 is_active */
   activePath?: string | null
   /** 递归深度（默认 4，防误扫大型目录树） */
@@ -45,9 +47,10 @@ const SKIP_DIRS = new Set([
   '.cache', '.idea', '.vscode', '__pycache__', '.next', 'backup'
 ])
 
-export function defaultSearchRoots(): { source: string; path: string }[] {
+export function defaultSearchRoots(configuredTopologyDir?: string): { source: string; path: string }[] {
   const home = os.homedir()
   const out: { source: string; path: string }[] = []
+  const seen = new Set<string>()
   const add = (source: string, dir: string): void => {
     if (!dir) return
     let resolved: string
@@ -56,13 +59,19 @@ export function defaultSearchRoots(): { source: string; path: string }[] {
     } catch {
       return
     }
+    const key = resolved.toLowerCase()
+    if (seen.has(key)) return
     try {
       if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
+        seen.add(key)
         out.push({ source, path: resolved })
       }
     } catch {
       /* 无权限/不存在则跳过 */
     }
+  }
+  if (configuredTopologyDir && configuredTopologyDir.trim()) {
+    add('configured', configuredTopologyDir.trim())
   }
   add('desktop', path.join(home, 'Desktop'))
   add('desktop', path.join(home, '桌面'))
@@ -81,7 +90,7 @@ export function findTopologyFiles(opts?: FindTopologyOptions): FindTopologyResul
   if (opts?.directory) {
     roots = [{ source: 'custom', path: path.resolve(opts.directory) }]
   } else {
-    roots = defaultSearchRoots()
+    roots = defaultSearchRoots(opts?.topologyDir)
   }
 
   const activePath = opts?.activePath ? path.resolve(opts.activePath) : null
@@ -131,8 +140,19 @@ export function findTopologyFiles(opts?: FindTopologyOptions): FindTopologyResul
     }
   }
 
+  const configuredRoot = opts?.topologyDir ? path.resolve(opts.topologyDir).toLowerCase() : null
+  const isUnderConfigured = (p: string): boolean => {
+    if (!configuredRoot) return false
+    const rel = path.relative(configuredRoot, path.resolve(p))
+    return !rel.startsWith('..') && !path.isAbsolute(rel)
+  }
+
   candidates.sort((a, b) => {
     if (a.isActive !== b.isActive) return a.isActive ? -1 : 1
+    const aConf = isUnderConfigured(a.path)
+    const bConf = isUnderConfigured(b.path)
+    if (aConf !== bConf) return aConf ? -1 : 1
+
     if (a.isNamedAfterDirectory !== b.isNamedAfterDirectory) return a.isNamedAfterDirectory ? -1 : 1
     if (b.modifiedAt !== a.modifiedAt) return b.modifiedAt - a.modifiedAt
     return a.path.toLowerCase() < b.path.toLowerCase() ? -1 : 1

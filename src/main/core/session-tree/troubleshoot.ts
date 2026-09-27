@@ -1,0 +1,102 @@
+import type { SessionNode } from '@shared/types'
+import { toolStepsOf, type ToolStep } from './compare'
+
+/**
+ * 经验沉淀（F13，2026-09-26）—— 从会话轨迹里抽出「失败 → 修正」片段，供模型提炼成技能。
+ *
+ * 为什么值得做：会话树已经把**每次失败与之后的修正**完整落盘了 —— 这是最真实、
+ * 最贴合本机环境的排障素材（不是教科书上的通用步骤，而是「在这台设备上踩过的坑」）。
+ * 但它散落在几十条工具调用里，直接喂给模型噪声太大，所以先做一次确定性抽取。
+ *
+ * 本模块**纯函数、不调模型、不落盘**：抽取与提示拼装可单测；模型调用在
+ * `agent/llm/distill.ts`，写盘在 SkillStore。
+ */
+
+export interface TroubleshootEpisode {
+  /** 失败的调用 */
+  failure: ToolStep
+  /** 失败之后、下一次失败之前的调用（含真正的修正尝试） */
+  after: ToolStep[]
+}
+
+/**
+ * 抽出「失败 → 之后若干次调用」的片段。
+ *
+ * `maxAfter` 限制每段最多带多少次后续调用：一次失败之后可能跟着十几条无关调用，
+ * 全带上会让提炼提示词噪声爆炸；取「最近的下一次失败之前」的前 N 条已经够用。
+ */
+export function findTroubleshootEpisodes(
+  nodes: readonly SessionNode[],
+  maxAfter = 6
+): TroubleshootEpisode[] {
+  const steps = toolStepsOf(nodes)
+  const out: TroubleshootEpisode[] = []
+  for (let i = 0; i < steps.length; i++) {
+    if (steps[i]!.ok !== false) continue
+    const after: ToolStep[] = []
+    for (let j = i + 1; j < steps.length && after.length < maxAfter; j++) {
+      if (steps[j]!.ok === false) break
+      after.push(steps[j]!)
+    }
+    out.push({ failure: steps[i]!, after })
+  }
+  return out
+}
+
+/**
+ * 只保留「失败之后确实有成功调用」的片段。
+ *
+ * 判据是「后面出现过 ok === true」：这说明这条路最终走通了，才有资格叫「经验」。
+ * 一路失败到底的片段沉淀出来的技能会教模型继续做错事。
+ */
+export function fixedEpisodes(episodes: readonly TroubleshootEpisode[]): TroubleshootEpisode[] {
+  return episodes.filter((e) => e.after.some((s) => s.ok === true))
+}
+
+/** 一行调用的紧凑描述（失败带错误码/摘要，成功带耗时） */
+function stepLine(s: ToolStep, mark: string): string {
+  const status = s.ok === false ? `失败${s.errorCode ? `(${s.errorCode})` : ''}` : s.ok === true ? '成功' : '未完成'
+  const summary = s.summary ? ` — ${s.summary}` : ''
+  const ms = s.ms !== undefined ? ` ${s.ms}ms` : ''
+  return `- ${mark} ${s.name}(${s.argKey}) ${status}${ms}${summary}`
+}
+
+/** 把片段拼成提炼提示词里的轨迹正文（截断到 maxChars，防止长会话把提示词撑爆） */
+export function buildTroubleshootTranscript(
+  episodes: readonly TroubleshootEpisode[],
+  maxChars = 6000
+): string {
+  const blocks: string[] = []
+  for (const [i, e] of episodes.entries()) {
+    blocks.push(`## 场景 ${i + 1}`)
+    blocks.push(stepLine(e.failure, '✘'))
+    if (e.after.length) {
+      blocks.push('之后的调用：')
+      for (const s of e.after) blocks.push(stepLine(s, s.ok === true ? '✔' : '·'))
+    }
+    blocks.push('')
+  }
+  const text = blocks.join('\n').trim()
+  return text.length > maxChars ? `${text.slice(0, maxChars)}\n…（轨迹已截断）` : text
+}
+
+/** 技能标题：优先用涉及的工具名拼，最多 3 个（具体题目留给用户改名） */
+export function troubleshootDraftTitle(episodes: readonly TroubleshootEpisode[]): string {
+  const names = [...new Set(episodes.map((e) => e.failure.name))].slice(0, 3)
+  return names.length ? `排障：${names.join('、')}` : '排障：实验失败复盘'
+}
+
+/** 技能描述：说明来源（让人一眼看出这是自动沉淀的、可能需要人工确认） */
+export function troubleshootDraftDescription(episodes: readonly TroubleshootEpisode[]): string {
+  return `由会话轨迹自动沉淀（${episodes.length} 个「失败→修正」片段）。内容基于本机实际操作，启用前请人工核对。`
+}
+
+/** 清洗模型输出：模型常无视「不要代码块」，这里剥掉最外层围栏与引导语（与 cleanEnhanced 同口径） */
+export function cleanDistilled(raw: string, maxChars = 8000): string {
+  let t = (raw ?? '').trim()
+  if (!t) return ''
+  const fence = /^```[A-Za-z0-9_-]*\s*\n([\s\S]*?)\n?```$/.exec(t)
+  if (fence && fence[1]) t = fence[1].trim()
+  t = t.replace(/^(沉淀后|提炼后|技能正文|Skill)\s*[:：]\s*/i, '').trim()
+  return t.slice(0, maxChars)
+}

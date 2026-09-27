@@ -114,3 +114,103 @@ test('重复删除幂等：墓碑不叠加、不出错', (t) => {
   store.remove({ linkKeys: [linkKey('SW1', 'PC3')] })
   assert.equal(store.snapshot().links.length, 0)
 })
+
+test('单文件隔离：导入新工程文件重置旧工程手动层，防止幽灵节点污染', (t) => {
+  const store = tmpStore(t)
+  // 导入工程 A
+  store.setFile(FILE_TOPO, 'D:/projA.topo')
+  store.applyManual({
+    nodes: [{ id: 'SW1', name: 'SW1', role: 'switch', source: 'manual', x: 100, y: 100 }],
+    links: []
+  })
+  assert.equal(store.snapshot().nodes.length, 2)
+
+  // 导入工程 B（包含完全不同的设备）
+  const TOPO_B = {
+    nodes: [{ id: 'Router-B', name: 'Router-B', role: 'router' }],
+    links: [],
+    updatedAt: 2
+  }
+  store.setFile(TOPO_B, 'D:/projB.topo')
+  const snapB = store.snapshot()
+  assert.equal(snapB.nodes.length, 1)
+  assert.equal(snapB.nodes[0].name, 'Router-B')
+  // 工程 A 的 SW1 / PC3 绝不能泄漏到工程 B 中
+  assert.ok(!snapB.nodes.some((n) => n.id === 'SW1' || n.id === 'PC3'))
+  assert.equal(store.fileSourcePath, 'D:/projB.topo')
+})
+
+test('工程切换恢复：切回原工程恢复该工程的微调，且互不干扰', (t) => {
+  const store = tmpStore(t)
+  store.setFile(FILE_TOPO, 'D:/projA.topo')
+  store.applyManual({
+    nodes: [{ id: 'SW1', name: 'SW1-A定制', role: 'switch', source: 'manual', x: 200, y: 200 }],
+    links: []
+  })
+  assert.equal(store.snapshot().nodes.find((n) => n.id === 'SW1').name, 'SW1-A定制')
+
+  // 切到工程 B
+  const TOPO_B = {
+    nodes: [{ id: 'SW-B', name: 'SW-B', role: 'switch' }],
+    links: [],
+    updatedAt: 2
+  }
+  store.setFile(TOPO_B, 'D:/projB.topo')
+  assert.equal(store.snapshot().nodes.length, 1)
+
+  // 切回工程 A
+  store.setFile(FILE_TOPO, 'D:/projA.topo')
+  const snapA = store.snapshot()
+  assert.equal(snapA.nodes.length, 2)
+  assert.equal(snapA.nodes.find((n) => n.id === 'SW1').name, 'SW1-A定制')
+})
+
+test('load() 脏数据自愈：启动时剔除遗留在 manual 层且不属于 file 层的跨工程幽灵节点', (t) => {
+  const file = path.join(os.tmpdir(), `ensp-topo-store-dirty-${process.pid}-${Math.random().toString(36).slice(2)}.json`)
+  t.after(() => fs.rmSync(file, { force: true }))
+
+  // 模拟之前故障场景写出的脏数据：fileLayer 是工程 B，manualLayer 却残留工程 A 的 2 个孤立节点
+  const dirtyData = {
+    version: 3,
+    file: {
+      nodes: [{ id: 'Core-New', name: 'Core-New', role: 'switch' }],
+      links: [],
+      updatedAt: 10
+    },
+    manual: {
+      nodes: [
+        { id: 'Old-Ghost1', name: 'Old-Ghost1', role: 'switch', source: 'manual', x: 10, y: 10 },
+        { id: 'Old-Ghost2', name: 'Old-Ghost2', role: 'pc', source: 'manual', x: 20, y: 20 },
+        { id: 'm-node-user-custom', name: 'UserAdded', role: 'pc', source: 'manual', x: 30, y: 30 }
+      ],
+      links: [
+        { id: 'l1', from: 'Old-Ghost1', to: 'Old-Ghost2', source: 'manual' }
+      ]
+    }
+  }
+  fs.writeFileSync(file, JSON.stringify(dirtyData, null, 2), 'utf8')
+
+  const store = new TopologyStore({ file })
+  const snap = store.snapshot()
+
+  // 验证自愈效果：Old-Ghost1 与 Old-Ghost2 被自动剔除，Core-New 与 m-node-user-custom 被保留
+  assert.equal(snap.nodes.length, 2)
+  assert.ok(snap.nodes.some((n) => n.id === 'Core-New'))
+  assert.ok(snap.nodes.some((n) => n.id === 'm-node-user-custom'))
+  assert.ok(!snap.nodes.some((n) => n.id === 'Old-Ghost1' || n.id === 'Old-Ghost2'))
+  assert.equal(snap.links.length, 0)
+})
+
+test('clear()：彻底清空拓扑与活动路径', (t) => {
+  const store = tmpStore(t)
+  store.setFile(FILE_TOPO, 'D:/test.topo')
+  store.applyManual({ nodes: manualNodes(['SW1']), links: [] })
+  assert.equal(store.snapshot().nodes.length, 2)
+  assert.equal(store.fileSourcePath, 'D:/test.topo')
+
+  store.clear()
+  const empty = store.snapshot()
+  assert.equal(empty.nodes.length, 0)
+  assert.equal(empty.links.length, 0)
+  assert.equal(store.fileSourcePath, null)
+})

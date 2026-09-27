@@ -32,6 +32,12 @@ export interface DecodedTopo {
   encoding: string
 }
 
+/** 原始 .topo 文件大小上限：工程文件是明文 XML/小体积 gzip，超过它只可能是误选或攻击载荷 */
+export const MAX_TOPO_FILE_BYTES = 20 * 1024 * 1024
+
+/** gunzip 后的解压上限：挡住 gzip 炸弹（小文件解出几十 GB 直接 OOM） */
+export const MAX_TOPO_DECODED_BYTES = 64 * 1024 * 1024
+
 /**
  * 文本字节解码：严格 UTF-8 优先；非法（真机中文版 .topo 实为 GBK，且头部谎称
  * encoding="UNICODE"）时回退 GBK。与通信层 encoding.ts 同一套判据（严格校验优先）。
@@ -50,7 +56,8 @@ export function decodeTopo(buf: Buffer): DecodedTopo {
   let xml: string
   let encoding = 'utf8'
   if (gzipped) {
-    const d = decodeText(gunzipSync(buf))
+    // v2.13：限制解压输出，避免 gzip 炸弹把主进程撑爆（超限抛错，上层 catch 成 UNKNOWN）
+    const d = decodeText(gunzipSync(buf, { maxOutputLength: MAX_TOPO_DECODED_BYTES }))
     xml = d.text
     encoding = d.encoding
   } else if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xfe) {

@@ -10,7 +10,15 @@ import type {
 } from '@shared/api'
 import { useApp } from '@/stores/app'
 import { Row, Section } from '@/components/settings-kit'
-import { Chip, IconFolder, IconInfo, IconRefresh, IconTrash, Switch } from '@/components/ui'
+import {
+  Chip,
+  DismissibleBanner,
+  IconFolder,
+  IconInfo,
+  IconRefresh,
+  IconTrash,
+  Switch
+} from '@/components/ui'
 
 /**
  * 设置 → 通用（v1.6）。
@@ -138,7 +146,9 @@ export function GeneralPanel(): ReactNode {
     []
   )
 
-  const openDir = async (target: 'userData' | 'exports' | 'attachments' | 'snapshots'): Promise<void> => {
+  const openDir = async (
+    target: 'userData' | 'exports' | 'attachments' | 'snapshots' | 'topology'
+  ): Promise<void> => {
     try {
       await window.api.app.openPath(target)
     } catch (e) {
@@ -202,7 +212,7 @@ export function GeneralPanel(): ReactNode {
   }
 
   const pickSubDir = async (
-    key: 'exportsDir' | 'attachmentsDir' | 'snapshotsDir',
+    key: 'exportsDir' | 'attachmentsDir' | 'snapshotsDir' | 'topologyDir',
     label: string
   ): Promise<void> => {
     try {
@@ -212,7 +222,8 @@ export function GeneralPanel(): ReactNode {
         userDataDir: '',
         exportsDir: '',
         attachmentsDir: '',
-        snapshotsDir: ''
+        snapshotsDir: '',
+        topologyDir: ''
       }
       await updateSettings({
         storage: {
@@ -228,7 +239,7 @@ export function GeneralPanel(): ReactNode {
   }
 
   const resetSubDir = async (
-    key: 'exportsDir' | 'attachmentsDir' | 'snapshotsDir',
+    key: 'exportsDir' | 'attachmentsDir' | 'snapshotsDir' | 'topologyDir',
     label: string
   ): Promise<void> => {
     try {
@@ -236,7 +247,8 @@ export function GeneralPanel(): ReactNode {
         userDataDir: '',
         exportsDir: '',
         attachmentsDir: '',
-        snapshotsDir: ''
+        snapshotsDir: '',
+        topologyDir: ''
       }
       await updateSettings({
         storage: {
@@ -359,6 +371,33 @@ export function GeneralPanel(): ReactNode {
         />
 
         <Row
+          title="拓扑工程目录"
+          desc="华为 eNSP 拓扑工程文件（.topo）存放位置；Agent 查找拓扑与导入首选此目录，导入时亦会自动记录；即时生效。"
+          stacked
+          control={
+            <div className="set-ctl-line">
+              <input
+                readOnly
+                value={info?.topologyDir ?? ''}
+                placeholder="未配置（默认搜索桌面/文档/下载；导入拓扑时自动记录）"
+              />
+              <button className="btn sm" onClick={() => void pickSubDir('topologyDir', '拓扑工程目录')}>
+                选择目录
+              </button>
+              <button className="btn sm" onClick={() => void openDir('topology')}>
+                <IconFolder size={11} />
+                打开目录
+              </button>
+              {settings.storage?.topologyDir ? (
+                <button className="btn sm ghost" onClick={() => void resetSubDir('topologyDir', '拓扑工程目录')}>
+                  恢复默认
+                </button>
+              ) : null}
+            </div>
+          }
+        />
+
+        <Row
           title="占用分布"
           desc="只统计本应用自管的数据，不含浏览器内核缓存（那部分不可清理，算进来只会让数字无法解释）。"
           stacked
@@ -390,8 +429,16 @@ export function GeneralPanel(): ReactNode {
           }
         />
 
-        {notice ? <div className="banner info">{notice}</div> : null}
-        {error ? <div className="banner danger">{error}</div> : null}
+        {notice ? (
+          <DismissibleBanner tone="info" onDismiss={() => setNotice('')}>
+            {notice}
+          </DismissibleBanner>
+        ) : null}
+        {error ? (
+          <DismissibleBanner tone="danger" onDismiss={() => setError('')}>
+            {error}
+          </DismissibleBanner>
+        ) : null}
       </Section>
 
       <Section label="通知">

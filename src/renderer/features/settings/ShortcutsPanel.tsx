@@ -1,6 +1,13 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { useApp } from '@/stores/app'
-import { IconSearch, IconClose, IconRotateCcw, IconTrash, IconKey } from '@/components/ui'
+import {
+  DismissibleBanner,
+  IconSearch,
+  IconClose,
+  IconRotateCcw,
+  IconTrash,
+  IconKey
+} from '@/components/ui'
 import {
   DEFAULT_SHORTCUTS,
   DEFAULT_SHORTCUTS_MAP,
@@ -137,7 +144,15 @@ export function ShortcutsPanel(): ReactNode {
         </button>
       </div>
 
-      {notice ? <div className="banner info shortcuts-banner">{notice}</div> : null}
+      {notice ? (
+        <DismissibleBanner
+          tone="info"
+          className="shortcuts-banner"
+          onDismiss={() => setNotice(null)}
+        >
+          {notice}
+        </DismissibleBanner>
+      ) : null}
 
       {/* 快捷键表格列表 */}
       <div className="shortcuts-table-container">

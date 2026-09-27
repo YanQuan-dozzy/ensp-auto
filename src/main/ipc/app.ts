@@ -31,7 +31,8 @@ export function registerAppIpc(services: Services, getWindow: () => BrowserWindo
       isCustomUserData,
       exportsDir: services.exportsDir,
       attachmentsDir: services.attachmentsDir,
-      snapshotsDir: services.snapshotsDir
+      snapshotsDir: services.snapshotsDir,
+      topologyDir: services.topologyDir
     }
   })
 
@@ -52,12 +53,34 @@ export function registerAppIpc(services: Services, getWindow: () => BrowserWindo
     if (args?.target === 'exports') target = services.exportsDir
     else if (args?.target === 'attachments') target = services.attachmentsDir
     else if (args?.target === 'snapshots') target = services.snapshotsDir
+    else if (args?.target === 'topology') {
+      const activeFile = services.topology.fileSourcePath
+      target =
+        services.topologyDir ||
+        (activeFile && fs.existsSync(path.dirname(activeFile))
+          ? path.dirname(activeFile)
+          : path.join(services.userDataDir, 'topologies'))
+    }
     else target = services.userDataDir
 
     if (!fs.existsSync(target)) fs.mkdirSync(target, { recursive: true })
     const err = await shell.openPath(target)
     if (err) throw new Error(err)
     return true
+  })
+
+  // v2.3：在系统默认浏览器打开外部链接。
+  // 只放行 http/https —— 渲染层递过来的字符串若被换成 file:// 或自定义协议，
+  // shell.openExternal 会直接交给系统执行，等于开了一个任意协议的口子。
+  ipcMain.handle(INVOKE.appOpenExternal, async (_e, args: { url?: unknown }) => {
+    const raw = toStr(args?.url).trim()
+    if (!/^https?:\/\//i.test(raw)) return false
+    try {
+      await shell.openExternal(raw)
+      return true
+    } catch {
+      return false
+    }
   })
 
   ipcMain.handle(INVOKE.appClearData, async (_e, args: { scope?: unknown }) => {

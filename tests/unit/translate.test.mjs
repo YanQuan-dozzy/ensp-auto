@@ -33,16 +33,25 @@ test('toolcall_end 收集工具调用（arguments 已是对象）', () => {
   assert.deepEqual(acc.toolCalls[0].args, { a: 1 })
 })
 
-test('thinking 事件不进入对话流', () => {
+test('v2.2 thinking 段收集，结束时下发为独立的 thinking 事件', () => {
   const acc = newTurn()
   const a = consumeEvent(acc, { type: 'thinking_start', contentIndex: 0, partial: {} })
   const b = consumeEvent(acc, { type: 'thinking_delta', contentIndex: 0, delta: '内部推理', partial: {} })
-  const c = consumeEvent(acc, { type: 'thinking_end', contentIndex: 0, content: '内部推理', partial: {} })
+  const c = consumeEvent(acc, { type: 'thinking_delta', contentIndex: 0, delta: '继续想', partial: {} })
+  const d = consumeEvent(acc, { type: 'thinking_end', contentIndex: 0, content: '内部推理继续想', partial: {} })
   assert.deepEqual(a, [])
   assert.deepEqual(b, [])
   assert.deepEqual(c, [])
-  assert.equal(acc.text, '')
+  assert.deepEqual(d, [{ type: 'thinking', text: '内部推理继续想' }])
+  assert.equal(acc.text, '', '思考不应混入正文')
   assert.equal(acc.toolCalls.length, 0)
+})
+
+test('v2.2 空思考段不下发 thinking 事件', () => {
+  const acc = newTurn()
+  consumeEvent(acc, { type: 'thinking_start', contentIndex: 0, partial: {} })
+  const end = consumeEvent(acc, { type: 'thinking_end', contentIndex: 0, content: '', partial: {} })
+  assert.deepEqual(end, [])
 })
 
 test('start / text_start / done 事件忽略', () => {

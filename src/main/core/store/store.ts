@@ -1,7 +1,12 @@
 import fs from 'node:fs'
 import type { DeviceId, Settings } from '@shared/types'
 import { DEFAULT_SETTINGS } from '@shared/types'
-import { normalizeAgentSettings, type RawAgentSettings } from '@shared/profiles'
+import {
+  normalizeAgentSettings,
+  upgradeAgentDefaults,
+  type RawAgentSettings
+} from '@shared/profiles'
+import { upgradeCompactionDefaults } from '@shared/runtime-policy'
 import { atomicWriteJsonSync } from '../fs/atomic'
 import { structuredCloneSafe } from '@shared/clone'
 
@@ -18,14 +23,24 @@ import { structuredCloneSafe } from '@shared/clone'
  */
 
 interface Persisted {
-  version: 1
+  version: number
   settings: Settings
   aliases: Record<DeviceId, string>
   recentPorts: number[]
 }
 
+/**
+ * 落盘结构版本。v2.9 起它同时充当**出厂默认值迁移的门控**：
+ * 版本落后的文件在加载时过一次 `migrateDefaultValues`，然后立刻回写版本号。
+ *
+ * 为什么要门控、而不是让上调逻辑一直挂在读取路径上：读取路径同时也是写入路径
+ * （每次 updateSettings 都会重新规整），一直挂着就意味着用户之后主动把轮数填回 50、
+ * 把字符预算填回 200000 都会被静默改回新默认值 —— 那正是「改了没反应且没有任何报错」。
+ */
+const PERSIST_VERSION = 2
+
 const EMPTY: Persisted = {
-  version: 1,
+  version: PERSIST_VERSION,
   settings: DEFAULT_SETTINGS,
   aliases: {},
   recentPorts: []
@@ -46,6 +61,12 @@ function deepMergeSettings(base: Settings, patch: Partial<Settings>): Settings {
     // v1.7：重试 / 压缩同样是子对象
     retry: { ...base.retry, ...(patch.retry ?? {}) },
     compaction: { ...base.compaction, ...(patch.compaction ?? {}) },
+    // v2.5：并发上限同样是子对象（漏一行 → 改完重启回到 4，且没有任何报错）
+    concurrency: { ...base.concurrency, ...(patch.concurrency ?? {}) },
+    // v2.14：重复调用防护（同样必须逐字段合并，否则「只关开关」会让整块被默认值顶回去）
+    repeatGuard: { ...base.repeatGuard, ...(patch.repeatGuard ?? {}) },
+    // v2.8：会话标题设置
+    title: { ...base.title, ...(patch.title ?? {}) },
     // v1.9：Wireshark 安装目录
     wireshark: { ...base.wireshark, ...(patch.wireshark ?? {}) },
     // 存储目录自定义设置
@@ -68,6 +89,23 @@ function withNormalizedAgent(s: Settings): Settings {
   return { ...s, agent: normalizeAgentSettings(s.agent as RawAgentSettings) }
 }
 
+/**
+ * v2.9：出厂默认值上调（一次性，见 PERSIST_VERSION 的说明）。
+ *
+ * 覆盖两处「档位默认值跟着 eNSP 长实验上调」的地方：
+ * - agent 档案：工具调用轮数、上下文窗口（shared/profiles.ts）
+ * - 压缩设置：字符预算、保留轮数（shared/runtime-policy.ts）
+ *
+ * 两处内部都只认「仍停在旧默认值上」的那一个组合，用户自己调过的值一律不动。
+ */
+function migrateDefaultValues(s: Settings): Settings {
+  return {
+    ...s,
+    agent: upgradeAgentDefaults(s.agent),
+    compaction: upgradeCompactionDefaults(s.compaction)
+  }
+}
+
 export class JsonStore {
   private data: Persisted = structuredCloneSafe(EMPTY)
 
@@ -79,20 +117,32 @@ export class JsonStore {
     try {
       if (!fs.existsSync(this.file)) return
       const parsed = JSON.parse(fs.readFileSync(this.file, 'utf8')) as Partial<Persisted>
+      // 老文件里的版本可能是 1 或干脆没有这个字段 → 一律当成 1（需要过迁移）
+      const fileVersion = typeof parsed.version === 'number' ? parsed.version : 1
       const rawSettings = (parsed.settings ?? {}) as Partial<Settings>
+      const merged = withNormalizedAgent(
+        deepMergeSettings(DEFAULT_SETTINGS, {
+          ...rawSettings,
+          // 先把持久化里的 agent 规整（含 v1.4 扁平字段迁移），再与默认值合并
+          ...(rawSettings.agent
+            ? { agent: normalizeAgentSettings(rawSettings.agent as RawAgentSettings) }
+            : {})
+        })
+      )
       this.data = {
-        version: 1,
-        settings: withNormalizedAgent(
-          deepMergeSettings(DEFAULT_SETTINGS, {
-            ...rawSettings,
-            // 先把持久化里的 agent 规整（含 v1.4 扁平字段迁移），再与默认值合并
-            ...(rawSettings.agent
-              ? { agent: normalizeAgentSettings(rawSettings.agent as RawAgentSettings) }
-              : {})
-          })
-        ),
+        version: PERSIST_VERSION,
+        settings: fileVersion < PERSIST_VERSION ? migrateDefaultValues(merged) : merged,
         aliases: parsed.aliases ?? {},
         recentPorts: parsed.recentPorts ?? []
+      }
+      // 迁移过就立刻回写版本号，保证「只跑一次」：否则用户下次主动把值改回旧默认，
+      // 重启后又会被抬上去。写失败不阻塞启动 —— 迁移是幂等的，下次启动重跑即可。
+      if (fileVersion < PERSIST_VERSION) {
+        try {
+          this.persist()
+        } catch {
+          /* 见上：下一次启动会重跑，语义不变 */
+        }
       }
     } catch {
       // 读坏了就用默认值，不阻塞启动；下一次写入会覆盖

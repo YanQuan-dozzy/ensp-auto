@@ -269,11 +269,28 @@ test('T1.8 MCP 出口：danger 工具既不列出也不允许调用', () => {
   const danger = TOOLS.filter((t) => t.risk === 'danger')
   assert.ok(danger.length > 0, '必须真的存在 danger 工具，否则本例是空转')
 
+  // v2.22（F17）：`mcpExposed === false` 的工具同样不外露 —— 它的结果只有
+  // 本进程内的模型能消费（read_image 产出的是图片），外部客户端那头的模型能力
+  // 无法判定，按「未知能力即拒绝」处理。
+  const hidden = TOOLS.filter((t) => t.mcpExposed === false)
+
   const exposed = toMcpTools(TOOLS).map((t) => t.name)
-  assert.equal(exposed.length, TOOLS.length - danger.length, '外露集合 = 内置工具 − danger')
+  assert.equal(
+    exposed.length,
+    TOOLS.length - danger.length - hidden.length,
+    '外露集合 = 内置工具 − danger − 显式不外露'
+  )
   for (const d of danger) {
     assert.equal(exposed.includes(d.name), false, `${d.name} 不应出现在 MCP 工具列表里`)
   }
+  for (const h of hidden) {
+    assert.equal(exposed.includes(h.name), false, `${h.name} 声明了不外露，就必须真的不出现`)
+  }
+  // 当前刻意不外露的只有 read_image —— 钉住它，免得将来有人顺手把别的工具也藏起来
+  assert.deepEqual(
+    hidden.map((t) => t.name),
+    ['read_image']
+  )
 })
 
 // ———————————————————— 测试底座 ————————————————————

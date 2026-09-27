@@ -20,15 +20,17 @@ export interface CollectedToolCall {
 /** 一轮对话的累计状态 */
 export interface TurnAccumulator {
   text: string
+  /** v2.2：正在累积的模型思考（reasoning），thinking_end 时作为 thinking 事件下发 */
+  thinking: string
   toolCalls: CollectedToolCall[]
 }
 
 export function newTurn(): TurnAccumulator {
-  return { text: '', toolCalls: [] }
+  return { text: '', thinking: '', toolCalls: [] }
 }
 
 /**
- * 消费一条事件，返回需要立即下发给 UI 的 AgentEvent（目前只有 text delta）。
+ * 消费一条事件，返回需要立即下发给 UI 的 AgentEvent（目前只有 text / thinking）。
  * toolcall_end 收集进 acc.toolCalls（arguments 已是解析后的对象）。
  */
 export function consumeEvent(acc: TurnAccumulator, ev: AssistantMessageEvent): AgentEvent[] {
@@ -36,11 +38,18 @@ export function consumeEvent(acc: TurnAccumulator, ev: AssistantMessageEvent): A
     case 'text_delta':
       acc.text += ev.delta
       return [{ type: 'text', delta: ev.delta }]
-    case 'thinking_delta':
     case 'thinking_start':
-    case 'thinking_end':
-      // 推理中间过程不进入对话流，避免把大段思考文本灌给用户
+      acc.thinking = ''
       return []
+    case 'thinking_delta':
+      acc.thinking += ev.delta
+      return []
+    case 'thinking_end': {
+      const text = acc.thinking
+      acc.thinking = ''
+      // 一段思考结束，作为独立的「思考」事件下发（界面渲染为可折叠行，与正文分离）
+      return text.trim() ? [{ type: 'thinking', text: text.trim() }] : []
+    }
     case 'toolcall_end':
       acc.toolCalls.push({
         id: ev.toolCall.id,

@@ -1,15 +1,18 @@
 /**
- * 设置 → 模型 分区（T5.8 从 SettingsDialog.tsx 外提）。
+ * 设置 → 模型 分区（T5.8 从 SettingsDialog.tsx 外提，v2.3 改为表格版式）。
  *
- * 自包含：本地草稿 + 即时落盘（每次改动都 updateSettings），
- * 与拆分前「在 SettingsDialog 组件里」的行为逐条等价 —— 这些字段本来就是
- * 「改了立即生效」的，摘成独立组件后只在进入该分区时初始化一次，反而更贴合分区语义。
+ * 版式：模型管理是一张表（模型 / 服务商 / 操作），增删改走「编辑模型」弹窗 ——
+ * 一档模型的字段有十来个（端点、密钥、上下文窗口、思考模式、采样参数…），
+ * 平铺在设置页里会让「有哪些模型」这件事反而看不见。
+ *
+ * 落盘语义：表格里的开关（启用）即时生效；弹窗里的字段点「保存模型」才生效 ——
+ * 一档模型的参数是成套的，边打边落盘会让半成品配置被下一次真实请求用到。
  */
-import { useEffect, useState } from 'react'
+import { useState, type ReactNode } from 'react'
 import { useApp } from '@/stores/app'
-import { ALL_PROVIDERS, PROVIDER_ORDER, type LlmProvider } from '@shared/providers'
-import { labelFor, newProfileId } from '@shared/profiles'
-import type { ModelProfile } from '@shared/types'
+import { ALL_PROVIDERS } from '@shared/providers'
+import { newProfileDraft, withProfileEnabled, activeProfile } from '@shared/profiles'
+import type { AgentSettings, ModelProfile } from '@shared/types'
 import {
   COMPACTION_BOUNDS,
   RETRY_BOUNDS,
@@ -18,468 +21,555 @@ import {
   type CompactionSettings,
   type RetrySettings
 } from '@shared/runtime-policy'
-import { Switch } from '@/components/ui'
+import {
+  Switch,
+  DismissibleBanner,
+  IconActivity,
+  IconCpu,
+  IconPlus,
+  IconTrash,
+  type BannerTone
+} from '@/components/ui'
 import { Row, Section } from '@/components/settings-kit'
-import { ApiKeyRow } from './ApiKeyRow'
+import {
+  CONCURRENCY_BOUNDS,
+  sanitizeConcurrency,
+  type ConcurrencySettings
+} from '@shared/concurrency'
+import {
+  sanitizeRepeatGuard,
+  type RepeatGuardSettings
+} from '@shared/repeat-guard'
+import {
+  TITLE_BOUNDS,
+  canGenerateTitle,
+  sanitizeTitleSettings,
+  type TitleSettings
+} from '@shared/session-title'
+import { ModelEditorDialog } from './ModelEditorDialog'
+import type { ProfileTestResult } from '@shared/api'
 
-export function ProfileSettings() {
+/** 探活结论 → banner 配色（skipped 只算提示，不是错误） */
+const TEST_TONE: Record<ProfileTestResult['level'], BannerTone> = {
+  ok: 'success',
+  warn: 'pending',
+  fail: 'danger',
+  skipped: 'info'
+}
+
+export function ProfileSettings(): ReactNode {
+  const settings = useApp((s) => s.settings)
   const updateSettings = useApp((s) => s.updateSettings)
   const setProfileKey = useApp((s) => s.setProfileKey)
   const configuredProfileIds = useApp((s) => s.configuredProfileIds)
-  const settings = useApp((s) => s.settings)
 
-  // —— 模型档案（本地草稿 + 即时落盘：每个改动都 updateSettings）——
-  const [draft, setDraft] = useState<ModelProfile[]>(() =>
-    settings.agent.profiles.map((p) => ({ ...p }))
-  )
-  const [activeId, setActiveId] = useState(settings.agent.activeProfileId)
-  const [systemPrompt, setSystemPrompt] = useState(settings.agent.systemPrompt)
-  const [rounds, setRounds] = useState('12')
-  const [temp, setTemp] = useState('0.2')
+  const agent = settings.agent
+  const profiles = agent.profiles
 
-  const [runtime, setRuntime] = useState(settings.agent.runtime)
-  // v1.7：请求韧性 / 上下文压缩。注意：这里的改动与模型档案一样是「即时落盘」的
-  // （底栏 foot 文案也明说「所有配置改动即时生效」），不要误写成「点保存才落盘」
+  /** 编辑弹窗（null = 未打开） */
+  const [editor, setEditor] = useState<{ profile: ModelProfile; isNew: boolean } | null>(null)
+  /** 正在测试的档案 id */
+  const [testing, setTesting] = useState<string | null>(null)
+  /** 最近一次连通性测试结论 */
+  const [tested, setTested] = useState<{ name: string; r: ProfileTestResult } | null>(null)
+
+  const [systemPrompt, setSystemPrompt] = useState(agent.systemPrompt)
+  const [runtime, setRuntime] = useState(agent.runtime)
+  // v1.7：请求韧性 / 上下文压缩。注意：这里的改动与表格里的开关一样是「即时落盘」的
+  // （底栏 foot 文案也明说「其余配置改动即时生效」），不要误写成「点保存才落盘」
   const [retryDraft, setRetryDraft] = useState<RetrySettings>(() => ({ ...settings.retry }))
   const [compactDraft, setCompactDraft] = useState<CompactionSettings>(() => ({
     ...settings.compaction
   }))
+  // v2.5：并发上限。老配置里可能没有这一块（sanitize 会补默认值），不能直接 spread
+  const [concurrencyDraft, setConcurrencyDraft] = useState<ConcurrencySettings>(() =>
+    sanitizeConcurrency(settings.concurrency)
+  )
+  // v2.8：会话标题。老配置没有这一块，必须 sanitize 补默认（默认关闭）
+  const [titleDraft, setTitleDraft] = useState<TitleSettings>(() =>
+    sanitizeTitleSettings(settings.title)
+  )
+  // v2.14：重复调用防护。老配置同样没有这一块，sanitize 补默认（默认开启）
+  const [repeatGuardDraft, setRepeatGuardDraft] = useState<RepeatGuardSettings>(() =>
+    sanitizeRepeatGuard(settings.repeatGuard)
+  )
 
-  const current = draft.find((p) => p.id === activeId) ?? draft[0]!
+  /** 写 agent 分区：读 getState 拿最新值，避免连击快速写入时基于过期快照互相覆盖 */
+  const writeAgent = (patch: Partial<AgentSettings>): Promise<void> =>
+    updateSettings({ agent: { ...useApp.getState().settings.agent, ...patch } })
 
-  // 切档时把数值输入框重置为该档的值。
-  // 刻意只依赖 current.id：数值框允许空串（清空重打），若把 maxRounds/temperature
-  // 也放进依赖，用户每敲一个字符都会把输入框弹回 draft 的值，反而打不进去。
-  useEffect(() => {
-    setRounds(String(current.maxRounds))
-    setTemp(String(current.temperature))
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [current.id])
+  /** 保存弹窗：新增 = 追加并切为活跃档；编辑 = 覆盖。密钥留空表示不改这一档的密钥 */
+  const saveProfile = async (next: ModelProfile, key: string): Promise<void> => {
+    const exists = useApp.getState().settings.agent.profiles.some((p) => p.id === next.id)
+    const list = exists ? profiles.map((p) => (p.id === next.id ? next : p)) : [...profiles, next]
+    await writeAgent({
+      profiles: list,
+      ...(exists ? {} : { activeProfileId: next.id })
+    })
+    if (key) await setProfileKey(next.id, key)
+    // 写盘成功后才关弹窗：失败时留在原地，用户不必重填一遍
+    setEditor(null)
+  }
 
-  const patchCurrent = (patch: Partial<ModelProfile>): void => {
-    const nextProfiles = draft.map((p) => (p.id === current.id ? { ...p, ...patch } : p))
-    setDraft(nextProfiles)
-    // v1.8：从 getState 读最新 agent（不用渲染闭包），避免连击快速补丁时基于过期快照互相覆盖
-    void updateSettings({
-      agent: { ...useApp.getState().settings.agent, profiles: nextProfiles, activeProfileId: activeId }
+  /** 删除一档：至少留一档；顺手清掉该档密钥，避免凭据库里留孤儿 */
+  const remove = async (p: ModelProfile): Promise<void> => {
+    if (profiles.length <= 1) return
+    if (!window.confirm(`删除模型「${p.label}」？该档已保存的 API Key 会一并删除。`)) return
+    const list = profiles.filter((x) => x.id !== p.id)
+    if (configuredProfileIds.includes(p.id)) await setProfileKey(p.id, '')
+    await writeAgent({
+      profiles: list,
+      activeProfileId: agent.activeProfileId === p.id ? list[0]!.id : agent.activeProfileId
     })
   }
 
-  /**
-   * 切换服务商：若端点/模型名仍是「某个 provider 的默认值」（说明没被自定义过），
-   * 就带出新 provider 的默认端点与推荐模型 —— 避免「改了服务商忘了改端点」。
-   */
-  const onProviderChange = (next: LlmProvider): void => {
-    const meta = ALL_PROVIDERS[next]
-    if (!meta) return
-    const isKnownDefault = (v: string): boolean =>
-      !v.trim() ||
-      Object.values(ALL_PROVIDERS).some((m) => !!m.defaultBaseUrl && m.defaultBaseUrl === v.trim())
-    const isKnownModel = (v: string): boolean =>
-      !v.trim() || Object.values(ALL_PROVIDERS).some((m) => m.models.includes(v.trim()))
-    const patch: Partial<ModelProfile> = { provider: next }
-    if (isKnownDefault(current.baseUrl)) patch.baseUrl = meta.defaultBaseUrl
-    if (isKnownModel(current.model)) patch.model = meta.models[0] ?? ''
-    patchCurrent(patch)
-  }
-
-  /** 新增一档：从当前档复制，省掉重填端点与模型；随后自动切到新档 */
-  const addProfile = (): void => {
-    const copy: ModelProfile = {
-      ...current,
-      id: newProfileId(),
-      label: `${labelFor(current.provider, current.model)} 副本`
+  /** 连通性测试：对指定档发一次最小真实请求（验端点 / 密钥 / 模型名三件事） */
+  const runTest = async (p: ModelProfile): Promise<void> => {
+    setTesting(p.id)
+    setTested(null)
+    try {
+      const r = await window.api.settings.testProfile(p.id)
+      setTested({ name: p.label, r })
+    } catch (e) {
+      setTested({
+        name: p.label,
+        r: { level: 'fail', detail: e instanceof Error ? e.message : String(e) }
+      })
+    } finally {
+      setTesting(null)
     }
-    const nextProfiles = [...draft, copy]
-    setDraft(nextProfiles)
-    setActiveId(copy.id)
-    void updateSettings({
-      // R25：读最新 agent（不用渲染闭包），避免与其它分区的写入互相覆盖
-      agent: {
-        ...useApp.getState().settings.agent,
-        profiles: nextProfiles,
-        activeProfileId: copy.id
-      }
-    })
   }
-
-  /** 删除一档：至少留一档；删掉的若配过密钥，顺手清掉，避免密钥文件里留孤儿 */
-  const removeProfile = async (): Promise<void> => {
-    if (draft.length <= 1) return
-    const gone = current.id
-    const nextProfiles = draft.filter((p) => p.id !== gone)
-    const nextActive = nextProfiles[0]!.id
-    setDraft(nextProfiles)
-    setActiveId(nextActive)
-    if (configuredProfileIds.includes(gone)) await setProfileKey(gone, '')
-    void updateSettings({
-      agent: {
-        ...useApp.getState().settings.agent,
-        profiles: nextProfiles,
-        activeProfileId: nextActive
-      }
-    })
-  }
-
-  const providerMeta = ALL_PROVIDERS[current.provider]
-  const isNative =
-    current.provider === 'openai' || current.provider === 'anthropic' || current.provider === 'google'
-  const currentKeyed = configuredProfileIds.includes(current.id)
 
   return (
-                      <>
-                        <Section
-                          label="模型档案"
-                          action={
-                            <span className="set-section-actions">
-                              <button className="btn sm" onClick={addProfile} title="复制当前档为新的一档">
-                                新增档案
-                              </button>
-                              <button
-                                className="btn sm"
-                                onClick={() => void removeProfile()}
-                                disabled={draft.length <= 1}
-                                title={draft.length <= 1 ? '至少保留一档' : '删除当前档案'}
-                              >
-                                删除
-                              </button>
-                            </span>
-                          }
+    <>
+      <section className="set-section">
+        <div className="set-section-head">
+          <span className="set-section-label">模型管理</span>
+        </div>
+        <div className="model-manage">
+          <div className="model-manage-desc">
+            配置 API Key 添加更多可用模型，预置模型默认使用稳定版本。
+          </div>
+          <div className="model-manage-actions">
+            <button
+              className="btn sm"
+              onClick={() => setEditor({ profile: newProfileDraft(), isNew: true })}
+              title="新增一个模型档案"
+            >
+              <IconPlus size={12} />
+              添加模型
+            </button>
+          </div>
+
+          {tested ? (
+            <DismissibleBanner tone={TEST_TONE[tested.r.level]} onDismiss={() => setTested(null)}>
+              <span>
+                <b>{tested.name}</b>：{tested.r.detail}
+                {tested.r.hint ? ` —— ${tested.r.hint}` : ''}
+              </span>
+              <button className="btn ghost icon sm" onClick={() => setTested(null)} title="收起该结论">
+                ×
+              </button>
+            </DismissibleBanner>
+          ) : null}
+
+          <div className="model-table-wrap">
+            <table className="model-table">
+              <thead>
+                <tr>
+                  <th>模型</th>
+                  <th>服务商</th>
+                  <th className="col-ops">操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {profiles.map((p) => (
+                  <tr key={p.id} className={p.enabled === false ? 'off' : ''}>
+                    <td>
+                      <button
+                        type="button"
+                        className="model-cell"
+                        onClick={() => setEditor({ profile: p, isNew: false })}
+                        title="点击编辑该模型"
+                      >
+                        <IconCpu size={14} className="model-cell-icon" />
+                        <span className="model-cell-name">{p.label}</span>
+                        {p.id === agent.activeProfileId ? (
+                          <span className="chip agent">使用中</span>
+                        ) : null}
+                        {configuredProfileIds.includes(p.id) ? null : (
+                          <span className="chip">未配密钥</span>
+                        )}
+                      </button>
+                    </td>
+                    <td className="model-cell-provider">
+                      {ALL_PROVIDERS[p.provider]?.label ?? p.provider}
+                    </td>
+                    <td>
+                      <span className="model-row-ops">
+                        <button
+                          className="icon-btn"
+                          onClick={() => void runTest(p)}
+                          disabled={testing === p.id}
+                          title="连通性测试：发一次真实的最小请求，验证端点、密钥与模型名"
                         >
-                          <Row
-                            title="当前档案"
-                            desc="代理实际使用的那一档；每档的端点、模型与密钥互相独立。"
-                            control={
-                              <>
-                                <select
-                                  value={current.id}
-                                  onChange={(e) => {
-                                    const nextId = e.target.value
-                                    setActiveId(nextId)
-                                    void updateSettings({
-                                      agent: {
-                                        ...useApp.getState().settings.agent,
-                                        activeProfileId: nextId
-                                      }
-                                    })
-                                  }}
-                                >
-                                  {draft.map((p) => (
-                                    <option key={p.id} value={p.id}>
-                                      {p.label || labelFor(p.provider, p.model)}
-                                      {configuredProfileIds.includes(p.id) ? '（已配置密钥）' : ''}
-                                    </option>
-                                  ))}
-                                </select>
-                                <span className={`chip${currentKeyed ? ' success' : ''}`}>
-                                  {currentKeyed ? '已配置' : '未配置'}
-                                </span>
-                              </>
-                            }
-                          />
-                          <Row
-                            title="档案名"
-                            desc="只用于你自己辨认，随便改；留空则按服务商与模型名自动生成。"
-                            control={
-                              <input
-                                value={current.label}
-                                onChange={(e) => patchCurrent({ label: e.target.value })}
-                                placeholder={labelFor(current.provider, current.model)}
-                              />
-                            }
-                          />
-                        </Section>
-      
-                        <Section label="服务商与端点">
-                          <Row
-                            title="服务商"
-                            desc="国产平台（DeepSeek / 智谱 / 千问 / Kimi / 豆包 / 千帆 / MiniMax）与自定义端点走 OpenAI 兼容协议；其余走各自官方原生 API。"
-                            control={
-                              <select
-                                value={current.provider}
-                                onChange={(e) => onProviderChange(e.target.value as LlmProvider)}
-                              >
-                                {PROVIDER_ORDER.map((p) => (
-                                  <option key={p} value={p}>
-                                    {ALL_PROVIDERS[p].label}
-                                  </option>
-                                ))}
-                              </select>
-                            }
-                          />
-                          <Row
-                            title="API 端点"
-                            desc={
-                              isNative
-                                ? 'OpenAI / Anthropic / Google 走官方原生 API，此字段不生效。'
-                                : `默认 ${providerMeta.defaultBaseUrl || '留空'}，可填任何 OpenAI 兼容端点：Kimi / Ollama / vLLM 等`
-                            }
-                            control={
-                              <input
-                                value={current.baseUrl}
-                                onChange={(e) => patchCurrent({ baseUrl: e.target.value })}
-                                placeholder={providerMeta.defaultBaseUrl || 'OpenAI 兼容端点地址'}
-                              />
-                            }
-                          />
-                          <Row
-                            title="模型名"
-                            desc={
-                              isNative
-                                ? '候选为 2026-09 各厂商官方最新模型名；官方 API 保存时会校验模型目录。'
-                                : '候选为 2026-09 各厂商官方最新模型名；OpenAI 兼容线可任意填写。'
-                            }
-                            control={
-                              <>
-                                <input
-                                  list="model-suggestions"
-                                  value={current.model}
-                                  onChange={(e) => patchCurrent({ model: e.target.value })}
-                                  placeholder={providerMeta.models[0] ?? '模型名'}
-                                />
-                                <datalist id="model-suggestions">
-                                  {providerMeta.models.map((m) => (
-                                    <option key={m} value={m} />
-                                  ))}
-                                </datalist>
-                              </>
-                            }
-                          />
-                        </Section>
-      
-                        <ApiKeyRow
-                          currentKeyed={currentKeyed}
-                          onSaveKey={(k) => setProfileKey(current.id, k)}
-                          onClearKey={() => void setProfileKey(current.id, '')}
+                          <IconActivity size={14} />
+                        </button>
+                        <button
+                          className="icon-btn"
+                          onClick={() => void remove(p)}
+                          disabled={profiles.length <= 1}
+                          title={profiles.length <= 1 ? '至少保留一个模型' : '删除该模型'}
+                        >
+                          <IconTrash size={14} />
+                        </button>
+                        <Switch
+                          checked={p.enabled !== false}
+                          onChange={(v) =>
+                            void updateSettings({
+                              agent: withProfileEnabled(useApp.getState().settings.agent, p.id, v)
+                            })
+                          }
                         />
-      
-                        <Section label="运行参数">
-                          <Row
-                            title="运行时"
-                            desc="全局设置，不随档案切换；未配置密钥时会自动回退到 mock，不会因缺配置而报错。"
-                            control={
-                              <select
-                                value={runtime}
-                                onChange={(e) => {
-                                  const next = e.target.value as 'react' | 'mock'
-                                  setRuntime(next)
-                                  void updateSettings({
-                                    agent: { ...useApp.getState().settings.agent, runtime: next }
-                                  })
-                                }}
-                              >
-                                <option value="react">真实运行时（自研 ReAct 循环）</option>
-                                <option value="mock">mock 运行时（离线回放）</option>
-                              </select>
-                            }
-                          />
-                          <Row
-                            title="最大轮次"
-                            desc="本档的轮次上限，用于防止代理在失败路径上无限重试。"
-                            control={
-                              <input
-                                type="number"
-                                min={1}
-                                max={50}
-                                value={rounds}
-                                onChange={(e) => {
-                                  setRounds(e.target.value)
-                                  const n = Number.parseInt(e.target.value, 10)
-                                  if (Number.isFinite(n)) {
-                                    patchCurrent({ maxRounds: Math.max(1, Math.min(50, n)) })
-                                  }
-                                }}
-                              />
-                            }
-                          />
-                          <Row
-                            title="温度"
-                            desc="本档的采样随机性，越低越稳定，建议 0 ~ 0.3。"
-                            control={
-                              <input
-                                type="number"
-                                step={0.1}
-                                min={0}
-                                max={2}
-                                value={temp}
-                                onChange={(e) => {
-                                  setTemp(e.target.value)
-                                  const n = Number(e.target.value)
-                                  if (Number.isFinite(n)) {
-                                    patchCurrent({ temperature: Math.max(0, Math.min(2, n)) })
-                                  }
-                                }}
-                              />
-                            }
-                          />
-                        </Section>
-      
-                        <Section label="自定义指令">
-                          <Row
-                            title="追加指令"
-                            desc="写完的这段文字会拼在基础系统提示词之后，作为常驻要求（技能内容会附在其后）。留空表示不加。"
-                            stacked
-                            control={
-                              <textarea
-                                value={systemPrompt}
-                                onChange={(e) => {
-                                  const val = e.target.value
-                                  setSystemPrompt(val)
-                                  void updateSettings({
-                                    agent: {
-                                      ...useApp.getState().settings.agent,
-                                      systemPrompt: val
-                                    }
-                                  })
-                                }}
-                                placeholder="例如：实验命名统一用 Lab-N 前缀；配置前先说明将要下发的命令。"
-                                rows={4}
-                              />
-                            }
-                          />
-                        </Section>
-      
-                        <Section label="请求韧性">
-                          <Row
-                            title="失败自动重试"
-                            desc="只重试临时性失败（限流 429、超时、5xx、连接中断）；密钥无效、模型名不存在、额度耗尽这类确定性错误会立刻失败 —— 重试它们只是让你多等几秒看到同一个错。"
-                            control={
-                              <Switch
-                                checked={retryDraft.enabled}
-                                onChange={(v) => {
-                                  const next = { ...retryDraft, enabled: v }
-                                  setRetryDraft(next)
-                                  void updateSettings({ retry: next })
-                                }}
-                              />
-                            }
-                          />
-                          <Row
-                            title="最大重试次数"
-                            desc="不含首次调用。等待按指数退避（基数 × 2 的 n-1 次方，上限 30 秒），并带 0~25% 随机抖动。"
-                            control={
-                              <input
-                                type="number"
-                                min={RETRY_BOUNDS.maxRetries.min}
-                                max={RETRY_BOUNDS.maxRetries.max}
-                                value={retryDraft.maxRetries}
-                                disabled={!retryDraft.enabled}
-                                onChange={(e) => {
-                                  const next = sanitizeRetry(
-                                    { ...retryDraft, maxRetries: e.target.value },
-                                    retryDraft
-                                  )
-                                  setRetryDraft(next)
-                                  void updateSettings({ retry: next })
-                                }}
-                              />
-                            }
-                          />
-                          <Row
-                            title="退避基数（毫秒）"
-                            desc="第一次重试的等待时长，之后翻倍。设得太小会在对端限流时反复撞墙。"
-                            control={
-                              <input
-                                type="number"
-                                step={100}
-                                min={RETRY_BOUNDS.baseDelayMs.min}
-                                max={RETRY_BOUNDS.baseDelayMs.max}
-                                value={retryDraft.baseDelayMs}
-                                disabled={!retryDraft.enabled}
-                                onChange={(e) => {
-                                  const next = sanitizeRetry(
-                                    { ...retryDraft, baseDelayMs: e.target.value },
-                                    retryDraft
-                                  )
-                                  setRetryDraft(next)
-                                  void updateSettings({ retry: next })
-                                }}
-                              />
-                            }
-                          />
-                        </Section>
-      
-                        <Section label="上下文压缩">
-                          <Row
-                            title="自动压缩历史"
-                            desc="代理干活时会累积大量命令回显（一条 display current-configuration 就可能几十万字符）。开启后超出预算的旧轮次会被压成摘要：只改内容、不删消息，任务目标与最近几轮保持原文，用户说的每一句话也原样保留。"
-                            control={
-                              <Switch
-                                checked={compactDraft.enabled}
-                                onChange={(v) => {
-                                  const next = { ...compactDraft, enabled: v }
-                                  setCompactDraft(next)
-                                  void updateSettings({ compaction: next })
-                                }}
-                              />
-                            }
-                          />
-                          <Row
-                            title="单条工具结果上限"
-                            desc="超出即保头 60% + 保尾 40%（结论通常在末尾），并附一句「如何拿全」。界面上的工具输出仍是完整的，这里只限制交给模型的那一份。"
-                            control={
-                              <input
-                                type="number"
-                                step={1000}
-                                min={COMPACTION_BOUNDS.toolResultMaxChars.min}
-                                max={COMPACTION_BOUNDS.toolResultMaxChars.max}
-                                value={compactDraft.toolResultMaxChars}
-                                disabled={!compactDraft.enabled}
-                                onChange={(e) => {
-                                  const next = sanitizeCompaction(
-                                    { ...compactDraft, toolResultMaxChars: e.target.value },
-                                    compactDraft
-                                  )
-                                  setCompactDraft(next)
-                                  void updateSettings({ compaction: next })
-                                }}
-                              />
-                            }
-                          />
-                          <Row
-                            title="上下文预算（字符）"
-                            desc="按字符估算而非 token —— 本地没有分词器，宁可估得保守。超出这个预算才开始压缩老轮次。"
-                            control={
-                              <input
-                                type="number"
-                                step={10000}
-                                min={COMPACTION_BOUNDS.transcriptMaxChars.min}
-                                max={COMPACTION_BOUNDS.transcriptMaxChars.max}
-                                value={compactDraft.transcriptMaxChars}
-                                disabled={!compactDraft.enabled}
-                                onChange={(e) => {
-                                  const next = sanitizeCompaction(
-                                    { ...compactDraft, transcriptMaxChars: e.target.value },
-                                    compactDraft
-                                  )
-                                  setCompactDraft(next)
-                                  void updateSettings({ compaction: next })
-                                }}
-                              />
-                            }
-                          />
-                          <Row
-                            title="保留最近轮数"
-                            desc="这几轮的原文不动，只压更早的轮次；第一轮（任务描述与附件清单）永远保留。"
-                            control={
-                              <input
-                                type="number"
-                                min={COMPACTION_BOUNDS.keepRounds.min}
-                                max={COMPACTION_BOUNDS.keepRounds.max}
-                                value={compactDraft.keepRounds}
-                                disabled={!compactDraft.enabled}
-                                onChange={(e) => {
-                                  const next = sanitizeCompaction(
-                                    { ...compactDraft, keepRounds: e.target.value },
-                                    compactDraft
-                                  )
-                                  setCompactDraft(next)
-                                  void updateSettings({ compaction: next })
-                                }}
-                              />
-                            }
-                          />
-                        </Section>
-                      </>
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <Section label="运行参数">
+        <Row
+          title="运行时"
+          desc="全局设置，不随模型切换；未配置密钥时会自动回退到 mock，不会因缺配置而报错。"
+          control={
+            <select
+              value={runtime}
+              onChange={(e) => {
+                const next = e.target.value as 'react' | 'mock'
+                setRuntime(next)
+                void writeAgent({ runtime: next })
+              }}
+            >
+              <option value="react">真实运行时（自研 ReAct 循环）</option>
+              <option value="mock">mock 运行时（离线回放）</option>
+            </select>
+          }
+        />
+      </Section>
+
+      <Section label="自定义指令">
+        <Row
+          title="追加指令"
+          desc="写完的这段文字会拼在基础系统提示词之后，作为常驻要求（技能内容会附在其后）。留空表示不加。"
+          stacked
+          control={
+            <textarea
+              value={systemPrompt}
+              onChange={(e) => {
+                const val = e.target.value
+                setSystemPrompt(val)
+                void writeAgent({ systemPrompt: val })
+              }}
+              placeholder="例如：实验命名统一用 Lab-N 前缀；配置前先说明将要下发的命令。"
+              rows={4}
+            />
+          }
+        />
+      </Section>
+
+      <Section label="请求韧性">
+        <Row
+          title="失败自动重试"
+          desc="只重试临时性失败（限流 429、超时、5xx、连接中断）；密钥无效、模型名不存在、额度耗尽这类确定性错误会立刻失败 —— 重试它们只是让你多等几秒看到同一个错。"
+          control={
+            <Switch
+              checked={retryDraft.enabled}
+              onChange={(v) => {
+                const next = { ...retryDraft, enabled: v }
+                setRetryDraft(next)
+                void updateSettings({ retry: next })
+              }}
+            />
+          }
+        />
+        <Row
+          title="最大重试次数"
+          desc="不含首次调用。等待按指数退避（基数 × 2 的 n-1 次方，上限 30 秒），并带 0~25% 随机抖动。"
+          control={
+            <input
+              type="number"
+              min={RETRY_BOUNDS.maxRetries.min}
+              max={RETRY_BOUNDS.maxRetries.max}
+              value={retryDraft.maxRetries}
+              disabled={!retryDraft.enabled}
+              onChange={(e) => {
+                const next = sanitizeRetry(
+                  { ...retryDraft, maxRetries: e.target.value },
+                  retryDraft
+                )
+                setRetryDraft(next)
+                void updateSettings({ retry: next })
+              }}
+            />
+          }
+        />
+        <Row
+          title="退避基数（毫秒）"
+          desc="第一次重试的等待时长，之后翻倍。设得太小会在对端限流时反复撞墙。"
+          control={
+            <input
+              type="number"
+              step={100}
+              min={RETRY_BOUNDS.baseDelayMs.min}
+              max={RETRY_BOUNDS.baseDelayMs.max}
+              value={retryDraft.baseDelayMs}
+              disabled={!retryDraft.enabled}
+              onChange={(e) => {
+                const next = sanitizeRetry(
+                  { ...retryDraft, baseDelayMs: e.target.value },
+                  retryDraft
+                )
+                setRetryDraft(next)
+                void updateSettings({ retry: next })
+              }}
+            />
+          }
+        />
+      </Section>
+
+      <Section label="上下文压缩">
+        <Row
+          title="自动压缩历史"
+          desc="代理干活时会累积大量命令回显（一条 display current-configuration 就可能几十万字符）。开启后超出预算的旧轮次会被压成摘要：只改内容、不删消息，任务目标与最近几轮保持原文，用户说的每一句话也原样保留。"
+          control={
+            <Switch
+              checked={compactDraft.enabled}
+              onChange={(v) => {
+                const next = { ...compactDraft, enabled: v }
+                setCompactDraft(next)
+                void updateSettings({ compaction: next })
+              }}
+            />
+          }
+        />
+        <Row
+          title="单条工具结果上限"
+          desc="超出即保头 60% + 保尾 40%（结论通常在末尾），并附一句「如何拿全」。界面上的工具输出仍是完整的，这里只限制交给模型的那一份。"
+          control={
+            <input
+              type="number"
+              step={1000}
+              min={COMPACTION_BOUNDS.toolResultMaxChars.min}
+              max={COMPACTION_BOUNDS.toolResultMaxChars.max}
+              value={compactDraft.toolResultMaxChars}
+              disabled={!compactDraft.enabled}
+              onChange={(e) => {
+                const next = sanitizeCompaction(
+                  { ...compactDraft, toolResultMaxChars: e.target.value },
+                  compactDraft
+                )
+                setCompactDraft(next)
+                void updateSettings({ compaction: next })
+              }}
+            />
+          }
+        />
+        <Row
+          title="上下文预算（字符）"
+          desc="整个对话的字符预算，超出即压缩老轮次。默认 80 万字符 ≈ 256k token，与默认模型窗口同量级；它和按窗口算的「触发水位」是双判据，谁先到谁触发 —— 换了窗口明显更大的模型（512k / 1M）时，这个值也要跟着调大，否则压缩仍会提前触发，大窗口就白开了。"
+          control={
+            <input
+              type="number"
+              step={10000}
+              min={COMPACTION_BOUNDS.transcriptMaxChars.min}
+              max={COMPACTION_BOUNDS.transcriptMaxChars.max}
+              value={compactDraft.transcriptMaxChars}
+              disabled={!compactDraft.enabled}
+              onChange={(e) => {
+                const next = sanitizeCompaction(
+                  { ...compactDraft, transcriptMaxChars: e.target.value },
+                  compactDraft
+                )
+                setCompactDraft(next)
+                void updateSettings({ compaction: next })
+              }}
+            />
+          }
+        />
+        <Row
+          title="保留最近轮数"
+          desc="这几轮的原文不动，只压更早的轮次；第一轮（任务描述与附件清单）永远保留。"
+          control={
+            <input
+              type="number"
+              min={COMPACTION_BOUNDS.keepRounds.min}
+              max={COMPACTION_BOUNDS.keepRounds.max}
+              value={compactDraft.keepRounds}
+              disabled={!compactDraft.enabled}
+              onChange={(e) => {
+                const next = sanitizeCompaction(
+                  { ...compactDraft, keepRounds: e.target.value },
+                  compactDraft
+                )
+                setCompactDraft(next)
+                void updateSettings({ compaction: next })
+              }}
+            />
+          }
+        />
+        <Row
+          title="用模型生成摘要"
+          desc="把较早的几轮原文交给模型压成「结论摘要」再进上下文：设备名与 IP、掩码、VLAN、接口名、已下发的命令、验证结论、失败与未完成项都会原样保留，回显明细与中间推理则省略。多花一次模型请求。关掉则退回本地修剪 —— 老工具输出会被换成「请重新调用该工具」，不再可恢复，但不多花请求。"
+          control={
+            <Switch
+              checked={compactDraft.summarize}
+              onChange={(v) => {
+                const next = { ...compactDraft, summarize: v }
+                setCompactDraft(next)
+                void updateSettings({ compaction: next })
+              }}
+            />
+          }
+        />
+        <Row
+          title="触发水位（占模型窗口比例）"
+          desc="真实用量达到窗口的这个比例就压缩，默认 0.75。用量数字来自服务商返回的 usage（已补上缓存命中部分），不是字符估算。留出的余量要给本轮输出与本轮工具回显 —— 调到 0.9 以上基本等于等着溢出。"
+          control={
+            <input
+              type="number"
+              step={0.05}
+              min={COMPACTION_BOUNDS.pressureRatio.min}
+              max={COMPACTION_BOUNDS.pressureRatio.max}
+              value={compactDraft.pressureRatio}
+              disabled={!compactDraft.enabled}
+              onChange={(e) => {
+                const next = sanitizeCompaction(
+                  { ...compactDraft, pressureRatio: e.target.value },
+                  compactDraft
+                )
+                setCompactDraft(next)
+                void updateSettings({ compaction: next })
+              }}
+            />
+          }
+        />
+      </Section>
+
+      <Section label="并发执行（v2.5）">
+        <Row
+          title="同时进行的调用上限"
+          desc="批量巡检多台设备时，跨设备的只读命令可以同时下发，不用一台一台排队等回显。同设备仍然严格串行（VRP 一次只能跑一条命令），配置类写操作始终独占，且会把它前后的只读调用隔开 —— 保证「改完再看」读到的是改后的状态。填 1 = 完全串行。"
+          control={
+            <input
+              type="number"
+              min={CONCURRENCY_BOUNDS.maxParallel.min}
+              max={CONCURRENCY_BOUNDS.maxParallel.max}
+              value={concurrencyDraft.maxParallel}
+              onChange={(e) => {
+                // 与其他数值设置同一口径：改的同时落盘（底栏写明「其余配置改动即时生效」）
+                const next = sanitizeConcurrency(
+                  { ...concurrencyDraft, maxParallel: e.target.value },
+                  concurrencyDraft
+                )
+                setConcurrencyDraft(next)
+                void updateSettings({ concurrency: next })
+              }}
+            />
+          }
+        />
+      </Section>
+
+      <Section label="重复调用防护（v2.14）">
+        <Row
+          title="重复调用提醒"
+          desc="代理偶尔会卡在同一个动作上：用完全相同的参数反复调同一条命令，每次都得到同样的结果却继续重发，直到把轮次预算烧光。开启后，同一工具 + 同一参数连续出现第 3、5、8 次时，会在对话末尾追加一条系统提醒，让它换参数、换命令或直接给结论。只提醒、不改任何工具结果，也不改系统提示词（后者会让服务端缓存整段失效）。参数按「值」比较，键序不同视为同一次调用；你插一句话就重新计数。"
+          control={
+            <Switch
+              checked={repeatGuardDraft.enabled}
+              onChange={(v) => {
+                const next = sanitizeRepeatGuard({ ...repeatGuardDraft, enabled: v }, repeatGuardDraft)
+                setRepeatGuardDraft(next)
+                void updateSettings({ repeatGuard: next })
+              }}
+            />
+          }
+        />
+      </Section>
+
+      <Section label="会话标题（v2.8）">
+        <Row
+          title="用模型给会话起名"
+          desc="一轮任务成功收尾后，让模型用一两句话概括这次做了什么，作为会话标题（如「给 3 台接入交换机配 VLAN 10」），比「新建会话 1 / 2 / 3」好找。每轮只多花一次很小的模型请求（只在还没起过名时发）。首轮没起成（任务失败/被中止）时，之后成功收尾的轮次会自动补起。你手动改过的标题不会被覆盖。"
+          control={
+            <Switch
+              checked={titleDraft.enabled}
+              disabled={!canGenerateTitle(activeProfile(agent))}
+              onChange={(v) => {
+                const next = sanitizeTitleSettings({ ...titleDraft, enabled: v }, titleDraft)
+                setTitleDraft(next)
+                void updateSettings({ title: next })
+              }}
+            />
+          }
+        />
+        <Row
+          title="标题目标字数"
+          desc="只是给模型的建议长度，不是硬截断；模型写超了会在 30 字硬上限处裁掉。默认 16 字，中文标题这个长度在侧栏列表里正好一行读完。"
+          control={
+            <input
+              type="number"
+              min={TITLE_BOUNDS.targetChars.min}
+              max={TITLE_BOUNDS.targetChars.max}
+              value={titleDraft.targetChars}
+              disabled={!titleDraft.enabled}
+              onChange={(e) => {
+                const next = sanitizeTitleSettings(
+                  { ...titleDraft, targetChars: e.target.value },
+                  titleDraft
+                )
+                setTitleDraft(next)
+                void updateSettings({ title: next })
+              }}
+            />
+          }
+        />
+        <Row
+          title="生成超时（毫秒）"
+          desc="起名请求的等待上限，默认 15000。超时不会影响你的任务 —— 请求被丢弃，标题退回「首条消息截断」的兜底值，任务照常收尾。"
+          control={
+            <input
+              type="number"
+              step={1000}
+              min={TITLE_BOUNDS.timeoutMs.min}
+              max={TITLE_BOUNDS.timeoutMs.max}
+              value={titleDraft.timeoutMs}
+              disabled={!titleDraft.enabled}
+              onChange={(e) => {
+                const next = sanitizeTitleSettings(
+                  { ...titleDraft, timeoutMs: e.target.value },
+                  titleDraft
+                )
+                setTitleDraft(next)
+                void updateSettings({ title: next })
+              }}
+            />
+          }
+        />
+      </Section>
+
+      {editor ? (
+        <ModelEditorDialog
+          profile={editor.profile}
+          isNew={editor.isNew}
+          hasKey={configuredProfileIds.includes(editor.profile.id)}
+          onClose={() => setEditor(null)}
+          onSave={saveProfile}
+        />
+      ) : null}
+    </>
   )
 }

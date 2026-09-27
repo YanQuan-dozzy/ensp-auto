@@ -27,10 +27,20 @@ import {
   sanitizeProfile,
   sanitizeProfiles,
   normalizeAgentSettings,
+  upgradeAgentDefaults,
   activeProfile,
   activeProfileOf,
   withActiveProfile,
   removeProfile,
+  enabledProfiles,
+  withProfileEnabled,
+  newProfileDraft,
+  probeModelEndpoint,
+  // v2.3：逐模型思考能力
+  modelCapability,
+  normalizeThinkingFields,
+  availableEfforts,
+  thinkingLevelMap,
   // attachments（纯函数）
   MAX_ATTACHMENT_BYTES,
   MAX_INLINE_CHARS,
@@ -102,11 +112,208 @@ test('sanitizeProfile：provider 白名单、模型名必填、数值收敛、la
     temperature: -5,
     baseUrl: '  https://api.deepseek.com  '
   })
-  assert.equal(p.maxRounds, 50)
+  assert.equal(p.maxRounds, 400)
   assert.equal(p.temperature, 0)
   assert.equal(p.baseUrl, 'https://api.deepseek.com')
   assert.equal(p.label, labelFor('deepseek', 'deepseek-flash'))
   assert.match(p.label, /deepseek-flash/)
+})
+
+// —— v2.3：模型管理页新增的逐档字段 ——
+
+test('sanitizeProfile：上下文窗口 / 输出上限 / 思考模式 / 采样参数逐档收敛，老配置默认可用', () => {
+  // 老配置里没有这些字段：必须补齐成「能直接用」的值，否则升级后模型全变不可用
+  const legacy = sanitizeProfile({ provider: 'deepseek', model: 'deepseek-flash' })
+  assert.equal(legacy.contextWindow, 256000)
+  assert.equal(legacy.maxOutputTokens, 16000)
+  assert.equal(legacy.thinking, 'auto')
+  assert.equal(legacy.enabled, true)
+  assert.equal(legacy.supportsImage, false)
+  assert.equal(legacy.topP, null)
+  assert.equal(legacy.topK, null)
+
+  const p = sanitizeProfile({
+    provider: 'qwen',
+    model: 'qwen3.7-max',
+    contextWindow: 99999999,
+    maxOutputTokens: 1,
+    thinking: '瞎写的值',
+    topP: 5,
+    topK: 3.7,
+    supportsImage: 'yes',
+    enabled: false
+  })
+  assert.equal(p.contextWindow, 2000000)
+  assert.equal(p.maxOutputTokens, 256)
+  assert.equal(p.thinking, 'auto', '不认识的值必须回落 auto，不能原样透传')
+  assert.equal(p.topP, 1)
+  assert.equal(p.topK, 3, 'Top K 必须取整')
+  assert.equal(p.supportsImage, false, '非布尔真值不当成 true')
+  assert.equal(p.enabled, false)
+})
+
+test('sanitizeProfile：Top P / K 留空用 null 表达（与 0 区分）', () => {
+  const blank = sanitizeProfile({ provider: 'deepseek', model: 'x', topP: '', topK: null })
+  assert.equal(blank.topP, null)
+  assert.equal(blank.topK, null)
+  // topP = 0 是合法采样值，不能被当成「留空」
+  assert.equal(sanitizeProfile({ provider: 'deepseek', model: 'x', topP: 0 }).topP, 0)
+})
+
+test('enabledProfiles：只列启用的档案；全停用时兜底返回全部（切换器不能变空）', () => {
+  const agent = {
+    runtime: 'react',
+    profiles: [
+      { ...newProfileDraft('deepseek'), id: 'p-on', enabled: true },
+      { ...newProfileDraft('qwen'), id: 'p-off', enabled: false }
+    ],
+    activeProfileId: 'p-on',
+    systemPrompt: ''
+  }
+  assert.deepEqual(
+    enabledProfiles(agent).map((p) => p.id),
+    ['p-on']
+  )
+  const allOff = { ...agent, profiles: agent.profiles.map((p) => ({ ...p, enabled: false })) }
+  assert.equal(enabledProfiles(allOff).length, 2)
+})
+
+test('withProfileEnabled：停用活跃档时活跃档必须顺移到仍启用的那一档', () => {
+  const agent = {
+    runtime: 'react',
+    profiles: [
+      { ...newProfileDraft('deepseek'), id: 'p-a', enabled: true },
+      { ...newProfileDraft('qwen'), id: 'p-b', enabled: true }
+    ],
+    activeProfileId: 'p-a',
+    systemPrompt: ''
+  }
+  const next = withProfileEnabled(agent, 'p-a', false)
+  assert.equal(next.profiles[0].enabled, false)
+  assert.equal(next.activeProfileId, 'p-b', '留着「活跃但停用」的档案会让代理继续用它')
+  // 停用非活跃档不动活跃 id；重新启用也不动
+  assert.equal(withProfileEnabled(agent, 'p-b', false).activeProfileId, 'p-a')
+  assert.equal(withProfileEnabled(agent, 'p-b', true).activeProfileId, 'p-a')
+})
+
+test('probeModelEndpoint：未配密钥 → skipped；端点缺失 → fail，且不发起任何请求', async () => {
+  let called = 0
+  const fetchImpl = async () => {
+    called++
+    throw new Error('不该走到这里')
+  }
+  const skipped = await probeModelEndpoint({
+    profile: { ...newProfileDraft('deepseek'), id: 'p-x' },
+    apiKey: null,
+    fetchImpl
+  })
+  assert.equal(skipped.level, 'skipped')
+  assert.equal(skipped.ms, undefined)
+
+  const bad = await probeModelEndpoint({
+    profile: { ...newProfileDraft('custom'), id: 'p-y', baseUrl: '', model: 'm' },
+    apiKey: 'sk-test',
+    fetchImpl
+  })
+  assert.equal(bad.level, 'fail')
+  assert.match(bad.detail, /端点/)
+  assert.equal(called, 0, '前置校验不通过时不该发请求')
+})
+
+test('probeModelEndpoint：与体检同一套口径 —— 结论文案包含模型名与耗时', async () => {
+  const fetchImpl = async () => ({ status: 200, text: async () => '{}' })
+  const r = await probeModelEndpoint({
+    profile: { ...newProfileDraft('deepseek'), id: 'p-z', model: 'deepseek-flash' },
+    apiKey: 'sk-test',
+    fetchImpl
+  })
+  assert.equal(r.level, 'ok')
+  assert.match(r.detail, /deepseek-flash/)
+  assert.ok(typeof r.ms === 'number')
+})
+
+// —— v2.3：逐模型思考能力（各家官方文档 2026-09 核对） ——
+
+test('能力表：DeepSeek 是 low/high/max 三档且可关（官方文档口径）', () => {
+  const cap = modelCapability('deepseek', 'deepseek-v4-pro')
+  assert.equal(cap.thinking, 'toggle')
+  assert.deepEqual([...cap.efforts], ['low', 'high', 'max'])
+  assert.equal(cap.defaultEffort, 'high')
+  assert.deepEqual([...availableEfforts(cap)], ['low', 'high', 'max'])
+})
+
+test('能力表：强制思考的模型不允许关闭（GLM-5.3 / Kimi K3）', () => {
+  for (const [provider, model] of [
+    ['zhipu', 'glm-5.3'],
+    ['kimi', 'kimi-k3'],
+    ['minimax', 'MiniMax-M2.7']
+  ]) {
+    const cap = modelCapability(provider, model)
+    assert.equal(cap.thinking, 'always', `${model} 应当不能关闭思考`)
+    assert.equal(thinkingLevelMap(cap).off, null, `${model} 的 off 必须映射成 null`)
+  }
+  // GLM-5.3 只认 max/high/low（传 medium 会报错）
+  assert.deepEqual([...modelCapability('zhipu', 'glm-5.3').efforts], ['low', 'high', 'max'])
+  assert.equal(thinkingLevelMap(modelCapability('zhipu', 'glm-5.3')).medium, null)
+})
+
+test('能力表：只有开关、没有强度参数的模型（GLM-5.1 / qwen3.7 / Kimi K2.6）', () => {
+  for (const [provider, model] of [
+    ['zhipu', 'glm-5.1'],
+    ['qwen', 'qwen3.7-max'],
+    ['kimi', 'kimi-k2.6']
+  ]) {
+    const cap = modelCapability(provider, model)
+    assert.equal(cap.thinking, 'toggle', `${model} 应当可开关`)
+    assert.deepEqual([...cap.efforts], [], `${model} 没有强度档位`)
+    // 没有档位时仍要给运行时一个中性档，否则「开启思考」表达不出来
+    assert.deepEqual([...availableEfforts(cap)], ['high'])
+  }
+})
+
+test('能力表：不接受采样参数的新模型（Kimi K3 / Claude Sonnet 5）', () => {
+  assert.equal(modelCapability('kimi', 'kimi-k3').sampling, false)
+  assert.equal(modelCapability('anthropic', 'claude-sonnet-5').sampling, false)
+  assert.equal(modelCapability('deepseek', 'deepseek-flash').sampling, true)
+})
+
+test('能力表：未核实的服务商不干预思考（自定义端点）', () => {
+  const cap = modelCapability('custom', 'my-local-model')
+  assert.equal(cap.thinking, 'none')
+  assert.deepEqual([...availableEfforts(cap)], ['high'])
+})
+
+test('normalizeThinkingFields：把用户选的值收敛到该模型真正支持的范围', () => {
+  // 强制思考的模型：off 必须被收敛成 on（传关闭会 400）
+  assert.deepEqual(
+    normalizeThinkingFields({
+      provider: 'zhipu',
+      model: 'glm-5.3',
+      thinking: 'off',
+      reasoningEffort: 'medium'
+    }),
+    { thinking: 'on', reasoningEffort: 'max' }
+  )
+  // 可关的模型：off 保留；不支持的档位落到默认档
+  assert.deepEqual(
+    normalizeThinkingFields({
+      provider: 'deepseek',
+      model: 'deepseek-flash',
+      thinking: 'off',
+      reasoningEffort: 'medium'
+    }),
+    { thinking: 'off', reasoningEffort: 'high' }
+  )
+  // 不支持思考参数的服务商：一律回落 auto（不下发）
+  assert.deepEqual(
+    normalizeThinkingFields({
+      provider: 'custom',
+      model: 'x',
+      thinking: 'on',
+      reasoningEffort: 'max'
+    }),
+    { thinking: 'auto', reasoningEffort: 'high' }
+  )
 })
 
 test('sanitizeProfiles：丢弃非法项、重复 id 重新发号', () => {
@@ -158,6 +365,86 @@ test('normalizeAgentSettings：完全缺失时给预置档且不共享 DEFAULT �
   assert.equal(a.activeProfileId, a.profiles[0].id)
   a.profiles[0].model = '被改坏'
   assert.notEqual(DEFAULT_SETTINGS.agent.profiles[0].model, '被改坏')
+})
+
+test('v2.9 upgradeAgentDefaults：只抬被旧 UI 卡住的轮数（12 / 50），自定窗口与自定值不动', () => {
+  const profiles = [
+    // 出厂预置档 + 旧默认值 → 轮数 12→200、窗口 200k→256k
+    { id: 'p-preset', provider: 'zhipu', model: 'glm-5.3', maxRounds: 12, contextWindow: 200000 },
+    // 顶到旧上限 50（想调更大但调不动）：必须一起抬
+    { id: 'p-capped', provider: 'deepseek', model: 'deepseek-flash', maxRounds: 50, contextWindow: 512000 },
+    // 用户自己敲的值：一个都不许动
+    { id: 'p-tuned', provider: 'qwen', model: 'qwen3.7-max', maxRounds: 30, contextWindow: 131072 },
+    // 本地小模型：窗口恰好是 128000，但不是出厂预置档，必须保留（无差别抬高会直接溢出）
+    { id: 'p-local', provider: 'custom', model: 'qwen2.5:7b', maxRounds: 8, contextWindow: 128000 }
+  ].map((p) => sanitizeProfile(p))
+  const a = upgradeAgentDefaults({
+    runtime: 'react',
+    profiles,
+    activeProfileId: 'p-preset',
+    systemPrompt: ''
+  })
+  const byId = (id) => a.profiles.find((p) => p.id === id)
+  assert.equal(byId('p-preset').maxRounds, 200)
+  assert.equal(byId('p-preset').contextWindow, 256000)
+  assert.equal(byId('p-capped').maxRounds, 200, '顶到旧上限 50 的就是「被卡住的」，不能漏')
+  assert.equal(byId('p-capped').contextWindow, 512000, '用户自己调大的窗口不许回退')
+  assert.equal(byId('p-tuned').maxRounds, 30, '显式填的轮数不能被迁移改掉')
+  assert.equal(byId('p-tuned').contextWindow, 131072)
+  assert.equal(byId('p-local').maxRounds, 8, '同上：8 是用户敲的，不是旧默认值')
+  assert.equal(byId('p-local').contextWindow, 128000, '自定义模型的窗口不动')
+
+  // 幂等且引用稳定：没得改时必须返回原对象（zustand selector 依赖这个）
+  assert.equal(upgradeAgentDefaults(a), a)
+})
+
+test('v2.9 迁移只在落盘版本落后时跑一次：之后用户主动填回的旧默认值不会被改回去', () => {
+  const dir = tmpRoot()
+  const file = path.join(dir, 'ensp-auto.json')
+  // 老文件：version 1 + 出厂默认值（轮数 12、压缩 20 万字符 / 保留 4 轮）
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      version: 1,
+      settings: {
+        agent: {
+          runtime: 'react',
+          profiles: [
+            { id: 'p-old', provider: 'deepseek', model: 'deepseek-flash', maxRounds: 12, contextWindow: 128000 }
+          ],
+          activeProfileId: 'p-old',
+          systemPrompt: ''
+        },
+        compaction: { enabled: true, toolResultMaxChars: 12000, transcriptMaxChars: 200000, keepRounds: 4, pressureRatio: 0.75, summarize: true }
+      },
+      aliases: {},
+      recentPorts: []
+    }),
+    'utf8'
+  )
+
+  const s1 = new JsonStore(file).getSettings()
+  assert.equal(s1.agent.profiles[0].maxRounds, 200, '旧默认轮数要被抬')
+  assert.equal(s1.agent.profiles[0].contextWindow, 256000, '预置档旧窗口要被抬')
+  assert.equal(s1.compaction.transcriptMaxChars, 800000)
+  assert.equal(s1.compaction.keepRounds, 8)
+  // 迁移后立刻回写版本号，否则重启会重跑
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).version, 2)
+
+  // 用户主动把两个值改回旧默认：这是显式选择，不许再被迁移盖掉
+  const store = new JsonStore(file)
+  const s2 = store.updateSettings({
+    ...s1,
+    agent: { ...s1.agent, profiles: [{ ...s1.agent.profiles[0], maxRounds: 50 }] },
+    compaction: { ...s1.compaction, transcriptMaxChars: 200000, keepRounds: 4 }
+  })
+  assert.equal(s2.agent.profiles[0].maxRounds, 50)
+  assert.equal(s2.compaction.transcriptMaxChars, 200000)
+
+  const reopened = new JsonStore(file).getSettings()
+  assert.equal(reopened.agent.profiles[0].maxRounds, 50, '重启后仍是用户填的值')
+  assert.equal(reopened.compaction.transcriptMaxChars, 200000)
+  assert.equal(reopened.compaction.keepRounds, 4)
 })
 
 test('activeProfile / withActiveProfile / removeProfile', () => {
@@ -246,8 +533,20 @@ test('buildAttachmentBlock：文本内联 + 图片/二进制给出提示 + 超�
   // 单文件预算有 200 字符的下限保护，200 以内不截，201 一定截
   assert.ok(!long.includes('x'.repeat(201)))
 
+  // v2.22（F17）：图片那一行按「模型能不能看图」分流；不传能力上下文时退回旧口径
   const img = buildAttachmentBlock([{ ...base, name: 'a.png', kind: 'image' }])
-  assert.match(img, /无法直接读取像素/)
+  assert.match(img, /当前模型无法读取像素/)
+  assert.match(
+    buildAttachmentBlock([{ ...base, name: 'a.png', kind: 'image' }], {
+      images: { modelCanSee: true }
+    }),
+    /已随本条消息\*\*直接附给你\*\*/
+  )
+  const blocked = buildAttachmentBlock([{ ...base, id: 'a-1', name: 'a.png', kind: 'image' }], {
+    images: { modelCanSee: false, blocked: new Map([['a-1', '当前模型未声明图片输入能力']]) }
+  })
+  assert.match(blocked, /\*\*没有\*\*附给你/)
+  assert.match(blocked, /未声明图片输入能力/)
 
   const bin = buildAttachmentBlock([{ ...base, name: 'a.zip', kind: 'binary' }])
   assert.match(bin, /二进制/)
@@ -439,6 +738,74 @@ test('read_attachment 工具：越界路径返回失败结果而不是抛异常'
   assert.equal(readAttachment.risk, 'read')
   assert.equal(readAttachment.scope, 'local')
   assert.ok(TOOLS.some((t) => t.name === 'read_attachment'))
+})
+
+/**
+ * v2.2（2026-09-25 实测）：代理 export_session_report 拿到导出的报告路径后读不回来，
+ * 只能绕路去连拓扑文件（把 activeTopology 覆盖了）。根因是唯一的文本读取工具
+ * read_attachment 只认附件归档。修法是把可读根放宽到「应用受管目录」（附件 + 导出），
+ * 同时**不**放宽 import/describe 这些附件专属语义。
+ */
+test('read_attachment 工具：可读导出目录内的文件；附件专属语义不随之放宽', async () => {
+  const store = new AttachmentStore(path.join(tmpRoot(), 'att4'))
+  const base = tmpRoot()
+  const exportsDir = path.join(base, 'exports')
+  fs.mkdirSync(exportsDir, { recursive: true })
+  const report = writeTmp(exportsDir, 'report.md', '# 报告\n\n第一行\n第二行')
+
+  const res = await readAttachment.handler(
+    { path: report, offset: 0, limit: 3 },
+    { attachments: store, exportsDir }
+  )
+  assert.equal(res.ok, true)
+  assert.equal(res.data.totalLines, 4)
+  assert.equal(res.data.from, 0)
+  assert.equal(res.data.to, 3)
+  assert.equal(res.data.hasMore, true)
+  // v2.13：续读元数据（to 是左闭右开区间的右端，nextOffset 就是它）
+  assert.equal(res.data.nextOffset, 3)
+  assert.equal(res.data.atEnd, false)
+  assert.equal(res.data.truncatedByBytes, false)
+  assert.equal(res.data.text, '# 报告\n\n第一行')
+
+  // 归档侧口径不变：导出目录里的文件不算附件，import/describe 依旧拒绝
+  assert.equal(store.resolve(report), null)
+  assert.equal(store.describe(report), null)
+  assert.equal(store.resolveReadable(report), null)
+  assert.equal(store.resolveReadable(report, [exportsDir]), report)
+
+  // 两根是并集而不是替换：给了导出目录后，归档里的附件照常读
+  const src = tmpRoot()
+  const { attachments } = await store.import('main', [writeTmp(src, 'conf.txt', 'sysname SW1\n')])
+  const archived = await readAttachment.handler(
+    { path: attachments[0].path },
+    { attachments: store, exportsDir }
+  )
+  assert.equal(archived.ok, true)
+  assert.match(archived.data.text, /sysname SW1/)
+
+  // 没有导出目录时仍拒绝，且文案要说清「能读哪儿」（模型据此停止重试）
+  const denied = await readAttachment.handler({ path: report }, { attachments: store })
+  assert.equal(denied.ok, false)
+  assert.equal(denied.error.code, 'BAD_PARAM')
+  assert.match(denied.error.message, /只能读附件归档目录里的文件/)
+  // 给了导出目录之后，文案把第二个可读根也带上（不存在 / 写错的路径同样受益）
+  const withExports = await readAttachment.handler(
+    { path: path.join(base, 'nope.md') },
+    { attachments: store, exportsDir }
+  )
+  assert.equal(withExports.ok, false)
+  assert.match(withExports.error.message, /只能读附件归档目录与导出目录里的文件/)
+
+  // 越界（`..` 回到上一级）仍被拒：相对路径校验发生在存在性检查之前
+  const escaped = path.join(base, 'escaped.txt')
+  fs.writeFileSync(escaped, 'nope')
+  const out = await readAttachment.handler(
+    { path: escaped },
+    { attachments: store, exportsDir }
+  )
+  assert.equal(out.ok, false)
+  assert.equal(out.error.code, 'BAD_PARAM')
 })
 
 // ————————————————————— 设置迁移与原子写 —————————————————————

@@ -2,6 +2,7 @@ import type { CommandResult, Device, DeviceId, Encoding, ViewKind } from '@share
 import { deviceIdForSsh, parseDeviceId, type DeviceTarget, type Transport } from '@shared/transport'
 import { type ByteChannel } from '../transport/ByteChannel'
 import { TelnetClient, type ConnectResult, type TelnetClientOptions } from '../telnet/TelnetClient'
+import { TerminalBuffer, type TerminalBufferSegment } from './TerminalBuffer'
 
 /**
  * 单个设备的会话。
@@ -10,12 +11,14 @@ import { TelnetClient, type ConnectResult, type TelnetClientOptions } from '../t
  * - 持有 TelnetClient（通信）
  * - 维护设备元数据（别名、型号、当前视图、编码）
  * - 把原始字节流广播给渲染层，并标注该段输出是否由代理触发
+ * - 留一份最近输出的回放缓冲（TerminalBuffer），供终端切回/重挂载时恢复
  *
  * 并发的唯一收敛点在 TelnetClient 的队列里 —— 本类不引入第二条写入路径。
  */
 
 export interface SessionDeps {
-  onRaw: (deviceId: DeviceId, chunk: Uint8Array, fromAgent: boolean) => void
+  /** seq 为该段在设备回放缓冲中的序号，渲染层用它跟快照水位对齐去重 */
+  onRaw: (deviceId: DeviceId, chunk: Uint8Array, fromAgent: boolean, seq: number) => void
   onClosed: (deviceId: DeviceId, reason: string) => void
   onStateChanged: (device: Device) => void
 }
@@ -63,6 +66,8 @@ export class DeviceSession {
 
   private client: TelnetClient
   private closed = false
+  /** 最近输出的回放缓冲：终端切走再切回、或 xterm 重建时用来恢复画面 */
+  private readonly terminal = new TerminalBuffer()
   /** >0 表示当前正在执行代理下发的命令，用于给原始流打标记 */
   private agentDepth = 0
   private unsubscribeRaw: () => void
@@ -84,7 +89,10 @@ export class DeviceSession {
 
     this.unsubscribeRaw = client.onRawData((chunk) => {
       this.lastSeenAt = Date.now()
-      deps.onRaw(this.id, chunk, this.agentDepth > 0)
+      const fromAgent = this.agentDepth > 0
+      // 先落回放缓冲再广播：渲染层拿到 seq 后可以和 buffer 快照对齐去重
+      const seq = this.terminal.append(chunk, fromAgent)
+      deps.onRaw(this.id, chunk, fromAgent, seq)
     })
     this.unsubscribeClose = client.onClose((reason) => {
       this.closed = true
@@ -177,6 +185,16 @@ export class DeviceSession {
     // v1.8：删除无意义的自赋值（`this.view = this.view`）—— 交互态下 view 由客户端
     // 内部状态机维护，exec 的 view 快照只对命令通道有意义
     return this.client.writeInteractive(data)
+  }
+
+  /** 终端回放快照（渲染层挂载 xterm 时拉取一次） */
+  terminalBuffer(): TerminalBufferSegment[] {
+    return this.terminal.snapshot()
+  }
+
+  /** 清空终端回放缓冲（用户执行「清空当前终端」） */
+  clearTerminalBuffer(): void {
+    this.terminal.clear()
   }
 
   /** 探测并缓存型号 / VRP 版本。失败不致命，只是拿不到默认别名建议 */

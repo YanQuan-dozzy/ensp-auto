@@ -6,6 +6,7 @@ import { Row, Section } from '@/components/settings-kit'
 import {
   Switch,
   Chip,
+  DismissibleBanner,
   Dot,
   IconClose,
   IconPlug,
@@ -54,6 +55,7 @@ export function McpDialog({ onClose }: { onClose: () => void }): ReactNode {
   const updateSettings = useApp((s) => s.updateSettings)
   const sync = useApp((s) => s.syncMcpServers)
   const test = useApp((s) => s.testMcpServer)
+  const clearServerError = useApp((s) => s.clearMcpServerError)
 
   const [draft, setDraft] = useState<McpServerConfig>(blankDraft)
   const [editingId, setEditingId] = useState<string | null>(null)
@@ -196,7 +198,11 @@ export function McpDialog({ onClose }: { onClose: () => void }): ReactNode {
             </button>
           </div>
 
-          {notice ? <div className="banner info">{notice}</div> : null}
+          {notice ? (
+            <DismissibleBanner tone="info" onDismiss={() => setNotice('')}>
+              {notice}
+            </DismissibleBanner>
+          ) : null}
           {importNotes.length > 0 ? (
             <details className="mcp-import-report">
               <summary>上次导入的说明（{importNotes.length} 条）</summary>
@@ -311,7 +317,14 @@ export function McpDialog({ onClose }: { onClose: () => void }): ReactNode {
                           </>
                         }
                       />
-                      {st?.error ? <div className="banner danger">{st.error}</div> : null}
+                      {st?.error ? (
+                        <DismissibleBanner
+                          tone="danger"
+                          onDismiss={() => clearServerError(cfg.id)}
+                        >
+                          {st.error}
+                        </DismissibleBanner>
+                      ) : null}
                       {st && st.connected && st.tools.length > 0 ? (
                         <div className="mcp-tools">
                           {st.tools.map((t) => (

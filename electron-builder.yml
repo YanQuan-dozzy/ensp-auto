@@ -1,0 +1,55 @@
+# electron-builder 打包配置（eNSP AI 工作台 → Windows exe）
+appId: cn.enspauto.workbench
+productName: ensp-auto
+copyright: Copyright © 2026 ensp-auto team
+
+directories:
+  output: dist
+  buildResources: build
+
+# 只打包运行时需要的文件；production 依赖的 node_modules 由 electron-builder 自动带入，
+# 保证 main bundle 中 external 的 @modelcontextprotocol/sdk、zod、ssh2 在 asar 内可达。
+# resources/src（图标设计源文件）与 _icon-preview.png 是生成 ico 的素材，运行时不需要，排除减包。
+files:
+  - out/**
+  - resources/**
+  - '!resources/src/**'
+  - '!resources/_icon-preview.png'
+  - package.json
+
+# 无原生模块需要编译（ssh2 的可选 cpu-features 未安装，运行时自动降级），
+# 关闭 npmRebuild 避免构建时触发 node-gyp 下载与编译。
+npmRebuild: false
+
+asar: true
+
+# 系统通知身份（AppUserModelId 的 IconUri）要求真实文件路径，ico 不能留在 asar 里，
+# 解包到 app.asar.unpacked/resources/ 供 src/main/index.ts#toastIconPath 读取。
+asarUnpack:
+  - resources/*.ico
+
+electronDownload:
+  mirror: https://npmmirror.com/mirrors/electron/
+
+win:
+  icon: build/icon.ico
+  target:
+    - target: nsis
+      arch:
+        - x64
+    - target: portable
+      arch:
+        - x64
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  perMachine: false
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  # 与运行时应用名（APP_NAME=eNSPAuto）一致，桌面/开始菜单不再显示旧名 ensp-auto
+  shortcutName: eNSPAuto
+  artifactName: ${productName}-${version}-${arch}-setup.${ext}
+
+portable:
+  artifactName: ${productName}-${version}-${arch}.${ext}

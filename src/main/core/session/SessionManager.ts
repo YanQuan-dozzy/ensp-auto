@@ -11,6 +11,7 @@ import { DEFAULT_HOST } from '../telnet/patterns'
 import { openChannel, type SshTarget } from '../transport'
 import type { JsonStore } from '../store/store'
 import { DeviceSession, deviceIdOf, type SessionDeps } from './DeviceSession'
+import type { TerminalBufferSegment } from './TerminalBuffer'
 
 export interface ScanProgress {
   scanned: number
@@ -338,6 +339,22 @@ export class SessionManager {
     const s = this.get(deviceId)
     if (!s) throw new Error(`设备未连接：${deviceId}`)
     return s
+  }
+
+  /**
+   * 终端回放快照。设备未连接（或已断开）返回空数组 ——
+   * 断开时 DeviceSession 就销毁了，缓冲随之消失，重连看不到上一次会话的画面（符合预期）。
+   */
+  terminalBuffer(deviceId: DeviceId): TerminalBufferSegment[] {
+    return this.get(deviceId)?.terminalBuffer() ?? []
+  }
+
+  /** 清空终端回放缓冲；返回 false 表示该设备当前没有活动会话 */
+  clearTerminal(deviceId: DeviceId): boolean {
+    const session = this.get(deviceId)
+    if (!session) return false
+    session.clearTerminalBuffer()
+    return true
   }
 
   closeAll(): void {

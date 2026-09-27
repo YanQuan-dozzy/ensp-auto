@@ -39,16 +39,21 @@ export async function createMcpServer(opts: McpServerOptions): Promise<McpServer
   const { deps, port } = opts
 
   /**
-   * 唯一的外露口径，两道闸口：
+   * 唯一的外露口径，三道闸口：
    * 1. danger 工具既不列出、也不允许调用（外部客户端权限 ≤ 应用内）；
    * 2. 外部 MCP 工具（`mcp__<server>__<tool>`）一律不外露 —— 正常装配下这里
    *    只会收到 builtinTools()，但这是一道与调用方解耦的防线：哪天有人把
-   *    agentTools 塞进来，也不会重新制造自环（D7，2026-09-23）。
+   *    agentTools 塞进来，也不会重新制造自环（D7，2026-09-23）；
+   * 3. v2.22（F17）`mcpExposed === false` 的工具不外露 —— 它的结果只有
+   *    「本进程内的模型」能消费（`read_image` 产出的图片），外部客户端那头的
+   *    模型能力无法判定，按「未知能力即拒绝」处理。
    *
    * ListTools 与 CallTool 必须共用这一份判断（R31）—— 分开写迟早会漂移，
    * 而漂移的后果是「列表里看不到、但照着名字仍然调得动」这种最坏组合。
    */
-  const exposedTools = deps.tools.filter((s) => s.risk !== 'danger' && !isExternalToolName(s.name))
+  const exposedTools = deps.tools.filter(
+    (s) => s.risk !== 'danger' && s.mcpExposed !== false && !isExternalToolName(s.name)
+  )
   const toolMap = new Map<string, ToolSpec>(exposedTools.map((t) => [t.name, t]))
 
   // 低层 Server：ListTools / CallTool 两个处理器直接吃 registry 的数据

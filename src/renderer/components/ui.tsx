@@ -301,6 +301,17 @@ export function IconStop({ size = 14, ...props }: IconProps): ReactNode {
   )
 }
 
+/** v2.11：中止 / 暂停（尾部「手动终止输出」状态行用） */
+export function IconPause({ size = 14, ...props }: IconProps): ReactNode {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...props}>
+      <circle cx="12" cy="12" r="9" />
+      <line x1="10" y1="9" x2="10" y2="15" />
+      <line x1="14" y1="9" x2="14" y2="15" />
+    </svg>
+  )
+}
+
 export function IconChevronDown({ size = 15, ...props }: IconProps): ReactNode {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...props}>
@@ -443,6 +454,47 @@ export function IconPaperclip({ size = 15, ...props }: IconProps): ReactNode {
   )
 }
 
+export function IconCopy({ size = 15, ...props }: IconProps): ReactNode {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...props}>
+      <rect x="9" y="9" width="12" height="12" rx="2" />
+      <path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1" />
+    </svg>
+  )
+}
+
+/** 引用（v2.11）：把这条消息引到输入框继续追问 */
+export function IconQuote({ size = 15, ...props }: IconProps): ReactNode {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...props}>
+      <path d="M10 8H6a2 2 0 0 0-2 2v3a2 2 0 0 0 2 2h2v1a3 3 0 0 1-3 3" />
+      <path d="M20 8h-4a2 2 0 0 0-2 2v3a2 2 0 0 0 2 2h2v1a3 3 0 0 1-3 3" />
+    </svg>
+  )
+}
+
+/** 引用 / 转发到输入框（对齐参考图 2）：向上弯曲箭头 */
+export function IconCornerUpRight({ size = 15, ...props }: IconProps): ReactNode {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...props}>
+      <polyline points="15 14 20 9 15 4" />
+      <path d="M4 20v-7a4 4 0 0 1 4-4h12" />
+    </svg>
+  )
+}
+
+/** 剪贴板（粘贴）：与 IconCopy 区分开 —— 一个是「拿走」，一个是「放进来」 */
+export function IconClipboard({ size = 15, ...props }: IconProps): ReactNode {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...props}>
+      <path d="M9 4H6.5A1.5 1.5 0 0 0 5 5.5v14A1.5 1.5 0 0 0 6.5 21h11a1.5 1.5 0 0 0 1.5-1.5v-14A1.5 1.5 0 0 0 17.5 4H15" />
+      <rect x="9" y="2.5" width="6" height="3.5" rx="1.2" />
+      <line x1="12" y1="11" x2="12" y2="16.5" />
+      <polyline points="9.8 14.3 12 16.5 14.2 14.3" />
+    </svg>
+  )
+}
+
 /* ————————————— 窗口控制按钮图标 ————————————— */
 
 export function IconWindowMin({ size = 12, ...props }: IconProps): ReactNode {
@@ -491,4 +543,5 @@ export function IconPin({ size = 15, ...props }: IconProps): ReactNode {
 
 /* ————————————— 自适应组件导出 ————————————— */
 export { AdaptiveContainer, useAdaptive, getAdaptiveTier, type AdaptiveTier, type AdaptiveContextValue } from './AdaptiveContainer'
+export { DismissibleBanner, useDismissOnOutside, type BannerTone } from './DismissibleBanner'
 export { AdaptiveToolbar, AdaptiveButton, AdaptiveInput, type AdaptiveButtonProps, type AdaptiveToolbarProps } from './AdaptiveToolbar'

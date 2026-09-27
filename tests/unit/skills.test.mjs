@@ -135,6 +135,42 @@ test('内置技能只预置一次：删除后重建 store 不会复活', (t) => 
   assert.equal(s2.list().length, BUILTIN_SKILLS.length - 1)
 })
 
+test('增量预置：老安装（seeded=true）会补上新版本新增的内置技能', (t) => {
+  const dir = tmpDir(t)
+  const s1 = new SkillStore({ dir })
+  const newest = BUILTIN_SKILLS[BUILTIN_SKILLS.length - 1]
+
+  // 模拟「老版本安装」：新技能的文件不存在，且 meta 里也没有它的预置记录，但 seeded 已是 true
+  fs.rmSync(path.join(dir, `${newest.id}.skill.md`), { force: true })
+  const metaFile = path.join(dir, 'meta.json')
+  const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'))
+  meta.builtin = meta.builtin.filter((id) => id !== newest.id)
+  meta.seeded = true
+  fs.writeFileSync(metaFile, JSON.stringify(meta), 'utf8')
+  assert.equal(s1.list().some((s) => s.id === newest.id), false, '前置条件：老安装里没有该技能')
+
+  const s2 = new SkillStore({ dir })
+  assert.equal(
+    s2.list().some((s) => s.id === newest.id),
+    true,
+    '新版本新增的内置技能必须在老安装上补上（否则「加了但看不到」）'
+  )
+  assert.equal(s2.list().length, BUILTIN_SKILLS.length)
+})
+
+test('增量预置不覆盖用户改过的正文', (t) => {
+  const dir = tmpDir(t)
+  const s1 = new SkillStore({ dir })
+  const target = s1.list()[0]
+  s1.save({ id: target.id, name: target.name, description: target.description, content: '# 我改过的正文' })
+
+  const s2 = new SkillStore({ dir })
+  assert.ok(
+    s2.get(target.id).content.includes('# 我改过的正文'),
+    '重建 store 不得用内置正文把用户改动覆盖回去'
+  )
+})
+
 test('save：新建技能自动生成 id 并规范化 frontmatter；同名去重', (t) => {
   const store = new SkillStore({ dir: tmpDir(t) })
   const a = store.save({ name: '我的技能', description: '描述', content: '# 正文' })

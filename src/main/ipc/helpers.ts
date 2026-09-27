@@ -73,8 +73,7 @@ export function importTopoPath(services: Services, filePath: string): TopoImport
   if (resolved.includes('..')) return null
   if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) return null
   const { topology, report } = readTopoFile(resolved)
-  services.topology.setFile(topology)
-  services.topology.setFileSource(resolved)
+  services.topology.setFile(topology, resolved)
   return { topology, report }
 }
 

@@ -5,7 +5,16 @@ import type { SessionNode, Settings, TopologyLink, TopologyNode } from '@shared/
 import type { ScanProgress } from '@shared/api'
 import { EVENT } from '@shared/channels'
 import type { AppState, SliceGet, SliceSet } from './appState'
-import { applyTheme, errorText, nodesToMessages, sortDevices, systemNote } from './storeUtil'
+import {
+  applyTheme,
+  errorText,
+  matchTreeNodes,
+  nearestUserAncestor,
+  nodesToMessages,
+  sortDevices,
+  stripAttachmentNote,
+  systemNote
+} from './storeUtil'
 
 export function dataActions(
   set: SliceSet,
@@ -17,9 +26,21 @@ export function dataActions(
   | 'loadSessions'
   | 'newSession'
   | 'continueFrom'
+  | 'openSession'
+  | 'deleteSession'
+  | 'renameSession'
+  | 'togglePinSession'
+  | 'openSessionFile'
+  | 'openSessionsDir'
+  | 'loadResumable'
+  | 'resumeSession'
+  | 'dismissResume'
+  | 'deleteMessage'
+  | 'regenerateMessage'
   | 'setTheme'
   | 'updateSettings'
   | 'setProfileKey'
+  | 'clearTopology'
   | 'refreshTopology'
   | 'saveManualTopology'
   | 'removeTopology'
@@ -34,6 +55,25 @@ export function dataActions(
   | 'importSkillDir'
   | 'importSkillPath'
 > {
+  /**
+   * 拉树 + 建「UI 消息 → 树节点」映射（v2.12）。失败/不可用返回 null，由调用方给提示。
+   *
+   * 为什么每次现拉而不是缓存：live 视图的消息 id 是渲染层自增的 `m<seq>`，
+   * 与树节点 id（`n-<uuid>`）是两套；映射只能靠「同一事件序列产出、角色计数一致」
+   * 来对齐，而树在任务推进中随时在变 —— 用时现拉 + 现对齐才不会拿到过期快照。
+   */
+  async function resolveTreeBinding(
+    get: SliceGet,
+    msgId: string
+  ): Promise<{ rootId: string; nodeId: string; nodes: SessionNode[] } | null> {
+    const rootId = get().activeRootId
+    if (!rootId) return null
+    const nodes = await window.api.session.get(rootId)
+    const map = matchTreeNodes(get().messages, nodes)
+    const nodeId = map.get(msgId)
+    return nodeId ? { rootId, nodeId, nodes } : null
+  }
+
   return {
     async init() {
       ensureSubscribed(set, get)
@@ -47,6 +87,8 @@ export function dataActions(
         await get().loadSessions()
         await get().loadSkills()
         await get().loadMcpServers()
+        // v2.8：查一次可续跑会话（启动提示「继续上次任务」）
+        await get().loadResumable()
         await get().refreshDevices()
       } catch (e) {
         // 启动失败不白屏：把错误亮给用户并提供重试
@@ -69,7 +111,16 @@ export function dataActions(
     },
 
     newSession() {
-      set({ activeRootId: null, activeStartNodeId: null, messages: [], queueCount: 0 })
+      // v2.7：新会话没有清单 —— 不清会显示上一个会话的进度
+      set({
+        activeRootId: null,
+        activeStartNodeId: null,
+        messages: [],
+        queueCount: 0,
+        agentTodos: [],
+        // v2.8：用户主动开新会话 = 不打算续跑，收起提示
+        resumable: null
+      })
     },
 
     async continueFrom(rootId: string, node: SessionNode) {
@@ -78,8 +129,181 @@ export function dataActions(
         activeRootId: rootId,
         activeStartNodeId: node.id,
         messages: nodesToMessages(nodes),
-        queueCount: 0
+        queueCount: 0,
+        agentTodos: await window.api.session.todos(rootId).catch(() => [])
       })
+    },
+
+    /** v2.2：进入旧会话 —— 载入完整消息流，后续发送追加到该会话尾部 */
+    async openSession(rootId: string) {
+      const nodes = await window.api.session.get(rootId)
+      set({
+        activeRootId: rootId,
+        activeStartNodeId: null,
+        messages: nodesToMessages(nodes),
+        queueCount: 0,
+        // v2.8：用户主动进了某个会话 = 已做出选择，收起续跑提示
+        resumable: null,
+        // v2.7：切会话时连同任务清单一起换 —— 不换会显示上一段对话的进度
+        agentTodos: await window.api.session.todos(rootId).catch(() => [])
+      })
+    },
+
+    // ————— v2.2：会话管理（历史列表右键菜单） —————
+
+    /** 删除会话：若删的是当前活跃会话，同步清空当前视图 */
+    async deleteSession(rootId: string) {
+      await window.api.session.delete(rootId)
+      if (get().activeRootId === rootId) {
+        set({
+          activeRootId: null,
+          activeStartNodeId: null,
+          messages: [],
+          queueCount: 0,
+          agentTodos: []
+        })
+      }
+    },
+
+    async renameSession(rootId: string, title: string) {
+      await window.api.session.rename(rootId, title)
+    },
+
+    async togglePinSession(rootId: string) {
+      const meta = get().sessions.find((s) => s.id === rootId)
+      if (!meta) return
+      await window.api.session.pin(rootId, !meta.pinned)
+    },
+
+    async openSessionFile(rootId: string) {
+      await window.api.session.openInExplorer(rootId)
+    },
+
+    async openSessionsDir() {
+      await window.api.session.openDir()
+    },
+
+    // ————— v2.8：断点续跑 —————
+
+    async loadResumable() {
+      try {
+        const list = await window.api.session.resumable()
+        set({ resumable: list })
+      } catch {
+        // 读失败按「没有可续跑的」处理：这只是启动提示，不该影响启动
+        set({ resumable: [] })
+      }
+    },
+
+    /**
+     * v2.8：继续上次未完成的任务。
+     *
+     * 关键点：**不重发新指令**，而是把该会话载入视图后由用户确认目标 ——
+     * 直接用祖先链当 history 起一轮 run，并把「继续」作为指令。
+     * 为什么不自动重发原指令：崩溃前那次可能已经把设备改到一半，
+     * 原指令再次执行会从「已经配过一半」的状态重头来一遍 —— 对 `undo` 不友好的
+     * 命令（如 acl 规则）会造成重复配置。让模型看到历史（含 v2.8 落盘的
+     * 工具摘要）后自己判断「哪些已经做完」，比机械重发安全得多。
+     */
+    async resumeSession(rootId: string) {
+      const nodes = await window.api.session.get(rootId)
+      set({
+        activeRootId: rootId,
+        activeStartNodeId: null,
+        messages: nodesToMessages(nodes),
+        queueCount: 0,
+        resumable: null,
+        agentTodos: await window.api.session.todos(rootId).catch(() => [])
+      })
+      await get().send(
+        '上次任务在本机中断了。请先阅读上面的历史轨迹（尤其是各次工具调用的结果摘要），' +
+          '判断哪些步骤已经完成、哪些还没做，然后接着把原目标做完；不要重复执行已经生效的配置。'
+      )
+    },
+
+    dismissResume() {
+      set({ resumable: null })
+    },
+
+    // ————— v2.12：消息删除 / 重新生成 —————
+
+    /** 删除一条消息：从对应节点起截断整条分支，然后把视图重载成树的现状 */
+    async deleteMessage(msgId: string) {
+      if (get().agentRunning) {
+        get().noteSystemMessage('任务执行中不能删除消息，请先中断或等待完成', 'info')
+        return
+      }
+      const bound = await resolveTreeBinding(get, msgId)
+      if (!bound) {
+        get().noteSystemMessage(
+          get().activeRootId
+            ? '无法定位该消息在会话树中的位置（可能是未落盘的系统提示），已跳过'
+            : '当前会话尚未落盘（新会话需先完成一轮任务），暂不能删除',
+          'info'
+        )
+        return
+      }
+      const target = bound.nodes.find((n) => n.id === bound.nodeId)
+      if (target?.parentId === null) {
+        get().noteSystemMessage('首条指令是会话根节点，不能删除；如需清空请用工具栏的清空按钮', 'info')
+        return
+      }
+      try {
+        await window.api.session.deleteNode(bound.rootId, bound.nodeId)
+        // 截断后视图以树为准重载 —— 被删分支连同其后的消息一起消失
+        const nodes = await window.api.session.get(bound.rootId)
+        set({ messages: nodesToMessages(nodes) })
+      } catch (e) {
+        get().noteSystemMessage(`删除消息失败：${errorText(e)}`)
+      }
+    },
+
+    /**
+     * 重新生成：回到产生这条回答的用户指令，截断旧回答分支后用**原指令**重跑。
+     *
+     * - 对 assistant/thinking：锚点 = 最近的 user 祖先；截断锚点 + 后代（视图里指令
+     *   会随重发再出现一次），然后 `send(原文)` —— 新回答从锚点的父节点开新分支。
+     * - 对 user 指令本身：锚点就是它，语义 = 「这条指令重发一遍」。
+     * - 锚点是 root（第一条指令）：root 不能删，改传 `keepSelf` 只删后代（旧回答），
+     *   再重发。树里会多一条内容相同的 user 节点（历史回放里指令出现两次），
+     *   这是「树只追加 + 复用原指令」下最小的实现代价，只影响第一条指令。
+     */
+    async regenerateMessage(msgId: string) {
+      if (get().agentRunning) {
+        get().noteSystemMessage('任务执行中不能重新生成，请先中断或等待完成', 'info')
+        return
+      }
+      const bound = await resolveTreeBinding(get, msgId)
+      if (!bound) {
+        get().noteSystemMessage(
+          get().activeRootId
+            ? '无法定位该消息在会话树中的位置，暂不能重新生成'
+            : '当前会话尚未落盘（新会话需先完成一轮任务），暂不能重新生成',
+          'info'
+        )
+        return
+      }
+      const anchor = nearestUserAncestor(bound.nodes, bound.nodeId)
+      if (!anchor) {
+        get().noteSystemMessage('找不到产生这条回答的指令节点，暂不能重新生成', 'info')
+        return
+      }
+      const originalText = stripAttachmentNote(anchor.content)
+      if (!originalText) {
+        get().noteSystemMessage('原指令内容为空，暂不能重新生成', 'info')
+        return
+      }
+      try {
+        // 锚点是 root 时传 keepSelf：只删后代（旧回答），root 自身保留
+        await window.api.session.deleteNode(bound.rootId, anchor.id, anchor.parentId === null)
+      } catch (e) {
+        get().noteSystemMessage(`重新生成失败（截断旧回答时出错）：${errorText(e)}`)
+        return
+      }
+      // 视图先收敛到树现状，再走正常 send —— 用户气泡与回答都会重新出现
+      const nodes = await window.api.session.get(bound.rootId)
+      set({ messages: nodesToMessages(nodes) })
+      await get().send(originalText)
     },
 
     async setTheme(theme: 'dark' | 'light') {
@@ -98,6 +322,17 @@ export function dataActions(
         key
       )
       set({ settings, hasApiKey, configuredProfileIds })
+    },
+
+    async clearTopology() {
+      try {
+        const t = await window.api.topology.clear()
+        set({ topology: t })
+      } catch (e) {
+        set((s) => ({
+          messages: [...s.messages, systemNote(`清空拓扑失败：${errorText(e)}`)]
+        }))
+      }
     },
 
     async refreshTopology() {
@@ -177,7 +412,13 @@ export function dataActions(
       }
     },
 
-    async saveSkill(input: { id?: string; name?: string; description?: string; content: string }) {
+    async saveSkill(input: {
+      id?: string
+      name?: string
+      description?: string
+      content: string
+      scope?: string[]
+    }) {
       try {
         const saved = await window.api.skill.save(input)
         await get().loadSkills()
@@ -194,11 +435,12 @@ export function dataActions(
     },
 
     async toggleSkill(id: string, enabled: boolean) {
-      const next = get().skills.map((s) => s.id)
-      const set2 = new Set(next)
-      if (enabled) set2.add(id)
-      else set2.delete(id)
-      await window.api.skill.setEnabled([...set2])
+      // 以「当前已启用集合」为基线增删，而不是全量技能 id ——
+      // 主进程 setEnabled 是整表替换，传全量会把已停用的技能一起重新启用。
+      const next = new Set(get().skills.filter((s) => s.enabled).map((s) => s.id))
+      if (enabled) next.add(id)
+      else next.delete(id)
+      await window.api.skill.setEnabled([...next])
       await get().loadSkills()
     },
 

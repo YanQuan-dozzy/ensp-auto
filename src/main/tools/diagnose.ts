@@ -1,4 +1,5 @@
 import type { Device } from '@shared/types'
+import { maxParallelOf, runGroupedBounded } from '@shared/concurrency'
 import { fail, ok, Type, type ToolSpec } from './registry'
 
 /**
@@ -61,28 +62,39 @@ export const collectDeviceDiagnostics: ToolSpec<{ deviceIds?: string[] }> = {
     }
 
     const report: Array<Record<string, unknown>> = []
-    for (const s of sessions) {
-      const checks: Array<Record<string, unknown>> = []
-      for (const c of DIAG_CHECKS) {
-        const r = await s.exec(c.command, {
-          timeoutMs: 10000,
-          ...(ctx.signal ? { signal: ctx.signal } : {})
-        })
-        if (!r.ok) {
-          checks.push({ key: c.key, label: c.label, ok: false, error: r.error ?? '命令执行失败' })
-          continue
+    // v2.5：跨设备并发采集。每台设备内部的 7 条 display 必须严格串行
+    // （VRP 一次只能跑一条命令），但设备之间互不相干 —— 3 台设备的
+    // 21 次往返从「21 个 RTT 串起来」变成「最慢那台的 7 个 RTT」。
+    const perDevice = await runGroupedBounded(
+      sessions,
+      (s) => s.id,
+      maxParallelOf(ctx.settings),
+      async (s): Promise<Record<string, unknown>> => {
+        const checks: Array<Record<string, unknown>> = []
+        for (const c of DIAG_CHECKS) {
+          const r = await s.exec(c.command, {
+            timeoutMs: 10000,
+            ...(ctx.signal ? { signal: ctx.signal } : {})
+          })
+          if (!r.ok) {
+            checks.push({ key: c.key, label: c.label, ok: false, error: r.error ?? '命令执行失败' })
+            continue
+          }
+          const excerpt = r.clean
+            .split('\n')
+            // 回显第一行通常是命令本身回显 echo，跳过会占篇幅
+            .filter((line) => !SLICE_CMD_RE.test(line.trim()))
+            .join('\n')
+            .trim()
+            .slice(0, c.limit)
+          checks.push({ key: c.key, label: c.label, ok: true, excerpt })
         }
-        const excerpt = r.clean
-          .split('\n')
-          // 回显第一行通常是命令本身回显 echo，跳过会占篇幅
-          .filter((line) => !SLICE_CMD_RE.test(line.trim()))
-          .join('\n')
-          .trim()
-          .slice(0, c.limit)
-        checks.push({ key: c.key, label: c.label, ok: true, excerpt })
-      }
-      report.push({ deviceId: s.id, name: s.name, checks })
-    }
+        return { deviceId: s.id, name: s.name, checks }
+      },
+      ctx.signal
+    )
+    // 结果按下标回填，所以顺序仍是 deviceIds / 已连接列表的原始顺序
+    for (const row of perDevice) if (row) report.push(row)
 
     return ok(
       {

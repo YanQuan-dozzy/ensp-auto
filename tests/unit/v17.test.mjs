@@ -23,9 +23,12 @@ import {
   messageChars,
   planCompaction,
   planRetry,
+  roundsLeftNotice,
+  roundsLeftWarnAt,
   sanitizeCompaction,
   sanitizeRetry,
   truncateToolResult,
+  upgradeCompactionDefaults,
   synthError,
   isRetryableFailure,
   isOverflowFailure,
@@ -339,6 +342,41 @@ test('默认设置：重试默认开、压缩默认开且预算合理', () => {
   assert.equal(DEFAULT_SETTINGS.retry.enabled, true)
   assert.equal(DEFAULT_SETTINGS.retry.maxRetries, 2)
   assert.equal(DEFAULT_SETTINGS.compaction.enabled, true)
-  assert.equal(DEFAULT_SETTINGS.compaction.keepRounds, 4)
+  // v2.9：轮数与窗口上调后，字符预算必须同量级（20 万字符 ≈ 6.3 万 token，
+  // 只有 256k 窗口的 24% —— 会让 token 判据永远轮不到触发，窗口白抬）
+  assert.equal(DEFAULT_SETTINGS.compaction.transcriptMaxChars, 800_000)
+  assert.equal(DEFAULT_SETTINGS.compaction.keepRounds, 8)
   assert.ok(DEFAULT_SETTINGS.compaction.toolResultMaxChars < DEFAULT_SETTINGS.compaction.transcriptMaxChars)
+})
+
+test('v2.9 upgradeCompactionDefaults：只抬停在旧默认值上的两项，用户调过的不动', () => {
+  const old = { ...DEFAULT_COMPACTION, transcriptMaxChars: 200_000, keepRounds: 4 }
+  const up = upgradeCompactionDefaults(old)
+  assert.equal(up.transcriptMaxChars, 800_000)
+  assert.equal(up.keepRounds, 8)
+
+  // 用户特意调小的预算必须原样保留（想早点压缩、省 token 是合理需求）
+  const tuned = { ...DEFAULT_COMPACTION, transcriptMaxChars: 120_000, keepRounds: 2 }
+  assert.equal(upgradeCompactionDefaults(tuned), tuned)
+
+  // 已经是新值时不动（幂等，返回原对象）
+  assert.equal(upgradeCompactionDefaults(DEFAULT_COMPACTION), DEFAULT_COMPACTION)
+})
+
+test('v2.9 roundsLeftNotice：大预算在剩 10 轮提醒，小预算按比例且不早于 3 轮', () => {
+  // 200 轮：剩 10 轮提醒，剩 11 轮还早
+  assert.equal(roundsLeftWarnAt(200), 10)
+  assert.equal(roundsLeftNotice(11, 200), null)
+  const n = roundsLeftNotice(10, 200)
+  assert.ok(n && n.includes('还剩 10 轮') && n.includes('200 轮'))
+
+  // 12 轮的小预算不该在第 0 轮就喊「还剩 10 轮」：夹到 3
+  assert.equal(roundsLeftWarnAt(12), 3)
+  assert.equal(roundsLeftNotice(4, 12), null)
+  assert.ok(roundsLeftNotice(3, 12))
+
+  // 极小预算也不会退化成 0（否则永远不提醒）
+  assert.equal(roundsLeftWarnAt(1), 3)
+  assert.ok(roundsLeftNotice(1, 1))
+  assert.equal(roundsLeftNotice(0, 1), null)
 })

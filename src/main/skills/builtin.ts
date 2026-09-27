@@ -92,7 +92,7 @@ description: 标准实验流程：发现拓扑 → 连接设备 → 下发配置
 
 ## 阶段 1：拓扑发现（只读）
 - 先 list_devices / scan_devices 了解有哪些设备在线。
-- 需要设备间关系时用 get_topology；不知道工程文件在哪用 find_topology_files ＋ import_topology_file。
+- 需要设备间关系时用 get_topology；必要时用 refresh_topology 从已连接设备实采；若用户明确要求导入外部工程，方可使用 import_topology_file。
 - 这个阶段不改变任何设备状态。
 
 ## 阶段 2：设备连接
@@ -291,7 +291,7 @@ description: 备课流水线（参照 JWM0203/ensp-skills）：裸 .topo 也能�
 拿到一个只有 .topo、没有教程的实验环境时，按五阶段推进，先设计后部署，全程可回滚可验证。
 
 ## 阶段 1：纸上设计（只读）
-- 用 get_topology / import_topology_file 还原拓扑：有哪些设备、谁和谁相连。
+- 用 get_topology 查看当前拓扑，必要时用 refresh_topology 还原已连接设备拓扑。
 - 按 ip-planning 技能约定设计地址规划（互联 10.0.AB.x/24、loopback X.X.X.X/32）。
 - 明确实验目标 → 拆成每台设备要做的配置块，先写规划表，再动任何设备。
 
@@ -311,5 +311,159 @@ description: 备课流水线（参照 JWM0203/ensp-skills）：裸 .topo 也能�
 ## 阶段 5：产出教程
 - 全部收敛后 save_configuration 保存，用 export_lab_guide 生成教学设计文档（目标/拓扑/IP 规划/配置步骤/验证清单）。
 - 最后可用 export_session_report 导出本次实验完整过程留档。`
+  },
+  {
+    id: 'ensp-ipv6',
+    name: 'IPv6 配置与排障',
+    description:
+      '华为 VRP 的 IPv6 配置规范：使能层次、静态地址与 SLAAC / DHCPv6 自动配置、' +
+      'IPv6 静态路由 / RIPng / OSPFv3、验证命令与 eNSP 常见坑。',
+    content: `---
+name: IPv6 配置与排障
+description: 华为 VRP 的 IPv6 配置规范：使能层次、地址与自动配置、静态路由 / RIPng / OSPFv3、验证与排障。
+---
+
+# IPv6 配置与排障
+
+IPv6 实验的失败大多来自「少使能一层」：全局没 \`ipv6\`、接口没 \`ipv6 enable\`、协议没配
+router-id。按下面顺序推进，每步验证过再往下走。
+
+## 使能层次（缺一层就全废）
+1. 全局 \`ipv6\` —— 使能 IPv6 单播转发；不配则接口的 ipv6 enable / ipv6 address 直接报错。
+2. 接口 \`ipv6 enable\` —— 每个要跑 IPv6 的接口（含 Vlanif / LoopBack / Tunnel）都要配。
+3. 地址 \`ipv6 address <地址> <前缀长度>\` —— 只配地址不 enable 接口，地址不生效。
+
+## 地址配置
+
+### 静态地址
+\`\`\`
+interface GigabitEthernet 0/0/1
+ipv6 enable
+ipv6 address 2001:db8:12::1 64
+quit
+\`\`\`
+
+### Loopback（路由标识 / 测试用，一般 /128）
+\`\`\`
+interface LoopBack 0
+ipv6 enable
+ipv6 address 2001:db8::1 128
+quit
+\`\`\`
+
+### VLANIF 三层网关
+\`\`\`
+vlan batch 10
+interface Vlanif 10
+ipv6 enable
+ipv6 address 2001:db8:10::1 64
+quit
+\`\`\`
+
+- 链路本地地址（fe80::/10）随 ipv6 enable 自动生成，OSPFv3 / RIPng 邻居靠它建立，不用手配。
+- 需要由 MAC 扩展生成接口 ID 时：\`ipv6 address 2001:db8:1:: 64 eui-64\`。
+
+## 地址自动配置
+
+### SLAAC（无状态，靠 RA 下发前缀）
+华为路由器**缺省抑制 RA**，服务端必须显式打开，否则终端拿不到前缀：
+\`\`\`
+interface GigabitEthernet 0/0/2
+ipv6 enable
+ipv6 address 2001:db8:14::1 64
+undo ipv6 nd ra halt
+quit
+\`\`\`
+终端侧（用路由器模拟）自动取地址并学默认路由：\`ipv6 address auto global default\`。
+
+### DHCPv6（有状态）
+服务器：
+\`\`\`
+ipv6
+dhcp enable
+dhcpv6 pool v6pc
+address prefix 2001:db8:10::/64
+excluded-address 2001:db8:10::1
+dns-server 2001:db8:10::1
+quit
+interface Vlanif 10
+ipv6 enable
+ipv6 address 2001:db8:10::1 64
+dhcpv6 server v6pc
+undo ipv6 nd ra halt
+ipv6 nd autoconfig managed-address-flag
+quit
+\`\`\`
+managed-address-flag 让终端走 DHCPv6 取地址（只开 RA 会走 SLAAC 拿不到池里的地址）。
+跨网段时由网关设备做中继，接口指向服务器全局地址：
+\`\`\`
+interface Vlanif 20
+ipv6 enable
+ipv6 address 2001:db8:20::1 64
+dhcpv6 relay destination 2001:db8:12::2
+quit
+\`\`\`
+终端侧：\`ipv6 address auto dhcp\`（eNSP 的 PC 则在 IPv6 配置页选 DHCPv6 模式）。
+
+## 路由
+
+### 静态路由
+\`\`\`
+ipv6 route-static 2001:db8:23:: 64 2001:db8:12::2
+ipv6 route-static :: 0 2001:db8:12::2
+\`\`\`
+第二行是默认路由。目的必须写「前缀 + 前缀长度」，只写地址会被拒。
+IPv6 路由表与 IPv4 路由表**互相独立** —— v4 通不代表 v6 通，必须单独查证。
+
+### RIPng
+\`\`\`
+ripng 1
+quit
+interface GigabitEthernet 0/0/0
+ipv6 enable
+ripng 1 enable
+quit
+\`\`\`
+进程与接口两侧都要使能，缺一个就不收 / 不发更新。
+
+### OSPFv3
+\`\`\`
+ospfv3 1
+router-id 1.1.1.1
+quit
+interface GigabitEthernet 0/0/0
+ipv6 enable
+ipv6 address 2001:db8:12::1 64
+ospfv3 1 area 0
+quit
+\`\`\`
+- OSPFv3 的 router-id **必须手工配置**，不会从接口地址自动选举；每台路由器唯一且非 0。
+- 接口用 \`ospfv3 <进程号> area <区域号>\` 使能，没有 OSPFv2 的 network 宣告步骤，宣告范围由接口网段决定。
+
+## 验证命令
+- display ipv6 interface brief —— 接口 IPv6 地址与物理 / 协议状态（最常用）
+- display ipv6 routing-table —— IPv6 路由表（看 Direct / Static / 协议路由）
+- display ipv6 neighbors —— ND 邻居表（二层可达性，对标 display arp）
+- display ospfv3 1 peer —— OSPFv3 邻居（期望 Full）
+- display ripng 1 neighbor / display ripng 1 route —— RIPng 邻居与学到的路由
+- ping ipv6 <目的地址> / ping ipv6 -a <源地址> <目的地址> —— 连通性（PC 上直接 ping 地址）
+- tracert ipv6 <目的地址> —— 逐跳定位断点
+
+## eNSP 常见坑
+- **本工作台的 verify_ping 只认 IPv4**：目标传 IPv6 地址会被直接拒绝。IPv6 连通性改用
+  run_show_command 下发 \`ping ipv6 ...\`，自己读丢包率（0% 即通）。
+- **RA 默认不发**：只配了地址、没 \`undo ipv6 nd ra halt\`，终端永远拿不到前缀，表现为「PC 没地址」。
+- **OSPFv3 没 router-id 就不运行**：与 OSPFv2 不同，这是启动硬前提。
+- **全局 ipv6 忘开**：接口下敲 ipv6 enable / ipv6 address 会报错或不生效，先补全局。
+- **设备型号**：低端型号（如 AR201）对 IPv6 支持受限，IPv6 实验建议用 AR2220 及以上。
+- **拿到地址但 ping 不通**：先 display ipv6 neighbors 看 ND 有没有学到对端，再查回程路由 ——
+  IPv6 静态路由同样要两端都配，只配去程只能通一半。
+- 回显乱码是 GBK 编码的正常现象，以命令是否被设备接受为准。
+
+## 地址规划约定（与 ip-planning 技能对齐）
+- 互联链路：2001:db8:AB::/64，A / B 为相邻设备编号；A 侧取 ::1、B 侧取 ::2。
+- 回环口：2001:db8::X/128，X 为设备编号。
+- 业务网段：2001:db8:X::/64（X 为 VLAN 号），网关取 ::1。
+- 统一使用文档保留前缀 2001:db8::/32，避免与真实公网地址语义混淆。`
   }
 ]

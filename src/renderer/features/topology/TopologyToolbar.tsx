@@ -10,7 +10,8 @@ import {
   IconRotateCcw,
   IconUpload,
   IconSearch,
-  IconRefresh
+  IconRefresh,
+  IconTrash
 } from '@/components/ui'
 import { ROLE_LABEL } from './TopoRender'
 import { TopologyHelpTooltip } from './TopologyHelpTooltip'
@@ -29,6 +30,7 @@ export interface TopologyToolbarProps {
   openFinder: () => void
   refreshing: boolean
   refresh: () => Promise<void>
+  onClear: () => Promise<void>
 }
 
 export function TopologyToolbar(p: TopologyToolbarProps): React.ReactNode {
@@ -94,6 +96,14 @@ export function TopologyToolbar(p: TopologyToolbarProps): React.ReactNode {
             collapseBelow={850}
             onClick={() => void p.openFinder()}
             tooltip="扫描桌面/文档/下载中的 .topo"
+          />
+          <AdaptiveButton
+            icon={<IconTrash size={13} />}
+            label="清空画布"
+            collapseBelow={950}
+            onClick={() => void p.onClear()}
+            disabled={p.locked}
+            tooltip="清空当前拓扑画布并重置工程状态"
           />
           <AdaptiveButton
             icon={<IconRefresh size={13} className={p.refreshing ? 'dot pending' : ''} />}

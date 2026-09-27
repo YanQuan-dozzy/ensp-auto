@@ -6,7 +6,8 @@
   "description": "eNSP 网络实验的 AI 代理工作台",
   "main": "./out/main/index.js",
   "scripts": {
-    "dev": "electron-vite dev",
+    "dev": "node tools/patch-electron-exe.cjs && powershell -NoProfile -ExecutionPolicy Bypass -File tools/ensure-shortcut.ps1 && electron-vite dev",
+    "postinstall": "node tools/patch-electron-exe.cjs",
     "build": "electron-vite build",
     "preview": "electron-vite preview",
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json --composite false",
@@ -14,7 +15,9 @@
     "typecheck:tests": "tsc --noEmit -p tsconfig.tests.json",
     "typecheck": "npm run typecheck:node && npm run typecheck:web && npm run typecheck:tests",
     "verify": "npm run typecheck && npm run build",
-    "test": "node tests/harness/bundle.mjs && node --test \"tests/unit/*.test.mjs\""
+    "test": "node tests/harness/bundle.mjs && node --test \"tests/unit/*.test.mjs\"",
+    "dist:prepare": "electron-vite build",
+    "dist": "npm run dist:prepare && electron-builder --win --publish never"
   },
   "dependencies": {
     "@earendil-works/pi-ai": "^0.85.1",
@@ -24,6 +27,8 @@
     "@xyflow/react": "^12.11.6",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
     "ssh2": "^1.17.0",
     "zod": "^4.6.5",
     "zustand": "^5.0.15"
@@ -35,6 +40,7 @@
     "@types/ssh2": "^1.15.6",
     "@vitejs/plugin-react": "^5.2.0",
     "electron": "^44.4.2",
+    "electron-builder": "^26.15.3",
     "electron-vite": "^5.0.0",
     "typescript": "^5.9.3",
     "vite": "^7.3.6"

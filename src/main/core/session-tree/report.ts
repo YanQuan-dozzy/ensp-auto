@@ -35,6 +35,16 @@ export function buildMarkdown(root: SessionNodeMeta, nodes: SessionNode[]): stri
       lines.push('## 代理')
       lines.push(node.content)
       lines.push('')
+    } else if (node.role === 'thinking') {
+      // v2.2：思考段折叠在 Markdown 引用块里，导出后不与正文混淆
+      lines.push('## 思考')
+      lines.push(
+        node.content
+          .split('\n')
+          .map((l) => `> ${l}`)
+          .join('\n')
+      )
+      lines.push('')
     } else if (node.role === 'tool') {
       const tc = node.toolCall
       const status = tc ? (tc.ok === false ? '失败' : tc.ok ? '成功' : '执行中') : ''

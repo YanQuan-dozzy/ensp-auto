@@ -50,6 +50,9 @@ const STAGE_LABEL: Record<WiresharkInstallProgressPayload['stage'], string> = {
 export function WiresharkPanel(): ReactNode {
   const cachedProbe = useApp((s) => s.settings.wireshark?.cachedProbe)
   const mcpServers = useApp((s) => s.settings.mcp?.servers)
+  // F10：任务生命周期自动抓包开关
+  const autoCapture = useApp((s) => s.settings.wireshark?.autoCapture) ?? false
+  const updateSettings = useApp((s) => s.updateSettings)
 
   const [state, setState] = useState<WiresharkAvailabilityPayload | null>(() => cachedProbe ?? null)
   const [busy, setBusy] = useState<'probe' | 'install' | 'attach' | null>(() =>
@@ -148,6 +151,12 @@ export function WiresharkPanel(): ReactNode {
     if (dir) await refresh(true)
     else if (!state?.probe.canAnalyze) setError('所选目录中没有找到 tshark.exe，请选择 Wireshark 的安装目录')
   }, [refresh, state])
+
+  // F10：整对象写回（设置白名单按字段合并，cachedProbe / dir 一并带上，避免被抹掉）
+  const toggleAutoCapture = useCallback(async (): Promise<void> => {
+    const cur = useApp.getState().settings.wireshark
+    await updateSettings({ wireshark: { ...cur, autoCapture: !autoCapture } })
+  }, [autoCapture, updateSettings])
 
   const probe = state?.probe
   // 以主进程的探测结果为准：它是「条目是否 enabled」的实时视图；
@@ -330,6 +339,25 @@ export function WiresharkPanel(): ReactNode {
             title="审批口径"
             desc="由「权限与审批」决定：外部工具默认每次都要人工确认。若你信任它、想让它自主跑完整套分析流程，可在那里对 wireshark 这台服务器勾选信任。"
             control={<Chip>走人工闸门</Chip>}
+          />
+          <Row
+            title="任务自动抓包"
+            desc="开启后，execute_task / batch_configure 开始时会自动调用已挂载的抓包工具，结束时停止，并把结果附进任务结果（含 pcap 路径，代理可接着分析）。抓包需要「完整档」（含 dumpcap）；认不出起停工具就静默跳过，不影响实验本身。"
+            control={
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <button
+                  className="btn sm"
+                  onClick={() => void toggleAutoCapture()}
+                  disabled={busy !== null}
+                  title={autoCapture ? '关闭任务自动抓包' : '开启任务自动抓包'}
+                >
+                  {autoCapture ? '关闭' : '开启'}
+                </button>
+                <Chip tone={autoCapture ? 'success' : undefined}>
+                  {autoCapture ? '已开启' : '未开启'}
+                </Chip>
+              </div>
+            }
           />
         </Section>
       ) : null}

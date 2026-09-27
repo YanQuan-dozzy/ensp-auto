@@ -21,8 +21,12 @@ import { structuredCloneSafe } from '@shared/clone'
  *
  * 存储布局（userData/skills/）：
  * - <id>.skill.md     每个技能一个 Markdown 文件（正文含 frontmatter 原文，可编辑）
- * - meta.json         元信息：seeded（是否已预置内置技能）、enabled（启用的 id）、
- *                     builtin（由来）、createdAt 时间戳
+ * - meta.json         元信息：seeded（是否已预置过内置技能）、enabled（启用的 id）、
+ *                     builtin（内置技能台账：曾预置过的 id，删除后仍保留以防复活）、
+ *                     createdAt 时间戳
+ *
+ * 内置技能按 id 增量预置（见 seedBuiltins）：新版本新增的内置技能会在老安装上补上，
+ * 用户改过的正文不被覆盖，用户删过的内置技能也不会复活。
  *
  * 与 TopologyStore 相同的纪律：不依赖 Electron，便于 harness 单测；
  * 每次变更 persist + publish（onChange → EVENT.skillsUpdated）。
@@ -37,6 +41,7 @@ interface Meta {
   version: 1
   seeded: boolean
   enabled: string[]
+  /** 内置技能台账：曾由 seedBuiltins 预置过的 id（用户删除后仍保留，防止下次启动复活） */
   builtin: string[]
   createdAt: Record<string, number>
 }
@@ -55,6 +60,8 @@ export interface SaveSkillInput {
   name?: string
   description?: string
   content: string
+  /** F12：绑定目录；缺省（undefined）表示「不改动现有绑定」，空数组表示设为全局技能 */
+  scope?: string[]
 }
 
 export class SkillStore {
@@ -141,22 +148,30 @@ export class SkillStore {
     this.opts.onChange?.(this.list())
   }
 
-  /** 首次启动预置内置技能；seeded 落盘后不再重复（用户删除的不会被复活） */
+  /**
+   * 预置内置技能 —— 按 id **增量预置**，不是「一次性」。
+   *
+   * 每次启动都比对内置清单，把**从未预置过**的补上，这样后续版本新增的内置技能
+   * 在已有安装上也会出现（旧的 `if (meta.seeded) return` 会让新技能永远不落地）。
+   * 两条不覆盖规则：
+   * - 磁盘上已有同 id 文件 → 跳过（用户可能改过正文，不覆盖）；
+   * - `meta.builtin` 台账里有该 id → 跳过（用户手动删过的内置技能不被复活）。
+   * 因此 `builtin` 的语义是「曾经预置过的内置技能台账」，`remove()` 不再从中摘除。
+   */
   private seedBuiltins(): void {
-    if (this.meta.seeded) return
     const existing = new Set(this.listIds())
     const seeded: string[] = []
     const createdAt: Record<string, number> = { ...this.meta.createdAt }
     const now = Date.now()
     for (const def of BUILTIN_SKILLS) {
-      if (existing.has(def.id)) continue
+      if (existing.has(def.id) || this.meta.builtin.includes(def.id)) continue
       this.writeSkill(def.id, def.content)
       seeded.push(def.id)
       if (!(def.id in createdAt)) createdAt[def.id] = now
     }
-    if (seeded.length > 0 || this.meta.builtin.length === 0) {
-      this.meta.builtin = [...new Set([...this.meta.builtin, ...seeded])]
-    }
+    // 无新增且此前已预置过 → 不动内存、不写盘（启动路径零磁盘写入）
+    if (seeded.length === 0 && this.meta.seeded) return
+    this.meta.builtin = [...new Set([...this.meta.builtin, ...seeded])]
     this.meta.createdAt = createdAt
     this.meta.seeded = true
     // 构造期不因落盘失败让整个应用起不来：降级为「本次会话内有效」并留下告警
@@ -199,6 +214,7 @@ export class SkillStore {
         content: raw,
         enabled: this.meta.enabled.includes(id),
         builtin: this.meta.builtin.includes(id),
+        scope: meta.scope,
         createdAt: this.meta.createdAt[id] ?? stat.birthtimeMs ?? Date.now(),
         updatedAt: stat.mtimeMs
       }
@@ -230,13 +246,18 @@ export class SkillStore {
     return isValidSkillId(id) ? this.readSkill(id) : null
   }
 
-  /** 已启用技能的注入内容（system prompt 用） */
+  /** 已启用技能的注入内容（system prompt 用）；带 scope 供注入层按上下文过滤（F12） */
   enabledContents(): SkillContent[] {
     return this.meta.enabled
       .filter((id) => this.meta.enabled.includes(id))
       .map((id) => this.readSkill(id))
       .filter((s): s is Skill => !!s)
-      .map((s) => ({ name: s.name, description: s.description, content: s.content }))
+      .map((s) => ({
+        name: s.name,
+        description: s.description,
+        content: s.content,
+        scope: s.scope
+      }))
   }
 
   // ———————————————— 写操作 ————————————————
@@ -258,6 +279,8 @@ export class SkillStore {
     const existing = input.id && isValidSkillId(input.id) ? this.readSkill(input.id) : null
     const name = (input.name ?? '').trim() || (existing?.name ?? '未命名技能')
     const description = (input.description ?? '').trim() || (existing?.description ?? '')
+    // F12：scope 未传 = 不改动现有绑定（否则在编辑器里改个描述就会把绑定抹掉）
+    const scope = input.scope === undefined ? (existing?.scope ?? []) : cleanScope(input.scope)
 
     let id = input.id ?? ''
     if (!id || !isValidSkillId(id)) {
@@ -270,7 +293,7 @@ export class SkillStore {
       }
     }
 
-    this.writeSkill(id, buildSkillMarkdown(name, description, body))
+    this.writeSkill(id, buildSkillMarkdown(name, description, body, scope))
     this.commitMeta(() => {
       if (!(id in this.meta.createdAt)) this.meta.createdAt[id] = Date.now()
       if (existing?.builtin && !this.meta.builtin.includes(id)) this.meta.builtin.push(id)
@@ -290,7 +313,7 @@ export class SkillStore {
     }
     this.commitMeta(() => {
       this.meta.enabled = this.meta.enabled.filter((x) => x !== id)
-      this.meta.builtin = this.meta.builtin.filter((x) => x !== id)
+      // 刻意不摘 builtin 台账：它记录「曾预置过」，增量预置靠它做到「删了不复活」
       delete this.meta.createdAt[id]
     })
     this.publish()
@@ -414,8 +437,15 @@ function toSummary(s: Skill): SkillSummary {
     description: s.description,
     enabled: s.enabled,
     builtin: s.builtin,
+    scope: s.scope,
     updatedAt: s.updatedAt
   }
+}
+
+/** F12：绑定目录清洗（去空、去重、只留字符串）。空数组 = 全局技能 */
+function cleanScope(list: unknown): string[] {
+  if (!Array.isArray(list)) return []
+  return [...new Set(list.filter((v): v is string => typeof v === 'string').map((v) => v.trim()).filter(Boolean))]
 }
 
 function cleanIds(list: unknown): string[] {

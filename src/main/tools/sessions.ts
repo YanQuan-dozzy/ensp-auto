@@ -36,11 +36,28 @@ export function collectSessionReport(
   return { path: file, ext }
 }
 
+/**
+ * F8：把分支对比报告写入导出目录。
+ *
+ * 与 `collectSessionReport` 同规矩（导出目录、文件名安全化、时间戳）。
+ * 对比正文由 `core/session-tree/compare.ts` 的纯函数生成 —— 这里只负责写盘，
+ * 这样「预览（不落盘）」与「导出（落盘）」共用同一份正文，不会两种口径。
+ */
+export function writeCompareReport(exportsDir: string, title: string, markdown: string): { path: string } {
+  const safe = safeFileName(title, { fallback: 'session', maxLen: 40 })
+  const dir = path.join(exportsDir, safe)
+  fs.mkdirSync(dir, { recursive: true })
+  const file = path.join(dir, `${safe}-compare-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.md`)
+  fs.writeFileSync(file, markdown, 'utf8')
+  return { path: file }
+}
+
 export const listSessions: ToolSpec<Record<string, never>> = {
   name: 'list_sessions',
   description: '列出所有会话（历史对话树）的摘要：标题、创建时间、最近活动时间、消息数。用于挑选要回溯或导出的会话。',
   risk: 'read',
   scope: 'local',
+  concurrencySafe: true,
   schema: Type.Object({}),
   summarize: (_args, result) => {
     const d = result.data as { sessions?: unknown[] } | undefined
@@ -55,8 +72,8 @@ export const listSessions: ToolSpec<Record<string, never>> = {
 export const exportSessionReport: ToolSpec<{ rootId: string; format?: 'md' | 'json' }> = {
   name: 'export_session_report',
   description:
-    '把指定会话导出为报告文件（markdown 或 json），写入应用导出目录，返回文件路径。' +
-    '先 list_sessions 拿到 rootId。',
+    '把指定会话导出为报告文件（markdown 或 json），写入应用导出目录，返回文件路径' +
+    '（需要看内容时用 read_attachment 按行读回该路径）。先 list_sessions 拿到 rootId。',
   risk: 'read',
   scope: 'local',
   schema: Type.Object(

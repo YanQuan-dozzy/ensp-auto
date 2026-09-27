@@ -1,3 +1,4 @@
+import path from 'node:path'
 import { INVOKE } from '@shared/channels'
 import { ipcMain } from 'electron'
 import { findTopologyFiles } from '../core/topology/findFiles'
@@ -13,6 +14,11 @@ import type { BrowserWindow } from 'electron'
  * 本模块只做「校验 → 调服务 → 回传」，业务逻辑在 services / core。
  */
 export function registerTopologyIpc(services: Services, getWindow: () => BrowserWindow | null): void {
+  ipcMain.handle(INVOKE.topologyClear, async () => {
+    services.topology.clear()
+    return services.topology.snapshot()
+  })
+
   ipcMain.handle(INVOKE.topologyGet, async () => services.topology.snapshot())
 
   ipcMain.handle(INVOKE.topologyRefresh, async () => services.refreshTopology())
@@ -46,13 +52,29 @@ export function registerTopologyIpc(services: Services, getWindow: () => Browser
   ipcMain.handle(INVOKE.topologyImportFile, async () => {
     // 弹系统文件选择框（dialog 天然限定用户选中文件，规避任意路径注入）
     const win = getWindow()
+    const defaultPath = services.topologyDir || undefined
     const result = await showOpenDialogSafe(win, {
       title: '导入 eNSP 工程文件',
+      defaultPath,
       filters: [{ name: 'eNSP 工程', extensions: ['topo'] }],
       properties: ['openFile']
     })
     if (result.canceled || !result.filePaths[0]) return null
-    return importTopoPath(services, result.filePaths[0])
+    const res = importTopoPath(services, result.filePaths[0])
+    if (res && !services.getSettings().storage?.topologyDir) {
+      try {
+        const dir = path.dirname(result.filePaths[0])
+        services.updateSettings({
+          storage: {
+            ...services.getSettings().storage,
+            topologyDir: dir
+          }
+        })
+      } catch {
+        /* 设置更新失败不影响导入主流程 */
+      }
+    }
+    return res
   })
 
   // v1.2：拓扑发现（找 .topo，UI 快捷导入）
@@ -60,6 +82,7 @@ export function registerTopologyIpc(services: Services, getWindow: () => Browser
     const directory = toStr(args?.directory) || undefined
     return findTopologyFiles({
       ...(directory ? { directory } : {}),
+      topologyDir: services.topologyDir,
       activePath: services.topology.fileSourcePath
     })
   })
@@ -68,7 +91,21 @@ export function registerTopologyIpc(services: Services, getWindow: () => Browser
   ipcMain.handle(INVOKE.topologyImportPath, async (_e, args: { filePath?: string }) => {
     const filePath = toStr(args?.filePath)
     if (!filePath) return null
-    return importTopoPath(services, filePath)
+    const res = importTopoPath(services, filePath)
+    if (res && !services.getSettings().storage?.topologyDir) {
+      try {
+        const dir = path.dirname(path.resolve(filePath))
+        services.updateSettings({
+          storage: {
+            ...services.getSettings().storage,
+            topologyDir: dir
+          }
+        })
+      } catch {
+        /* 设置更新失败不影响导入主流程 */
+      }
+    }
+    return res
   })
 
   // ————————————————— 设置与密钥 —————————————————

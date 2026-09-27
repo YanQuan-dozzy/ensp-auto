@@ -10,6 +10,8 @@ import { registerWiresharkIpc } from './wireshark'
 import { registerEnspIpc } from './ensp'
 import { registerSkillsIpc } from './skills'
 import { registerAppIpc } from './app'
+import { registerClipboardIpc } from './clipboard'
+import { registerChangesIpc } from './changes'
 
 /**
  * IPC 路由层的装配入口（T5.1：按域拆到同目录的兄弟模块）。
@@ -38,6 +40,10 @@ export function registerIpc(services: Services, getWindow: () => BrowserWindow |
   registerEnspIpc(services, getWindow)
   registerSkillsIpc(services, getWindow)
   registerAppIpc(services, getWindow)
+  // v2.1：剪贴板读写无服务依赖（纯 Electron clipboard 转发）
+  registerClipboardIpc()
+  // F6：跨设备变更时间线（只读）
+  registerChangesIpc(services)
 }
 
 // 保持既有导入路径可用（index 曾是这些名字的唯一出处）

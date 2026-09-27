@@ -9,7 +9,8 @@ import {
   computeClampedLeft,
   computeClampedRight,
   computeWindowResizeShrink,
-  shouldCollapseButton
+  shouldCollapseButton,
+  DEFAULT_SETTINGS
 } from '../.build/harness.mjs'
 
 /**
@@ -101,3 +102,10 @@ test('按钮自适应折叠逻辑：collapseBelow 阈值与优先级自适应', 
   assert.equal(shouldCollapseButton({ tier: 'md', width: 580, collapseBelow: 620 }), true) // 添加节点 -> 图标
   assert.equal(shouldCollapseButton({ tier: 'md', width: 580, collapseBelow: 460 }), false) // 从设备刷新 -> 保持文字
 })
+
+test('PanelSettings：三栏面板默认展开状态配置 (left/right/centerCollapsed 全为 false)', () => {
+  assert.equal(DEFAULT_SETTINGS.panels.leftCollapsed, false)
+  assert.equal(DEFAULT_SETTINGS.panels.rightCollapsed, false)
+  assert.equal(DEFAULT_SETTINGS.panels.centerCollapsed, false)
+})
+

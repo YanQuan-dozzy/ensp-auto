@@ -1,8 +1,36 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { analyzeReferenceConfig, type ReferenceAnalysis } from '../core/reference/analyze'
+import { decode, detectEncoding } from '../core/telnet/encoding'
 import { fail, ok, Type, type ToolSpec } from './registry'
 import { atomicWriteJsonSync } from '../core/fs/atomic'
+
+/** 参考配置文本文件的字节上限 */
+const MAX_REFERENCE_BYTES = 512 * 1024
+
+/**
+ * 读参考配置文本文件（v2.13）。
+ *
+ * 为什么不能直接 `readFileSync(path, 'utf8')`：中文的实验指导书 / 标准配置样例大量是
+ * GBK，硬解 UTF-8 会整份变成 U+FFFD，而模型随后会「照此摘要配置真机」—— 乱码直接
+ * 变成错误配置。这里复用通信层与附件预览同一套判据：UTF-8 严格校验优先，失败回退 GBK。
+ *
+ * 含 NUL 视为二进制直接拒绝：否则一个改名为 .cfg 的 zip/exe 会被分析出一份毫无意义的
+ * 「能力摘要」，比明确报错更糟。
+ */
+export function readReferenceTextFile(
+  filePath: string
+): { ok: true; text: string; encoding: 'utf8' | 'gbk' } | { ok: false; error: string } {
+  const buf = fs.readFileSync(filePath)
+  if (buf.includes(0)) {
+    return {
+      ok: false,
+      error: '内容看起来是二进制（含 NUL），无法作为配置文本分析；请提供 txt/md/cfg 等文本文件'
+    }
+  }
+  const encoding = detectEncoding(buf)
+  return { ok: true, text: decode(buf, encoding).text, encoding }
+}
 
 /**
  * 参考配置能力学习工具（v1.2 / F-：参照 ensp-mcp analyze_reference_configs）。
@@ -14,17 +42,18 @@ import { atomicWriteJsonSync } from '../core/fs/atomic'
 export const analyzeReferenceConfigs: ToolSpec<{ text?: string; path?: string }> = {
   name: 'analyze_reference_configs',
   description:
-    '分析参考配置（文本或 .txt/.cfg 文件）并提取配置能力摘要：OSPF/VLAN/DHCP/VRRP/NAT/ACL/' +
+    '分析参考配置（文本或文本文件）并提取配置能力摘要：OSPF/VLAN/DHCP/VRRP/NAT/ACL/' +
     'IPSec/WiFi 等按协议归类，标注所属设备并抽出代表性命令。' +
     '当用户给出实验指导书样例或标准配置要求「照此配置」时，先用本工具学习，再按摘要执行。' +
     '返回能力列表与可落盘的工件路径。',
   risk: 'read',
   scope: 'local',
+  concurrencySafe: true,
   schema: Type.Object(
     {
       text: Type.Optional(Type.String({ description: '参考配置原文（与 path 二选一）' })),
       path: Type.Optional(
-        Type.String({ description: '参考配置文件的绝对路径（.txt/.cfg/.conf，≤512KB；与 text 二选一）' })
+        Type.String({ description: '参考配置文件的绝对路径（文本文件，≤512KB，扩展名不限，UTF-8/GBK 自动识别；与 text 二选一）' })
       )
     },
     { additionalProperties: false }
@@ -48,16 +77,20 @@ export const analyzeReferenceConfigs: ToolSpec<{ text?: string; path?: string }>
 
     let content: string
     if (pathArg) {
-      // —— 路径白名单（与 import_topology_file 同规则）——
+      // —— 路径准入：刻意**不做扩展名白名单**（用户会指任意位置的参考配置，.bak /
+      //    无扩展名的片段都合法）。真正的门是「≤512KB + 内容为文本（无 NUL）」，
+      //    约束见 readReferenceTextFile。
       const resolved = path.resolve(pathArg)
-      // v1.8：path.resolve 已归一化 `..`，防穿越只依赖下方扩展/存在/大小检查
       if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
         return fail('BAD_PARAM', `文件不存在：${resolved}`, { ms: Date.now() - t0 })
       }
-      if (fs.statSync(resolved).size > 512 * 1024) {
+      if (fs.statSync(resolved).size > MAX_REFERENCE_BYTES) {
         return fail('BAD_PARAM', '参考配置文件超过 512KB', { ms: Date.now() - t0 })
       }
-      content = fs.readFileSync(resolved, 'utf8')
+      // v2.13：按内容判编码（UTF-8 优先 / GBK 回退），不再硬解 UTF-8 把中文配置读成乱码
+      const read = readReferenceTextFile(resolved)
+      if (!read.ok) return fail('NOT_TEXT', read.error, { ms: Date.now() - t0 })
+      content = read.text
     } else {
       content = textArg
     }

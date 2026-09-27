@@ -1,14 +1,21 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useApp } from '@/stores/app'
 import { activeProfileOf } from '@shared/profiles'
 import { DevicePanel } from '@/features/devices/DevicePanel'
 import { TerminalPane } from '@/features/terminal/TerminalPane'
 import { AgentPanel } from '@/features/agent/AgentPanel'
 import { GateDialog } from '@/features/agent/GateDialog'
+import { QuestionDialog } from '@/features/agent/QuestionDialog'
 import { SettingsDialog } from '@/features/settings/SettingsDialog'
 import { TopologyCanvas } from '@/features/topology/TopologyCanvas'
 import { SkillsPanel } from '@/features/skills/SkillsPanel'
-import { getEffectiveShortcuts, matchesShortcut } from '@/features/shortcuts/shortcutsData'
+import { ChangeTimeline } from '@/features/changes/ChangeTimeline'
+import { TracePanel } from '@/features/trace/TracePanel'
+import {
+  formatKeys,
+  getEffectiveShortcuts,
+  matchesShortcut
+} from '@/features/shortcuts/shortcutsData'
 import {
   IconLogo,
   IconSidebar,
@@ -20,6 +27,8 @@ import {
   IconSun,
   IconMoon,
   IconPin,
+  IconActivity,
+  IconRotateCcw,
   IconWindowMin,
   IconWindowMax,
   IconWindowRestore,
@@ -65,6 +74,17 @@ export function App(): ReactNode {
   const [rightW, setRightW] = useState(settings.panels.right)
   const dragging = useRef<'left' | 'right' | null>(null)
 
+  const effShortcuts = useMemo(
+    () => getEffectiveShortcuts(settings.shortcuts),
+    [settings.shortcuts]
+  )
+  const settingsShortcut = effShortcuts['app:settings'] ?? ['Ctrl', ',']
+  const settingsShortcutDisplay = formatKeys(settingsShortcut)
+  const settingsShortcutBadge =
+    settingsShortcut.find((k) => !['Ctrl', 'Shift', 'Alt', 'Cmd', 'Meta'].includes(k)) ??
+    settingsShortcut[settingsShortcut.length - 1] ??
+    ','
+
   // 监听窗口最大化状态
   useEffect(() => {
     void window.api.window.isMaximized().then(setIsMaximized)
@@ -107,6 +127,7 @@ export function App(): ReactNode {
     const handleResize = (): void => {
       const winW = window.innerWidth
       const cur = useApp.getState().settings.panels
+      if (cur.centerCollapsed) return
       const leftActive = !cur.leftCollapsed
       const rightActive = !cur.rightCollapsed
       const curLeft = leftActive ? leftWRef.current : 0
@@ -187,12 +208,33 @@ export function App(): ReactNode {
     })
   }, [updateSettings])
 
-  const toggleRightCollapse = useCallback(() => {
+  const toggleCenterCollapse = useCallback(() => {
     const cur = useApp.getState().settings.panels
+    const nextCollapsed = !cur.centerCollapsed
+    if (!nextCollapsed) {
+      setTab('topology')
+    }
+    // 防空屏保护：若折叠中栏时右栏已折叠，则同时唤醒右栏
+    const nextRight = nextCollapsed && cur.rightCollapsed ? false : cur.rightCollapsed
     void updateSettings({
       panels: {
         ...cur,
-        rightCollapsed: !cur.rightCollapsed
+        centerCollapsed: nextCollapsed,
+        rightCollapsed: nextRight
+      }
+    })
+  }, [updateSettings, setTab])
+
+  const toggleRightCollapse = useCallback(() => {
+    const cur = useApp.getState().settings.panels
+    const nextRight = !cur.rightCollapsed
+    // 防空屏保护：若中栏已折叠且要折叠右栏，则唤醒中栏
+    const nextCenter = nextRight && cur.centerCollapsed ? false : cur.centerCollapsed
+    void updateSettings({
+      panels: {
+        ...cur,
+        rightCollapsed: nextRight,
+        centerCollapsed: nextCenter
       }
     })
   }, [updateSettings])
@@ -258,6 +300,14 @@ export function App(): ReactNode {
         return
       }
 
+      // 切换中间拓扑画布
+      if (matchesShortcut(e, eff['workbench:toggle-center'])) {
+        e.preventDefault()
+        e.stopPropagation()
+        toggleCenterCollapse()
+        return
+      }
+
       // 切换终端
       if (matchesShortcut(e, eff['nav:terminal'])) {
         e.preventDefault()
@@ -303,7 +353,7 @@ export function App(): ReactNode {
 
     window.addEventListener('keydown', onKey, true)
     return () => window.removeEventListener('keydown', onKey, true)
-  }, [setTab, toggleLeftCollapse, toggleRightCollapse, settingsOpen])
+  }, [setTab, toggleLeftCollapse, toggleRightCollapse, toggleCenterCollapse, settingsOpen])
 
   if (!ready) {
     if (startupError) {
@@ -337,7 +387,7 @@ export function App(): ReactNode {
         <div className="topbar-brand">
           <button
             className={`btn ghost icon${settings.panels.leftCollapsed ? '' : ' active'}`}
-            title={`切换设备列表 (${settings.panels.leftCollapsed ? '展开' : '折叠'}, Ctrl+B)`}
+            title={`切换设备列表 (${settings.panels.leftCollapsed ? '展开' : '折叠'}, ${formatKeys(effShortcuts['workbench:toggle-left'] ?? ['Ctrl', 'B'])})`}
             onClick={toggleLeftCollapse}
           >
             <IconSidebar size={16} />
@@ -362,8 +412,15 @@ export function App(): ReactNode {
             {connected} 已连接
           </span>
           <button
+            className={`btn ghost icon${settings.panels.centerCollapsed ? '' : ' active'}`}
+            title={`切换拓扑画布 (${settings.panels.centerCollapsed ? '展开' : '折叠'}, ${formatKeys(effShortcuts['workbench:toggle-center'] ?? ['Ctrl', 'Alt', 'B'])})`}
+            onClick={toggleCenterCollapse}
+          >
+            <IconTopology size={15} />
+          </button>
+          <button
             className={`btn ghost icon${settings.panels.rightCollapsed ? '' : ' active'}`}
-            title={`切换 AI 面板 (${settings.panels.rightCollapsed ? '展开' : '折叠'}, Ctrl+Shift+B)`}
+            title={`切换 AI 面板 (${settings.panels.rightCollapsed ? '展开' : '折叠'}, ${formatKeys(effShortcuts['workbench:toggle-right'] ?? ['Ctrl', 'Shift', 'B'])})`}
             onClick={toggleRightCollapse}
           >
             <IconBot size={15} />
@@ -383,10 +440,14 @@ export function App(): ReactNode {
           >
             <IconPin size={15} />
           </button>
-          <button className="btn adaptive-btn" onClick={() => setSettingsOpen((prev) => !prev)} title="设置 (Ctrl+,)">
+          <button
+            className="btn adaptive-btn"
+            onClick={() => setSettingsOpen((prev) => !prev)}
+            title={`设置 (${settingsShortcutDisplay})`}
+          >
             <IconSettings size={15} />
             <span className="topbar-btn-text">设置</span>
-            <span className="kbd-badge">,</span>
+            <span className="kbd-badge">{settingsShortcutBadge}</span>
           </button>
 
           <div className="topbar-divider" />
@@ -435,66 +496,95 @@ export function App(): ReactNode {
           </>
         )}
 
-        <div className="col" style={{ flex: 1, minWidth: 0 }}>
-          <div className="tabstrip">
-            <div className="tab-pill-group">
-              <div
-                className={`tab${activeTab === 'terminal' ? ' active' : ''}`}
-                onClick={() => setTab('terminal')}
-                title="设备交互终端 (Ctrl+1)"
-              >
-                <IconTerminal size={14} />
-                终端
+        {!settings.panels.centerCollapsed && (
+          <div className="col" style={{ flex: 1, minWidth: 0 }}>
+            <div className="tabstrip">
+              <div className="tab-pill-group">
+                <div
+                  className={`tab${activeTab === 'terminal' ? ' active' : ''}`}
+                  onClick={() => setTab('terminal')}
+                  title={`设备交互终端 (${formatKeys(effShortcuts['nav:terminal'] ?? ['Ctrl', '1'])})`}
+                >
+                  <IconTerminal size={14} />
+                  终端
+                </div>
+                <div
+                  className={`tab${activeTab === 'topology' ? ' active' : ''}`}
+                  onClick={() => setTab('topology')}
+                  title={`拓扑画布 (${formatKeys(effShortcuts['nav:topology'] ?? ['Ctrl', '2'])})`}
+                >
+                  <IconTopology size={14} />
+                  拓扑画布
+                </div>
+                <div
+                  className={`tab${activeTab === 'skills' ? ' active' : ''}`}
+                  onClick={() => setTab('skills')}
+                  title={`技能库与提示词管理 (${formatKeys(effShortcuts['nav:skills'] ?? ['Ctrl', '3'])})`}
+                >
+                  <IconSparkles size={14} />
+                  技能
+                </div>
+                <div
+                  className={`tab${activeTab === 'changes' ? ' active' : ''}`}
+                  onClick={() => setTab('changes')}
+                  title="变更时间线：所有设备的配置变更审计"
+                >
+                  <IconActivity size={14} />
+                  变更
+                </div>
+                <div
+                  className={`tab${activeTab === 'trace' ? ' active' : ''}`}
+                  onClick={() => setTab('trace')}
+                  title="执行轨迹：书签 / 分支对比 / 回放"
+                >
+                  <IconRotateCcw size={14} />
+                  轨迹
+                </div>
               </div>
-              <div
-                className={`tab${activeTab === 'topology' ? ' active' : ''}`}
-                onClick={() => setTab('topology')}
-                title="拓扑画布 (Ctrl+2)"
-              >
-                <IconTopology size={14} />
-                拓扑画布
-              </div>
-              <div
-                className={`tab${activeTab === 'skills' ? ' active' : ''}`}
-                onClick={() => setTab('skills')}
-                title="技能库与提示词管理 (Ctrl+3)"
-              >
-                <IconSparkles size={14} />
-                技能
-              </div>
-            </div>
-            {activeDevice ? (
-              <span className="tabstrip-device-badge">
-                <span className="chip success" title={`${activeDevice.name} · ${activeDevice.view ?? '未知视图'}`}>
-                  <span className="tabstrip-device-name">{activeDevice.name}</span>
-                  <span className="tabstrip-device-sep">·</span>
-                  <span className="tabstrip-device-view">{activeDevice.view ?? '未知视图'}</span>
+              {activeDevice ? (
+                <span className="tabstrip-device-badge">
+                  <span className="chip success" title={`${activeDevice.name} · ${activeDevice.view ?? '未知视图'}`}>
+                    <span className="tabstrip-device-name">{activeDevice.name}</span>
+                    <span className="tabstrip-device-sep">·</span>
+                    <span className="tabstrip-device-view">{activeDevice.view ?? '未知视图'}</span>
+                  </span>
                 </span>
-              </span>
-            ) : null}
-          </div>
+              ) : null}
+            </div>
 
-          {activeTab === 'topology' ? <TopologyCanvas /> : null}
-          {activeTab === 'skills' ? <SkillsPanel /> : null}
-          {/* v1.8：终端保活 —— 切走用 CSS 隐藏而不是卸载，避免 xterm 滚动缓冲（10000 行）
-              随切 tab 丢失；xterm 在 display:none 期间仍积累写入，ResizeObserver 在
-              显示时重新 fit 尺寸 */}
-          <div
-            className="col"
-            style={{ flex: 1, minWidth: 0, minHeight: 0, display: activeTab === 'terminal' ? 'flex' : 'none' }}
-          >
-            <TerminalPane />
+            {activeTab === 'topology' ? <TopologyCanvas /> : null}
+            {activeTab === 'skills' ? <SkillsPanel /> : null}
+            {activeTab === 'changes' ? <ChangeTimeline /> : null}
+            {activeTab === 'trace' ? <TracePanel /> : null}
+            {/* v1.8：终端保活 —— 切走用 CSS 隐藏而不是卸载，避免 xterm 滚动缓冲（10000 行）
+                随切 tab 丢失；xterm 在 display:none 期间仍积累写入，ResizeObserver 在
+                显示时重新 fit 尺寸 */}
+            <div
+              className="col"
+              style={{ flex: 1, minWidth: 0, minHeight: 0, display: activeTab === 'terminal' ? 'flex' : 'none' }}
+            >
+              <TerminalPane />
+            </div>
           </div>
-        </div>
+        )}
 
         {!settings.panels.rightCollapsed && (
           <>
+            {!settings.panels.centerCollapsed && (
+              <div
+                className="splitter"
+                title="拖动调整 AI 面板宽度"
+                onMouseDown={() => startDrag('right')}
+              />
+            )}
             <div
-              className="splitter"
-              title="拖动调整 AI 面板宽度"
-              onMouseDown={() => startDrag('right')}
-            />
-            <div className="panel-side-container" style={{ width: rightW }}>
+              className="panel-side-container"
+              style={{
+                width: settings.panels.centerCollapsed ? undefined : rightW,
+                flex: settings.panels.centerCollapsed ? 1 : undefined,
+                minWidth: 0
+              }}
+            >
               <AgentPanel onOpenSettings={() => setSettingsOpen(true)} />
             </div>
           </>
@@ -530,6 +620,8 @@ export function App(): ReactNode {
       </div>
 
       <GateDialog />
+      {/* v2.7：结构化提问 / 计划模式方案评审 —— 与闸门同样会打断界面，但语义是「收集内容」 */}
+      <QuestionDialog />
       {settingsOpen ? <SettingsDialog onClose={() => setSettingsOpen(false)} /> : null}
     </div>
   )

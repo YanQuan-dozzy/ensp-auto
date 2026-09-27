@@ -26,6 +26,8 @@ export interface TopoNodeData {
   /** 各方向是否有连线在使用（undefined = 全部隐藏，悬停显示） */
   used?: { left: boolean; right: boolean; top: boolean; bottom: boolean }
   editing?: boolean
+  /** F11：正在回放的步骤对应的设备（描边发光强调） */
+  highlight?: boolean
   commitRename?: (name: string) => void
   cancelRename?: () => void
   [key: string]: unknown
@@ -209,7 +211,7 @@ export function TopoNode(props: NodeProps): ReactNode {
   }
   return (
     <div
-      className="topo-node"
+      className={`topo-node${data.highlight ? ' highlight' : ''}`}
       style={{
         borderColor: selected ? 'var(--accent)' : color,
         background: 'linear-gradient(160deg, var(--bg-elevated), var(--bg-surface))'
@@ -265,14 +267,23 @@ export function TopoNode(props: NodeProps): ReactNode {
 
 export const TopoNodeMemo = memo(TopoNode)
 
-export const toFlowNodes = (nodes: TopologyNode[]): Node[] =>
+export const toFlowNodes = (
+  nodes: TopologyNode[],
+  /** F11：回放当前步骤操作的设备 id；不传 = 与旧行为一致（无高亮） */
+  highlightDeviceId?: string | null
+): Node[] =>
   nodes.map((n, i) => ({
     id: n.id,
     position: {
       x: Number.isFinite(n.x) ? (n.x as number) : ((i % 4) * 240 + 40),
       y: Number.isFinite(n.y) ? (n.y as number) : (Math.floor(i / 4) * 130 + 40)
     },
-    data: { label: n.name, role: n.role, ...(n.model ? { model: n.model } : {}) },
+    data: {
+      label: n.name,
+      role: n.role,
+      ...(n.model ? { model: n.model } : {}),
+      ...(highlightDeviceId && n.deviceId === highlightDeviceId ? { highlight: true } : {})
+    },
     type: 'topo'
   }))
 

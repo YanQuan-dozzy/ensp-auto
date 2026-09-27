@@ -137,11 +137,11 @@ test('T2.4 migrateDirectory：源与目标相同 → 空操作，不假报拷贝
 
 // ———————————————————— T2.2 storage 设置项真的落盘（R16） ————————————————————
 
-test('T2.2 sanitizeStorageSettings：三个子目录能改、空串恢复默认、未提供保持原值', () => {
-  const cur = { userDataDir: 'D:\\data', exportsDir: '', attachmentsDir: '', snapshotsDir: '' }
+test('T2.2 sanitizeStorageSettings：受管子目录能改、空串恢复默认、未提供保持原值', () => {
+  const cur = { userDataDir: 'D:\\data', exportsDir: '', attachmentsDir: '', snapshotsDir: '', topologyDir: '' }
 
   const set = sanitizeStorageSettings(
-    { exportsDir: 'E:\\exp', attachmentsDir: ' E:\\att ', snapshotsDir: 'E:\\snap' },
+    { exportsDir: 'E:\\exp', attachmentsDir: ' E:\\att ', snapshotsDir: 'E:\\snap', topologyDir: ' E:\\topos ' },
     cur
   )
   assert.deepEqual(set, {
@@ -149,19 +149,24 @@ test('T2.2 sanitizeStorageSettings：三个子目录能改、空串恢复默认�
     exportsDir: 'E:\\exp',
     // 去空白：界面回显与实际生效的值必须一致，否则用户看到的路径是假的
     attachmentsDir: 'E:\\att',
-    snapshotsDir: 'E:\\snap'
+    snapshotsDir: 'E:\\snap',
+    topologyDir: 'E:\\topos'
   })
 
   const reset = sanitizeStorageSettings({ exportsDir: '' }, set)
   assert.equal(reset.exportsDir, '', '空串 = 恢复默认')
   assert.equal(reset.attachmentsDir, 'E:\\att', '只动传进来的那个键')
+  assert.equal(reset.topologyDir, 'E:\\topos', '未动键保持原值')
+
+  const resetTopo = sanitizeStorageSettings({ topologyDir: '' }, set)
+  assert.equal(resetTopo.topologyDir, '', 'topologyDir 也能恢复默认')
 
   const untouched = sanitizeStorageSettings({}, set)
   assert.deepEqual(untouched, set)
 })
 
 test('T2.2 sanitizeStorageSettings：userDataDir 不接受渲染层改写（唯一真相源是 bootstrap）', () => {
-  const cur = { userDataDir: 'D:\\data', exportsDir: '', attachmentsDir: '', snapshotsDir: '' }
+  const cur = { userDataDir: 'D:\\data', exportsDir: '', attachmentsDir: '', snapshotsDir: '', topologyDir: '' }
   const out = sanitizeStorageSettings({ userDataDir: 'E:\\hijack' }, cur)
   assert.equal(out.userDataDir, 'D:\\data', '改数据目录必须走 app:change-user-data-dir（要重启+迁移）')
 })

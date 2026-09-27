@@ -1,6 +1,8 @@
 import { createModels, createProvider, type MutableModels, type Provider } from '@earendil-works/pi-ai'
 import { openAICompletionsApi } from '@earendil-works/pi-ai/api/openai-completions.lazy'
 import { COMPAT_PROVIDERS, isCompatProvider, type CompatProvider, type LlmProvider } from '@shared/providers'
+import { thinkingLevelMap } from '@shared/model-thinking'
+import type { ReasoningEffort } from '@shared/types'
 
 /**
  * 按设置装配 pi-ai 的 Models 集合（多 provider 的单一装配点）。
@@ -22,6 +24,21 @@ export interface LLMSettings {
   baseUrl: string
   model: string
   apiKey: string
+  /** 逐档的上下文窗口（token）；缺省用兼容线的保守默认值 */
+  contextWindow?: number
+  /** 逐档的输出上限（token） */
+  maxOutputTokens?: number
+  /** 该档是否支持图片输入（决定模型元数据里的 input 能力声明） */
+  supportsImage?: boolean
+  /**
+   * 思考能力（来自 shared/model-thinking.ts 的能力表）。
+   *
+   * 为什么不让装配层自己判断：pi-ai 只在 `model.reasoning` 为真时才会走各家的思考分支，
+   * 而「能不能关 / 支持哪几档」是逐模型的事实，必须由能力表一处给出。
+   */
+  thinking?: 'toggle' | 'always' | 'none'
+  /** 该模型支持的强度档位（空数组 = 只有开关，没有强度参数） */
+  thinkingEfforts?: readonly ReasoningEffort[]
 }
 
 export interface LLMHandle {
@@ -29,6 +46,10 @@ export interface LLMHandle {
   provider: string
   modelId: string
 }
+
+/** 兼容线的兜底窗口与输出上限：用户没填时用这两个值，与档案默认值保持一致 */
+const DEFAULT_CONTEXT_WINDOW = 256000
+const DEFAULT_MAX_TOKENS = 16000
 
 const BUILTIN_FACTORIES: Record<'openai' | 'anthropic' | 'google', () => Promise<Provider>> = {
   openai: () => import('@earendil-works/pi-ai/providers/openai').then((m) => m.openaiProvider()),
@@ -50,6 +71,9 @@ async function buildCompat(settings: LLMSettings): Promise<LLMHandle> {
   const preset = COMPAT_PROVIDERS[provider]
   const baseUrl = (settings.baseUrl || preset.defaultBaseUrl).trim()
   const models = createModels()
+  // 只有模型确实有思考能力时才声明 reasoning —— pi 的思考分支以此为开关；
+  // 未核实的服务商（custom 等）保持 false，请求里不会多出任何思考字段
+  const supportsThinking = settings.thinking === 'toggle' || settings.thinking === 'always'
   const p = createProvider({
     id: 'compat',
     name: preset.label,
@@ -68,11 +92,23 @@ async function buildCompat(settings: LLMSettings): Promise<LLMHandle> {
         api: 'openai-completions',
         provider: 'compat',
         baseUrl,
-        reasoning: false,
-        input: ['text'],
+        reasoning: supportsThinking,
+        ...(supportsThinking
+          ? {
+              // 逐档声明：不支持的档位写 null，pi 的 clamp 才会真的拦住它们
+              thinkingLevelMap: thinkingLevelMap({
+                thinking: settings.thinking === 'always' ? 'always' : 'toggle',
+                efforts: settings.thinkingEfforts ?? [],
+                defaultEffort: 'high',
+                sampling: true,
+                note: ''
+              })
+            }
+          : {}),
+        input: settings.supportsImage ? ['text', 'image'] : ['text'],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 262144,
-        maxTokens: 16384
+        contextWindow: Math.max(1000, settings.contextWindow ?? DEFAULT_CONTEXT_WINDOW),
+        maxTokens: Math.max(256, settings.maxOutputTokens ?? DEFAULT_MAX_TOKENS)
       }
     ],
     api: openAICompletionsApi()

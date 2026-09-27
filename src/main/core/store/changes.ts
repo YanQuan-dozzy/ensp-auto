@@ -1,6 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import type { DeviceId, Expectation } from '@shared/types'
+import type { ChangeKind, ChangeRecord, DeviceId } from '@shared/types'
 import {
   describeShapeWarning,
   isFiniteNumber,
@@ -17,28 +17,11 @@ import { atomicWriteJsonSync } from '../fs/atomic'
  * 每设备只保留最近 MAX_PER_DEVICE 条，避免无限增长。
  *
  * v0.2 的写入者只有 Agent 路径，actor 固定为 'agent'，字段为将来扩展预留。
+ * F6（2026-09-26）：记录形状上提到 `@shared/types`，渲染层的变更时间线直接消费同一份类型；
+ * `recent()` 提供跨设备的时间线视图（原 `list()` 只能按设备查）。
  */
 
-export type ChangeKind = 'apply' | 'restore' | 'save'
-export type ChangeResult = 'ok' | 'failed' | 'rejected' | 'blocked'
-
-export interface ChangeRecord {
-  id: string
-  deviceId: DeviceId
-  at: number
-  kind: ChangeKind
-  /** v0.2 只有代理通道；用户手动操作通道预留 */
-  actor: 'agent' | 'user'
-  /** 本次变更依据的快照（apply 前自动采集 / restore 的目标快照） */
-  snapshotId?: string
-  description: string
-  commands?: string[]
-  expectation?: Expectation
-  result: ChangeResult
-  /** apply 流程里的期望校验结果 */
-  verified?: boolean
-  error?: { code: string; message: string }
-}
+export type { ChangeKind, ChangeRecord } from '@shared/types'
 
 interface IndexFile {
   version: 1
@@ -46,6 +29,9 @@ interface IndexFile {
 }
 
 const MAX_PER_DEVICE = 200
+
+/** 变更时间线一次最多回传的条数（防止把整个索引灌进渲染层） */
+export const MAX_TIMELINE_ITEMS = 500
 
 const CHANGE_KINDS: readonly ChangeKind[] = ['apply', 'restore', 'save']
 
@@ -134,8 +120,55 @@ export class ChangeStore {
     return this.index.items.filter((i) => i.deviceId === deviceId)
   }
 
+  /**
+   * 跨设备的变更时间线（F6）：全部设备按时间倒序，取最近 limit 条。
+   *
+   * `items` 在 `add()` 里是 unshift 进数组的，天然按时间倒序，这里只需截断。
+   */
+  recent(limit = MAX_TIMELINE_ITEMS): ChangeRecord[] {
+    const n = Number.isFinite(limit) ? Math.max(1, Math.min(MAX_TIMELINE_ITEMS, Math.floor(limit))) : MAX_TIMELINE_ITEMS
+    return this.index.items.slice(0, n)
+  }
+
   latest(deviceId: DeviceId): ChangeRecord | undefined {
     return this.list(deviceId)[0]
+  }
+
+  /**
+   * 删除单条变更记录（列表里的「删除」）。
+   *
+   * 为什么变更记录可以删而会话树不行：它是**审计流水**，删掉只影响「回看历史」，
+   * 不影响任何设备状态或对话上下文；而时间线越长越难读，用户需要能清理噪声条目。
+   * 写盘失败回滚内存（与 `add()` 同款理由：界面上删了、磁盘上还在，重启就回弹）。
+   *
+   * @returns 是否真的删掉了一条（id 不存在返回 false，不抛错）
+   */
+  remove(id: string): boolean {
+    const before = this.index.items.slice()
+    const next = before.filter((i) => i.id !== id)
+    if (next.length === before.length) return false
+    this.index.items = next
+    try {
+      this.persist()
+    } catch (e) {
+      this.index.items = before
+      throw e
+    }
+    return true
+  }
+
+  /** 清空全部变更记录，返回清掉的条数。同样写失败回滚内存。 */
+  clear(): number {
+    const before = this.index.items
+    if (before.length === 0) return 0
+    this.index.items = []
+    try {
+      this.persist()
+    } catch (e) {
+      this.index.items = before
+      throw e
+    }
+    return before.length
   }
 
   private prune(deviceId: DeviceId): void {

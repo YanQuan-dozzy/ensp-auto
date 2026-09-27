@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import type { Device } from '@shared/types'
 import { deriveTopology, type TopologyProbe } from '../core/topology/fromNeighbors'
-import { readTopoFile } from '../core/topology/fromProjectFile'
+import { readTopoFile, MAX_TOPO_FILE_BYTES } from '../core/topology/fromProjectFile'
 import { findTopologyFiles, type FindTopologyResult } from '../core/topology/findFiles'
 import { writeTopoFile } from '../core/topology/toProjectFile'
 import { launchTopologyFile, resolveEnspExe } from '../core/ensp/launcher'
@@ -41,25 +41,32 @@ export function probesFromSessions(
 export const getTopology: ToolSpec<Record<string, never>> = {
   name: 'get_topology',
   description:
-    '读取当前网络拓扑（结构化数据：设备节点、角色、链路与端口标签）。' +
-    '拓扑来自实采推导与手动补画的合并结果。需要了解设备间连接关系时先用本工具。',
+    '读取当前网络拓扑（结构化数据：设备节点、角色、链路与端口标签、活动文件路径及拓扑工程目录）。' +
+    '拓扑来自当前导入工程或实采推导。需要了解设备间连接关系或当前拓扑文件时先用本工具。',
   risk: 'read',
   scope: 'device',
   schema: Type.Object({}),
   summarize: (_args, result) => {
-    const t = result.data as Topology | undefined
-    return `拓扑：${t?.nodes?.length ?? 0} 节点 / ${t?.links?.length ?? 0} 链路`
+    const t = result.data as (Topology & { activeFilePath?: string | null; topologyDir?: string }) | undefined
+    return `拓扑：${t?.nodes?.length ?? 0} 节点 / ${t?.links?.length ?? 0} 链路${t?.activeFilePath ? `（来自 ${path.basename(t.activeFilePath)}）` : ''}`
   },
   handler: async (_args, ctx) => {
     const t0 = Date.now()
     const t = ctx.topology.snapshot()
+    const activeFilePath = ctx.topology.fileSourcePath
+    const topologyDir = ctx.settings.storage?.topologyDir || ''
     if (!t.nodes.length && !t.links.length) {
       return ok(
-        { ...emptyTopology(), hint: '拓扑为空，可用 refresh_topology 从已连接设备实采推导' },
+        {
+          ...emptyTopology(),
+          activeFilePath,
+          topologyDir,
+          hint: '拓扑为空，可用 refresh_topology 从已连接设备实采推导'
+        },
         { ms: Date.now() - t0 }
       )
     }
-    return ok(t, { ms: Date.now() - t0 })
+    return ok({ ...t, activeFilePath, topologyDir }, { ms: Date.now() - t0 })
   }
 }
 
@@ -97,15 +104,16 @@ export const findTopologyFilesTool: ToolSpec<{
 }> = {
   name: 'find_topology_files',
   description:
-    '在本机查找 eNSP 工程文件（.topo）：缺省扫描桌面/文档/下载，也可指定目录。' +
+    '在本机查找 eNSP 工程文件（.topo）：若配置了拓扑工程目录则首选该目录，缺省亦扫描桌面/文档/下载，也可指定 directory 扫描特定路径。' +
     '返回结构化候选列表（路径、来源、修改时间、是否当前活动拓扑）。' +
-    '不知道拓扑在哪里时优先用本工具定位，再配合 import_topology_file 导入。',
+    '仅在用户明确要求查找/查看拓扑文件或协助定位时使用，严禁自主盲目自动导入！',
   risk: 'read',
   scope: 'local',
+  concurrencySafe: true,
   schema: Type.Object(
     {
       directory: Type.Optional(
-        Type.String({ description: '限定搜索的目录；缺省扫描桌面/文档/下载' })
+        Type.String({ description: '限定搜索的目录；缺省优先搜索配置的拓扑工程目录及桌面/文档/下载' })
       ),
       maxDepth: Type.Optional(
         Type.Integer({
@@ -126,11 +134,13 @@ export const findTopologyFilesTool: ToolSpec<{
   handler: async (args, ctx) => {
     const t0 = Date.now()
     const directory = (args.directory ?? '').trim()
+    const configuredDir = ctx.settings.storage?.topologyDir?.trim() || undefined
     if (directory && (path.extname(directory) || !fs.existsSync(directory) || !fs.statSync(directory).isDirectory())) {
       return fail('BAD_PARAM', `目录不存在或不是目录：${directory}`, { ms: Date.now() - t0 })
     }
     const result = findTopologyFiles({
       ...(directory ? { directory } : {}),
+      topologyDir: configuredDir,
       activePath: ctx.topology.fileSourcePath,
       // v1.8：maxDepth 显式收敛（原实现默认 4 层，指定目录扫描大型目录树仍可能很慢）
       ...(args.maxDepth !== undefined ? { maxDepth: args.maxDepth } : { maxDepth: 3 }),
@@ -147,9 +157,10 @@ export const findTopologyFilesTool: ToolSpec<{
 export const importTopologyFile: ToolSpec<{ path: string }> = {
   name: 'import_topology_file',
   description:
-    '解析 eNSP 工程文件（.topo）作为拓扑的第一来源并保存：设备（name/model/坐标/com_port）与接口链路。' +
-    '与 LLDP 实采、画布手补三层降级合并，文件最权威。返回拓扑与解析结构报告（设备/链路数、警告）。',
-  risk: 'read',
+    '导入并替换当前拓扑画布为指定的 eNSP 工程文件（.topo）：设备（name/model/坐标/com_port）与接口链路。' +
+    '会更新当前拓扑并隔离重置上一工程数据。' +
+    '仅在用户明确指定路径或明确指示导入时调用，严禁未经用户许可擅自导入任何文件！',
+  risk: 'write',
   scope: 'local',
   schema: Type.Object(
     { path: Type.String({ description: '.topo 文件的绝对路径' }) },
@@ -172,14 +183,20 @@ export const importTopologyFile: ToolSpec<{ path: string }> = {
     if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
       return fail('BAD_PARAM', `文件不存在：${resolved}`, { ms: Date.now() - t0 })
     }
+    // v2.13：.topo 是明文 XML 或小体积 gzip，超大文件只可能是误选/攻击载荷；
+    // 不加这道门就是整份 readFileSync + 可能的 gunzip，主进程会被直接撑爆
+    if (fs.statSync(resolved).size > MAX_TOPO_FILE_BYTES) {
+      return fail('BAD_PARAM', `工程文件超过 ${MAX_TOPO_FILE_BYTES / 1024 / 1024} MB 上限，请确认选对了 .topo 文件`, {
+        ms: Date.now() - t0
+      })
+    }
 
     try {
       const { topology, report } = readTopoFile(resolved)
       if (report.devices === 0) {
         return fail('UNKNOWN', `未能从 .topo 中识别设备（${report.warnings[0] ?? '格式未知'}）`, { ms: Date.now() - t0 })
       }
-      ctx.topology.setFile(topology)
-      ctx.topology.setFileSource(resolved)
+      ctx.topology.setFile(topology, resolved)
       return ok({ topology, report, path: resolved }, { ms: Date.now() - t0 })
     } catch (e) {
       return fail('UNKNOWN', `解析 ${path.basename(resolved)} 失败：${e instanceof Error ? e.message : String(e)}`, { ms: Date.now() - t0 })

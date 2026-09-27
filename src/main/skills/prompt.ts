@@ -6,14 +6,72 @@
  * 每个技能 = 名称 + 描述 + 正文，语义上是一段独立的操作手册。
  */
 
+import path from 'node:path'
+
 export interface SkillContent {
   name: string
   description: string
   content: string
+  /** F12：绑定目录（空 / 缺省 = 全局技能，任何上下文都注入） */
+  scope?: string[]
 }
 
 /** 已启用技能注入 system prompt 的总预算（超过即整体丢弃后续技能，见 D14） */
 export const SKILL_PROMPT_MAX_CHARS = 60_000
+
+/**
+ * 目录归一化：统一分隔符、去尾部分隔符、转小写。
+ *
+ * 为什么要转小写：Windows 路径不区分大小写，用户写的 `D:\Lab` 与设置里存出来的
+ * `d:\lab` 是同一个目录；不归一化就会出现「明明绑定了却不注入」这种无从排查的现象。
+ */
+export function normalizeDir(p: string): string {
+  return (p ?? '').trim().replace(/[\\/]+/g, '/').replace(/\/+$/, '').toLowerCase()
+}
+
+/**
+ * F12：绑定目录是否命中当前上下文。
+ *
+ * 判据是**前缀包含**（含相等）：绑定 `D:/lab/ospf` 时，上下文是
+ * `D:/lab/ospf/topo1` 也算命中 —— 实验目录常有子目录，要求精确相等会让绑定形同虚设。
+ * 空 scope = 全局技能，恒命中。
+ */
+export function scopeMatches(
+  scope: readonly string[] | undefined,
+  contextDirs: readonly string[]
+): boolean {
+  const scopes = (scope ?? []).map(normalizeDir).filter(Boolean)
+  if (scopes.length === 0) return true
+  const dirs = contextDirs.map(normalizeDir).filter(Boolean)
+  return scopes.some((s) => dirs.some((d) => d === s || d.startsWith(`${s}/`)))
+}
+
+/** 按当前上下文过滤已启用技能：全局技能恒在，绑定技能仅命中时在 */
+export function skillsForContext<T extends SkillContent>(
+  skills: readonly T[],
+  contextDirs: readonly string[]
+): T[] {
+  return skills.filter((s) => scopeMatches(s.scope, contextDirs))
+}
+
+/**
+ * 从「设置里的拓扑目录」与「当前打开的工程文件」推导上下文目录（去空去重，保序）。
+ *
+ * 取工程文件所在目录而不是文件本身：绑定粒度是目录（一个实验一个目录）。
+ */
+export function contextDirsOf(
+  topologyDir: string,
+  projectFile: string | null | undefined
+): string[] {
+  const out: string[] = []
+  const push = (p: string): void => {
+    const t = (p ?? '').trim()
+    if (t && !out.includes(t)) out.push(t)
+  }
+  push(topologyDir)
+  if (projectFile) push(path.dirname(projectFile))
+  return out
+}
 
 export interface BuildSkillPromptOptions {
   /** 注入总预算；默认 SKILL_PROMPT_MAX_CHARS。为 0 时不注入任何技能 */

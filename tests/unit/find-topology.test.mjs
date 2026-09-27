@@ -103,3 +103,19 @@ test('findTopologyFiles：maxDepth 限制递归', () => {
     fs.rmSync(root, { recursive: true, force: true })
   }
 })
+
+test('findTopologyFiles：topologyDir 优先扫描且结果置顶', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ensp-find-'))
+  const configured = path.join(root, 'my-topos')
+  try {
+    fs.mkdirSync(configured, { recursive: true })
+    fs.writeFileSync(path.join(configured, 'target.topo'), '<topo/>')
+    const r = findTopologyFiles({ topologyDir: configured })
+    assert.ok(r.count >= 1)
+    const target = r.candidates.find((c) => c.name === 'target.topo')
+    assert.ok(target, '应找到配置目录中的拓扑')
+    assert.equal(r.candidates[0].name, 'target.topo', '配置目录中的候选应排在首位')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})

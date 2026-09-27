@@ -251,7 +251,7 @@ function baseDeps(overrides = {}) {
         activeProfileId: 'p-test',
         systemPrompt: ''
       },
-      panels: { left: 240, right: 380, leftCollapsed: false, rightCollapsed: false },
+      panels: { left: 240, right: 380, leftCollapsed: false, rightCollapsed: false, centerCollapsed: false },
       mcp: { enabled: false, port: 49150, servers: [], exposeToAgent: true },
       ensp: { exePath: '' }
     },

@@ -1,4 +1,5 @@
 import type { Device } from '@shared/types'
+import { maxParallelOf, runGroupedBounded } from '@shared/concurrency'
 import { fail, failFromCommand, ok, Type, type ToolSpec } from './registry'
 import {
   hasDhcpConfig,
@@ -35,6 +36,7 @@ export const verifyPing: ToolSpec<{ from: string; target: string }> = {
     '（reachable / unreachable / unknown）。用于验证实验拓扑连通性（如 pc_connectivity）。',
   risk: 'read',
   scope: 'device',
+  concurrencySafe: true,
   schema: Type.Object(
     {
       from: Type.String({ description: '源设备 ID，形如 127.0.0.1:2008' }),
@@ -107,28 +109,35 @@ export const verifyConnectivity: ToolSpec<{ deviceIds?: string[] }> = {
     }
 
     const report: Array<Record<string, unknown>> = []
-    for (const s of sessions) {
-      const r = await s.exec('display interface brief', {
-        timeoutMs: 12000,
-        ...(ctx.signal ? { signal: ctx.signal } : {})
-      })
-      if (!r.ok) {
-        report.push({ deviceId: s.id, name: s.name, error: r.error ?? '命令执行失败', verdict: 'error' })
-        continue
-      }
-      const rows = parseInterfaceBrief(r.clean)
-      const up = rows.filter((x) => x.phy === 'up' && x.protocol === 'up').length
-      const down = rows.filter((x) => x.phy === 'down' || x.protocol === 'down').length
-      report.push({
-        deviceId: s.id,
-        name: s.name,
-        up,
-        down,
-        count: rows.length,
-        verdict: up > 0 ? 'up' : rows.length === 0 ? 'no-interfaces' : 'down',
-        interfaces: rows.slice(0, 48)
-      })
-    }
+    // v2.5：跨设备并发（同设备只回一条 display interface brief，天然没有设备内并发）
+    const perDevice = await runGroupedBounded(
+      sessions,
+      (s) => s.id,
+      maxParallelOf(ctx.settings),
+      async (s): Promise<Record<string, unknown>> => {
+        const r = await s.exec('display interface brief', {
+          timeoutMs: 12000,
+          ...(ctx.signal ? { signal: ctx.signal } : {})
+        })
+        if (!r.ok) {
+          return { deviceId: s.id, name: s.name, error: r.error ?? '命令执行失败', verdict: 'error' }
+        }
+        const rows = parseInterfaceBrief(r.clean)
+        const up = rows.filter((x) => x.phy === 'up' && x.protocol === 'up').length
+        const down = rows.filter((x) => x.phy === 'down' || x.protocol === 'down').length
+        return {
+          deviceId: s.id,
+          name: s.name,
+          up,
+          down,
+          count: rows.length,
+          verdict: up > 0 ? 'up' : rows.length === 0 ? 'no-interfaces' : 'down',
+          interfaces: rows.slice(0, 48)
+        }
+      },
+      ctx.signal
+    )
+    for (const row of perDevice) if (row) report.push(row)
 
     const upCount = report.filter((r) => r.verdict === 'up').length
     return ok(
@@ -149,6 +158,7 @@ export const verifyDhcp: ToolSpec<{ server: string }> = {
     '的名称/网段/起始结束地址/总地址与已用地址。返回判定 configured / partial / not-configured。',
   risk: 'read',
   scope: 'device',
+  concurrencySafe: true,
   schema: Type.Object(
     { server: Type.String({ description: 'DHCP 服务器设备 ID（通常为核心交换机/路由器）' }) },
     { additionalProperties: false }
@@ -206,6 +216,7 @@ export const verifyRoute: ToolSpec<{ deviceId: string; destination?: string }> =
     '不指定则返回路由总数与路由摘要。用于验证静态路由/OSPF/RIP 是否收敛。',
   risk: 'read',
   scope: 'device',
+  concurrencySafe: true,
   schema: Type.Object(
     {
       deviceId: Type.String({ description: '设备 ID，形如 127.0.0.1:2008' }),
@@ -268,6 +279,7 @@ export const verifyArp: ToolSpec<{ deviceId: string; ip?: string }> = {
     '检查设备 ARP 表（display arp）：可指定 IP 判断是否学到 MAC（即邻居可达）；不指定则返回 MAC 条目数与摘要。',
   risk: 'read',
   scope: 'device',
+  concurrencySafe: true,
   schema: Type.Object(
     {
       deviceId: Type.String({ description: '设备 ID，形如 127.0.0.1:2008' }),
@@ -314,6 +326,7 @@ export const verifyNat: ToolSpec<{ deviceId: string }> = {
     '判定 configured（有任一 NAT 配置）/ not-configured。用于验证 acl_nat 任务效果。',
   risk: 'read',
   scope: 'device',
+  concurrencySafe: true,
   schema: Type.Object(
     { deviceId: Type.String({ description: '设备 ID（出口路由器）' }) },
     { additionalProperties: false }
@@ -359,6 +372,7 @@ export const verifyEthTrunk: ToolSpec<{ deviceId: string; trunkId?: number }> = 
     '判定 up（运行状态 up）/ down / absent（未配置）。用于验证 eth_trunk 任务效果。',
   risk: 'read',
   scope: 'device',
+  concurrencySafe: true,
   schema: Type.Object(
     {
       deviceId: Type.String({ description: '设备 ID（交换机/路由器）' }),

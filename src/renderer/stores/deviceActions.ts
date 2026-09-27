@@ -16,6 +16,7 @@ export function deviceActions(
   | 'connect'
   | 'connectSsh'
   | 'connectAll'
+  | 'clearScanError'
   | 'disconnect'
   | 'rename'
   | 'forgetDevice'
@@ -55,6 +56,14 @@ export function deviceActions(
       } catch (e) {
         set({ scanError: e instanceof Error ? e.message : String(e) })
       }
+    },
+
+    /**
+     * v2.21：只清提示，不重试任何操作。
+     * 扫描 / 连接的失败提示会一直挂在设备列表上方，看完即弃；用户点别处时收掉。
+     */
+    clearScanError() {
+      set({ scanError: null })
     },
 
     /** v2.0：SSH 连接（已存凭据或直接填主机与认证）；成功后聚焦到终端。错误上抛由调用方展示 */

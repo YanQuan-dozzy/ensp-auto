@@ -14,8 +14,8 @@ export const DEFAULT_SHORTCUTS: ShortcutItem[] = [
     name: '打开/关闭设置',
     desc: '快速呼出或关闭应用设置对话框',
     category: '全局',
-    keys: ['Ctrl', ','],
-    keyDisplay: 'Ctrl+,',
+    keys: ['Ctrl', 'Alt', 'S'],
+    keyDisplay: 'Ctrl+Alt+S',
     scope: '全局'
   },
   {
@@ -34,6 +34,15 @@ export const DEFAULT_SHORTCUTS: ShortcutItem[] = [
     category: '工作台',
     keys: ['Ctrl', 'Shift', 'B'],
     keyDisplay: 'Ctrl+Shift+B',
+    scope: '全局'
+  },
+  {
+    id: 'workbench:toggle-center',
+    name: '切换中间拓扑画布',
+    desc: '展开或折叠中间拓扑画布工作区',
+    category: '工作台',
+    keys: ['Ctrl', 'Alt', 'B'],
+    keyDisplay: 'Ctrl+Alt+B',
     scope: '全局'
   },
   {
@@ -138,6 +147,36 @@ export function getEffectiveShortcuts(
   return map
 }
 
+/**
+ * 作用域为「输入框」的快捷键 —— 它们服务的是 AI 指令输入框，
+ * 终端里的同名按键必须原样留给 xterm（不能当成全局快捷键放行）。
+ *
+ * 事故背景（2026-09-25）：`agent:send` 绑的是**裸 Enter**（scope='输入框'），
+ * 而终端面板放行按键时过去不区分作用域，于是用户在终端里按回车 →
+ * xterm 被要求「不要处理这个键」→ onData 不触发 → 回车永远发不出去，
+ * 终端表现为「能打字、按回车没反应、命令执行不了」。
+ * Shift+Enter（agent:newline）同理被吞掉。
+ */
+export const INPUT_SCOPED_SHORTCUT_IDS: ReadonlySet<string> = new Set(
+  DEFAULT_SHORTCUTS.filter((s) => s.scope === '输入框').map((s) => s.id)
+)
+
+/**
+ * 终端面板应当「放行给应用」的快捷键表。
+ *
+ * 与 getEffectiveShortcuts 的唯一区别：剔除输入框作用域的项。
+ * 终端里 Enter 是提交命令行，不能被 AI 输入框的「发送」绑定占用。
+ */
+export function terminalPassthroughShortcuts(
+  customShortcuts?: Record<string, string[]>
+): Record<string, string[]> {
+  const out: Record<string, string[]> = {}
+  for (const [id, keys] of Object.entries(getEffectiveShortcuts(customShortcuts))) {
+    if (!INPUT_SCOPED_SHORTCUT_IDS.has(id)) out[id] = keys
+  }
+  return out
+}
+
 /** 将按键数组格式化为可读字符串（如 'Ctrl+Shift+B'） */
 export function formatKeys(keys: string[]): string {
   return keys.join('+')
@@ -179,11 +218,11 @@ export function matchesShortcut(e: KeyboardEvent, keys: string[]): boolean {
   if (upperMain === 'ENTER') {
     return key === 'Enter' || code === 'Enter'
   }
-  if (main === ',') {
-    return key === ',' || code === 'Comma'
+  if (main === ',' || main === '，') {
+    return key === ',' || key === '，' || code === 'Comma'
   }
-  if (main === '.') {
-    return key === '.' || code === 'Period'
+  if (main === '.' || main === '。') {
+    return key === '.' || key === '。' || code === 'Period'
   }
   if (upperMain.startsWith('F') && /^F\d+$/i.test(upperMain)) {
     return key.toUpperCase() === upperMain || code.toUpperCase() === upperMain
@@ -215,6 +254,8 @@ export function eventToKeys(e: KeyboardEvent): string[] | null {
   if (e.key === 'Escape') main = 'Esc'
   else if (e.key === 'Enter') main = 'Enter'
   else if (e.key === ' ') main = 'Space'
+  else if (e.key === '，') main = ','
+  else if (e.key === '。') main = '.'
   else if (e.key.length === 1) main = e.key.toUpperCase()
 
   // 必须包含非修饰键主体

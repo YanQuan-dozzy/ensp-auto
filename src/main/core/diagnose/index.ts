@@ -1,9 +1,10 @@
 import fs from 'node:fs'
 import net from 'node:net'
 import path from 'node:path'
-import type { DiagCheck, DiagReport, Settings } from '@shared/types'
+import type { DiagCheck, DiagReport, ModelProfile, Settings } from '@shared/types'
 import { ENSP_SOURCE_LABEL } from '@shared/types'
 import { activeProfile } from '@shared/profiles'
+import type { ProfileTestResult } from '@shared/api'
 import { locateEnsp } from '../ensp/launcher'
 import { buildProbePlan, classifyHttpStatus, classifyNetworkError } from './probe'
 
@@ -76,23 +77,49 @@ async function checkApiKey(deps: DiagDeps): Promise<DiagCheck> {
 
 async function checkLlmEndpoint(deps: DiagDeps): Promise<DiagCheck> {
   const base = { id: 'llm-endpoint' as const, label: '模型端点' }
-  if (!deps.apiKey) {
-    return { ...base, level: 'skipped', detail: '未配置密钥，跳过网络探活', hint: '填入 API Key 后可自动验证端点与模型名。' }
-  }
 
   // v1.5：探活的对象是「当前活跃档案」，与代理实际发请求用的一致
   const a = activeProfile(deps.settings.agent)
-  const plan = buildProbePlan({
-    provider: a.provider,
-    baseUrl: a.baseUrl,
-    model: a.model,
-    apiKey: deps.apiKey
-  })
-  if (!plan.ok) {
-    return { ...base, level: 'fail', detail: plan.detail, hint: plan.hint }
+  const r = await probeModelEndpoint({ profile: a, apiKey: deps.apiKey, ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}) })
+  return {
+    ...base,
+    level: r.level,
+    detail: r.detail,
+    ...(r.hint ? { hint: r.hint } : {}),
+    ...(r.ms !== undefined ? { ms: r.ms } : {})
+  }
+}
+
+/**
+ * 对「一档模型配置」做一次真实探活（端点 + 密钥 + 模型名三件事一起验）。
+ *
+ * 抽成独立函数是因为它有两个调用方：环境体检（活跃档案）与设置 → 模型管理页
+ * 每行右侧的「测试」按钮（任意一档）。两处必须是同一次探测、同一套结论文案，
+ * 否则用户会以为「体检通过但测试失败」是应用在自相矛盾。
+ */
+export async function probeModelEndpoint(input: {
+  profile: ModelProfile
+  apiKey: string | null
+  fetchImpl?: typeof fetch
+}): Promise<ProfileTestResult> {
+  const { profile, apiKey } = input
+  if (!apiKey) {
+    return {
+      level: 'skipped',
+      detail: '未配置密钥，跳过网络探活',
+      hint: '填入 API Key 后可自动验证端点与模型名。'
+    }
   }
 
-  const doFetch = deps.fetchImpl ?? fetch
+  const plan = buildProbePlan({
+    provider: profile.provider,
+    baseUrl: profile.baseUrl,
+    model: profile.model,
+    apiKey
+  })
+  if (!plan.ok) return { level: 'fail', detail: plan.detail, hint: plan.hint }
+
+  const doFetch = input.fetchImpl ?? fetch
   const t0 = Date.now()
   try {
     const res = await doFetch(plan.url, {
@@ -105,14 +132,13 @@ async function checkLlmEndpoint(deps: DiagDeps): Promise<DiagCheck> {
     const body = await res.text().catch(() => '')
     const verdict = classifyHttpStatus(res.status, body)
     return {
-      ...base,
       level: verdict.level,
-      detail: verdict.level === 'ok' ? `通过 ${ms}ms · ${a.model}` : verdict.detail,
+      detail: verdict.level === 'ok' ? `通过 ${ms}ms · ${profile.model}` : verdict.detail,
       ...(verdict.hint ? { hint: verdict.hint } : {}),
       ms
     }
   } catch (e) {
-    return { ...base, ...classifyNetworkError(e), ms: Date.now() - t0 }
+    return { ...classifyNetworkError(e), ms: Date.now() - t0 }
   }
 }
 

@@ -420,6 +420,7 @@ export const verifyExpectation: ToolSpec<{
     '可选重试等待协议收敛。用于变更后的状态验证。',
   risk: 'read',
   scope: 'device',
+  concurrencySafe: true,
   schema: Type.Object(
     {
       deviceId: Type.String({ description: '设备 ID' }),

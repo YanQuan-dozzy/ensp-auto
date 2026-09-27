@@ -51,7 +51,12 @@ if ($node) { Say ("Node " + (node -v)) 'Green' }
 $env:ELECTRON_MIRROR = 'https://npmmirror.com/mirrors/electron/'
 
 # ---- 3. 缺依赖 / 缺二进制才安装 ----
-$ElectronExe = Join-Path $Root 'node_modules\electron\dist\electron.exe'
+# 优先用补丁产物 eNSPAuto.exe（tools/patch-electron-exe.cjs 产出）：任务栏名称
+# 回退取进程映像名，electron.exe 会显示 "Electron"，eNSPAuto.exe 显示 "eNSPAuto"。
+$ElectronExe = Join-Path $Root 'node_modules\electron\dist\eNSPAuto.exe'
+if (-not (Test-Path $ElectronExe)) {
+  $ElectronExe = Join-Path $Root 'node_modules\electron\dist\electron.exe'
+}
 $NeedInstall = $false
 if (-not (Test-Path (Join-Path $Root 'node_modules'))) {
   $NeedInstall = $true
@@ -146,10 +151,11 @@ if (-not (Test-Path $OutMain)) {
 }
 
 # ---- 7. 创建快捷方式并经快捷方式启动（任务栏显示 eNSPAuto 而非 Electron）----
-# 原理（对标 Boss-claw）：任务栏按钮的名称/图标取自「启动该进程的快捷方式(.lnk)」。
-# 直接跑 electron.exe 时 Windows 会显示 exe 自带元数据（Electron/eNSPAuto 默认图标），
-# 因此先在 %LOCALAPPDATA%\eNSPAuto 放置同名快捷方式，再经它拉起 electron.exe，
-# Explorer 即把该窗口关联到「eNSPAuto + app.ico」。
+# 原理：主进程 setAppUserModelId 后，任务栏按钮按「AUMID → 关联快捷方式(.lnk)」解析
+# 名称与图标；找不到就回退 exe 元数据（名称 Electron + Electron 图标）。
+# v2.12 通知修复让主进程声明了 AUMID（cn.enspauto.workbench），但 WScript.Shell 建的
+# .lnk 不带 AUMID → 关联断裂，任务栏身份退回 Electron —— 下方 7.1 补写绑定。
+# NSIS 安装版由 electron-builder 自动给快捷方式写 AUMID，无需本段。
 $ScDir = Join-Path $env:LOCALAPPDATA 'eNSPAuto'
 if (-not (Test-Path $ScDir)) { New-Item -ItemType Directory -Force -Path $ScDir | Out-Null }
 $ScPath = Join-Path $ScDir 'eNSPAuto.lnk'
@@ -170,10 +176,105 @@ try {
   $sc.IconLocation = "$IconPath,0"
   $sc.Description = 'eNSPAuto —— eNSP 网络实验的 AI 代理工作台'
   $sc.Save()
-  (Get-Item $ScPath).LastWriteTime = Get-Date
+
+  # ---- 7.1 给 .lnk 写入 AppUserModelID（必须与 src/main/index.ts 的 APP_ID 一致）----
+  # WScript.Shell 不支持该属性，走 IPropertyStore（PKEY_AppUserModel_ID）写 .lnk 属性流。
+  # 失败不阻断启动（仅告警）——退化为修复前的任务栏显示。
+  $AppAumid = 'cn.enspauto.workbench'
+  try {
+    if (-not ('LnkAumid' -as [type])) {
+      Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class LnkAumid {
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PropertyKey { public Guid fmtid; public uint pid; }
+    [StructLayout(LayoutKind.Explicit)]
+    private struct PropVariant {
+        [FieldOffset(0)] public ushort vt;
+        [FieldOffset(8)] public IntPtr pointerValue;
+    }
+    [ComImport, Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IPropertyStore {
+        [PreserveSig] int GetCount(out uint cProps);
+        [PreserveSig] int GetAt(uint iProp, out PropertyKey pkey);
+        [PreserveSig] int GetValue(ref PropertyKey key, out PropVariant pv);
+        [PreserveSig] int SetValue(ref PropertyKey key, ref PropVariant pv);
+        [PreserveSig] int Commit();
+    }
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode, PreserveSig = false)]
+    private static extern void SHGetPropertyStoreFromParsingName(string pszPath, IntPtr pbc, uint gpsFlags, ref Guid riid, [MarshalAs(UnmanagedType.Interface)] out IPropertyStore ppv);
+    [DllImport("ole32.dll")]
+    private static extern int PropVariantClear(ref PropVariant pv);
+
+    // PKEY_AppUserModel_ID = {9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}, pid 5
+    private static PropertyKey PkeyAumid = new PropertyKey {
+        fmtid = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"), pid = 5
+    };
+
+    public static bool SetLnkAumid(string lnkPath, string aumid) {
+        try {
+            Guid iid = typeof(IPropertyStore).GUID;
+            IPropertyStore store;
+            // GPS_READWRITE(0x1)：SHCreateItemFromParsingName 拿到的是只读存储，
+            // SetValue/Commit 会静默失败 —— 这是此前 AUMID 绑定一直不生效的根因
+            SHGetPropertyStoreFromParsingName(lnkPath, IntPtr.Zero, 0x1, ref iid, out store);
+            PropVariant pv = new PropVariant();
+            try {
+                pv.vt = 31; // VT_LPWSTR
+                pv.pointerValue = Marshal.StringToCoTaskMemUni(aumid);
+                PropertyKey k = PkeyAumid;
+                if (store.SetValue(ref k, ref pv) != 0) return false;
+                return store.Commit() == 0;
+            } finally { PropVariantClear(ref pv); }
+        } catch { return false; }
+    }
+
+    public static string GetLnkAumid(string lnkPath) {
+        try {
+            Guid iid = typeof(IPropertyStore).GUID;
+            IPropertyStore store;
+            // GPS_READWRITE(0x1)：SHCreateItemFromParsingName 拿到的是只读存储，
+            // SetValue/Commit 会静默失败 —— 这是此前 AUMID 绑定一直不生效的根因
+            SHGetPropertyStoreFromParsingName(lnkPath, IntPtr.Zero, 0x1, ref iid, out store);
+            PropertyKey k = PkeyAumid;
+            PropVariant pv;
+            if (store.GetValue(ref k, out pv) != 0) return null;
+            try {
+                if (pv.vt != 31 || pv.pointerValue == IntPtr.Zero) return null;
+                return Marshal.PtrToStringUni(pv.pointerValue);
+            } finally { PropVariantClear(ref pv); }
+        } catch { return null; }
+    }
+}
+'@
+    }
+    if ([LnkAumid]::SetLnkAumid($ScPath, $AppAumid)) {
+      # 写后读回断言，结果进 start.log —— 真机排查有据可查
+      $readback = [LnkAumid]::GetLnkAumid($ScPath)
+      if ($readback -eq $AppAumid) {
+        Say ('快捷方式已绑定 AppUserModelID（' + $AppAumid + '）') 'DarkGray'
+      } else {
+        Say ('警告：AUMID 写入读回不一致：' + $readback) 'Yellow'
+      }
+    } else {
+      Say '警告：.lnk 绑定 AppUserModelID 失败（系统限制）。任务栏名称回退取进程映像名 eNSPAuto，仍正确；通知不受影响' 'Yellow'
+    }
+  } catch {
+    Say ('警告：AppUserModelID 绑定异常：' + $_.Exception.Message) 'Yellow'
+  }
 } catch {
   Fail '创建 eNSPAuto.lnk 快捷方式失败：' + $_.Exception.Message
 }
+
+# ---- 7.2 开始菜单快捷方式（唯一实现见 tools/ensure-shortcut.ps1）----
+# 任务栏按 AUMID 解析名称/图标只搜「开始菜单 + 桌面」；§7 的 .lnk 在 %LOCALAPPDATA%
+# 不在搜索范围，仅「经它启动」时生效。开始菜单放一份同 AUMID 的 .lnk，
+# dev（electron-vite 直拉 electron.exe）与任何绕过启动器的场景都能正确解析身份。
+try {
+  & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root 'tools\ensure-shortcut.ps1')
+} catch { }
 
 Say '快捷方式就绪，启动 eNSPAuto…' 'Green'
 Start-Process -FilePath $ScPath | Out-Null

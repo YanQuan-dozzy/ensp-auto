@@ -8,7 +8,7 @@
 import { useEffect, useState } from 'react'
 import { useApp } from '@/stores/app'
 import { ENSP_SOURCE_LABEL, type EnspLocatePayload } from '@shared/types'
-import { Switch } from '@/components/ui'
+import { Switch, useDismissOnOutside } from '@/components/ui'
 import { Row, Section } from '@/components/settings-kit'
 
 export function IntegrationSettings({ onManage }: { onManage: () => void }) {
@@ -34,6 +34,11 @@ export function IntegrationSettings({ onManage }: { onManage: () => void }) {
   // eNSP 自动检测结果（只在本次打开面板期间有效；落盘的是输入框里的值）
   const [locate, setLocate] = useState<EnspLocatePayload | null>(null)
   const [locating, setLocating] = useState(false)
+  /**
+   * 检测结果的外点关闭：ref 挂在**整块结果**（结论条 + 候选路径折叠）上，而不是只挂结论条 ——
+   * 否则点「查看探测过的 N 个位置」会先被判定为「点了别处」而把要展开的内容一并抹掉。
+   */
+  const locateRef = useDismissOnOutside(locate !== null, () => setLocate(null))
 
   /** 自动检测是只读探测：找到就把路径填进输入框并即时保存 */
   const doLocate = async (): Promise<void> => {
@@ -176,29 +181,31 @@ export function IntegrationSettings({ onManage }: { onManage: () => void }) {
                                   </button>
                                 </div>
                                 {locate ? (
-                                  locate.found ? (
-                                    <div className="banner success">
-                                      检测到：{locate.found}（来源：{ENSP_SOURCE_LABEL[locate.source]}）
-                                    </div>
-                                  ) : (
-                                    <div className="banner danger">
-                                      未找到 eNSP_Client.exe（已探测 {locate.candidates.length}{' '}
-                                      个候选路径），请用「浏览…」指定
-                                    </div>
-                                  )
-                                ) : null}
-                                {locate && locate.candidates.length > 0 ? (
-                                  <details className="cand-details">
-                                    <summary>查看探测过的 {locate.candidates.length} 个位置</summary>
-                                    <ul>
-                                      {locate.candidates.map((c) => (
-                                        <li key={c.path} className={c.exists ? 'hit' : ''}>
-                                          <span className="mono">{c.path}</span>
-                                          <span className="src">{ENSP_SOURCE_LABEL[c.source]}</span>
-                                        </li>
-                                      ))}
-                                    </ul>
-                                  </details>
+                                  <div ref={locateRef}>
+                                    {locate.found ? (
+                                      <div className="banner success">
+                                        检测到：{locate.found}（来源：{ENSP_SOURCE_LABEL[locate.source]}）
+                                      </div>
+                                    ) : (
+                                      <div className="banner danger">
+                                        未找到 eNSP_Client.exe（已探测 {locate.candidates.length}{' '}
+                                        个候选路径），请用「浏览…」指定
+                                      </div>
+                                    )}
+                                    {locate.candidates.length > 0 ? (
+                                      <details className="cand-details">
+                                        <summary>查看探测过的 {locate.candidates.length} 个位置</summary>
+                                        <ul>
+                                          {locate.candidates.map((c) => (
+                                            <li key={c.path} className={c.exists ? 'hit' : ''}>
+                                              <span className="mono">{c.path}</span>
+                                              <span className="src">{ENSP_SOURCE_LABEL[c.source]}</span>
+                                            </li>
+                                          ))}
+                                        </ul>
+                                      </details>
+                                    ) : null}
+                                  </div>
                                 ) : null}
                               </>
                             }

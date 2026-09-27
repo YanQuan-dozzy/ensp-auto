@@ -257,22 +257,34 @@ export function checkClearTarget(roots: ManagedRoots, rawTarget: string): string
 /** 目录类设置项的长度上限（与 ensp.exePath 同一口径） */
 export const MAX_DIR_PATH_LEN = 512
 
-/** 可自定义的三个子目录（userDataDir 走 bootstrap，不在此列，见 validateUserDataTarget） */
-export type CustomDirKey = 'exportsDir' | 'attachmentsDir' | 'snapshotsDir'
+/** 可自定义的受管目录（userDataDir 走 bootstrap，不在此列，见 validateUserDataTarget） */
+export type CustomDirKey = 'exportsDir' | 'attachmentsDir' | 'snapshotsDir' | 'topologyDir'
 
 /**
  * 清洗 storage 设置补丁（IPC 白名单用）。
  *
  * 三条纪律：
- * - 白名单字段：只认 exports/attachments/snapshots 三个子目录；
+ * - 白名单字段：只认 exports/attachments/snapshots/topology 四个子目录；
  * - 空串 = 恢复默认（这是唯一允许「清空」的写法）；
  * - 非字符串 / 超长 / 盘根一律带可读原因拒绝，不静默丢弃也不静默收敛
  *   （静默收敛会让界面显示与实际生效的值不一致，正是 R16 那类问题的温床）。
  */
 export function sanitizeStorageSettings(
   patch: unknown,
-  cur: { userDataDir: string; exportsDir: string; attachmentsDir: string; snapshotsDir: string }
-): { userDataDir: string; exportsDir: string; attachmentsDir: string; snapshotsDir: string } {
+  cur: {
+    userDataDir: string
+    exportsDir: string
+    attachmentsDir: string
+    snapshotsDir: string
+    topologyDir?: string
+  }
+): {
+  userDataDir: string
+  exportsDir: string
+  attachmentsDir: string
+  snapshotsDir: string
+  topologyDir: string
+} {
   const p = (patch ?? {}) as Record<string, unknown>
   const dirOf = (v: unknown, fallback: string): string => {
     if (v === undefined) return fallback
@@ -294,7 +306,8 @@ export function sanitizeStorageSettings(
     userDataDir: cur.userDataDir,
     exportsDir: dirOf(p['exportsDir'], cur.exportsDir),
     attachmentsDir: dirOf(p['attachmentsDir'], cur.attachmentsDir),
-    snapshotsDir: dirOf(p['snapshotsDir'], cur.snapshotsDir)
+    snapshotsDir: dirOf(p['snapshotsDir'], cur.snapshotsDir),
+    topologyDir: dirOf(p['topologyDir'], cur.topologyDir ?? '')
   }
 }
 

@@ -2,8 +2,12 @@ import { INVOKE } from '@shared/channels'
 import { activeProfile, sanitizeProfiles } from '@shared/profiles'
 import { ipcMain } from 'electron'
 import { sanitizeCompaction, sanitizeRetry } from '@shared/runtime-policy'
+import { sanitizeConcurrency } from '@shared/concurrency'
+import { sanitizeRepeatGuard } from '@shared/repeat-guard'
+import { sanitizeTitleSettings } from '@shared/session-title'
 import { sanitizeStorageSettings } from '../core/storage/usage'
-import { setApiKey } from '../settings/secrets'
+import { probeModelEndpoint } from '../core/diagnose'
+import { getApiKey, setApiKey } from '../settings/secrets'
 import type { AgentSettings, Settings } from '@shared/types'
 import { MAX_SYSTEM_PROMPT, sanitizeMcpServers, settingsPayload, toInt, toStr } from './helpers'
 import type { Services } from '../services'
@@ -54,7 +58,8 @@ export function registerSettingsIpc(services: Services): void {
         left: Math.max(180, Math.min(420, toInt(p.left, 240))),
         right: Math.max(320, Math.min(640, toInt(p.right, 380))),
         leftCollapsed: !!p.leftCollapsed,
-        rightCollapsed: !!p.rightCollapsed
+        rightCollapsed: !!p.rightCollapsed,
+        centerCollapsed: !!p.centerCollapsed
       }
     }
     if (patch?.mcp && typeof patch.mcp === 'object') {
@@ -109,15 +114,35 @@ export function registerSettingsIpc(services: Services): void {
     if (patch?.compaction && typeof patch.compaction === 'object') {
       safe.compaction = sanitizeCompaction(patch.compaction, services.getSettings().compaction)
     }
+    if (patch?.concurrency && typeof patch.concurrency === 'object') {
+      // v2.5：并发上限。1 = 全串行；越界与坏值由 sanitizeConcurrency 收敛
+      safe.concurrency = sanitizeConcurrency(patch.concurrency, services.getSettings().concurrency)
+    }
+    if (patch?.repeatGuard && typeof patch.repeatGuard === 'object') {
+      // v2.14：重复调用防护。它只产生一条提醒、不改任何工具结果，所以缺省即开启 ——
+      // 但坏值仍要收敛成「沿用现值」，而不是让 undefined 把这块写成空对象
+      safe.repeatGuard = sanitizeRepeatGuard(
+        patch.repeatGuard,
+        services.getSettings().repeatGuard
+      )
+    }
+    if (patch?.title && typeof patch.title === 'object') {
+      // v2.8：会话标题生成。默认关闭（会多花一次请求，不该静默计费）
+      safe.title = sanitizeTitleSettings(patch.title, services.getSettings().title)
+    }
     if (patch?.wireshark && typeof patch.wireshark === 'object') {
       // v1.9：Wireshark 安装目录与持久化探测结果。
       const cur = services.getSettings().wireshark
       const dir = patch.wireshark.dir !== undefined ? toStr(patch.wireshark.dir).trim() : cur.dir
       const cachedProbe =
         patch.wireshark.cachedProbe !== undefined ? patch.wireshark.cachedProbe : cur.cachedProbe
+      // F10：自动抓包开关；未传即沿用现值（否则每次写探测缓存都会把它抹回默认）
+      const autoCapture =
+        patch.wireshark.autoCapture !== undefined ? patch.wireshark.autoCapture === true : cur.autoCapture === true
       safe.wireshark = {
         dir: dir.length > 512 ? dir.slice(0, 512) : dir,
-        cachedProbe: cachedProbe ?? null
+        cachedProbe: cachedProbe ?? null,
+        autoCapture
       }
     }
     if (patch?.shortcuts !== undefined && typeof patch.shortcuts === 'object') {
@@ -138,6 +163,19 @@ export function registerSettingsIpc(services: Services): void {
   ipcMain.handle(INVOKE.secretHas, async (_e, args?: { profileId?: string }) => {
     const pid = toStr(args?.profileId) || activeProfile(services.getSettings().agent).id
     return { has: services.hasApiKey(pid) }
+  })
+
+  // v2.3：模型管理页每行的「测试」按钮 —— 对指定档案发一次最小真实请求。
+  // 与体检走同一个 probeModelEndpoint，结论文案完全一致；找不到该档时按 fail 回传，
+  // 不抛异常（渲染层只需要一句能显示在人眼前的话）。
+  ipcMain.handle(INVOKE.settingsTestProfile, async (_e, args?: { profileId?: string }) => {
+    const settings = services.getSettings()
+    const pid = toStr(args?.profileId)
+    const profile = settings.agent.profiles.find((p) => p.id === pid)
+    if (!profile) {
+      return { level: 'fail' as const, detail: '该模型档案已不存在', hint: '刷新设置页后重试。' }
+    }
+    return probeModelEndpoint({ profile, apiKey: getApiKey(profile.id) })
   })
 
   ipcMain.handle(INVOKE.secretSet, async (_e, args: { profileId?: string; key?: string }) => {

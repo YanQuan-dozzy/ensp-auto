@@ -1,0 +1,17 @@
+# 行尾统一：不依赖 core.autocrlf，保证跨平台一致
+* text=auto eol=lf
+
+# Windows 批处理必须 CRLF（且为 GBK 编码，用 tools/fix-cmd-encoding.py 转换）
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# 二进制：禁止行尾转换
+*.png binary
+*.ico binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.exe binary
+*.dll binary
+*.zip binary
+*.7z binary

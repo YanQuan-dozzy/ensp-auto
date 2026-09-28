@@ -1,7 +1,7 @@
 import {
   createContext,
   useContext,
-  useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type CSSProperties,
@@ -60,14 +60,23 @@ export function AdaptiveContainer({
   ...rest
 }: AdaptiveContainerProps): ReactNode {
   const containerRef = useRef<HTMLDivElement | null>(null)
+  /**
+   * N69：初始宽度取 `window.innerWidth`，而真实容器宽度要等测量才知道 ——
+   * 右栏 / 窄面板里首帧会先按 `lg` 渲染（完整文字），量到真实宽度后又被收起，
+   * 表现为闪动。改在 `useLayoutEffect` 里同步测量：它在 DOM 变更后、**绘制前**执行，
+   * 首帧就拿真值，用户看不到中间态。
+   *
+   * 仍保留 `window.innerWidth` 作初值（而非 0）：测量前若真有一次渲染（如
+   * SSR 之外的极端时序），按窗口宽度估比按 0（xs 档）更不容易错。
+   */
   const [width, setWidth] = useState<number>(() => (typeof window !== 'undefined' ? window.innerWidth : 800))
   const [tier, setTier] = useState<AdaptiveTier>(() => getAdaptiveTier(width))
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const el = containerRef.current
     if (!el) return
 
-    // 初始测量
+    // 初始测量（绘制前完成 —— 首帧档位即正确，不再有「先宽后窄」的闪动）
     const initW = Math.round(el.getBoundingClientRect().width)
     if (initW > 0) {
       setWidth(initW)

@@ -9,12 +9,26 @@ import {
   applyTheme,
   errorText,
   matchTreeNodes,
+  mergeTouchedSettings,
   nearestUserAncestor,
   nodesToMessages,
   sortDevices,
   stripAttachmentNote,
   systemNote
 } from './storeUtil'
+
+/**
+ * N18：会话载入的请求序号。
+ *
+ * `openSession` / `continueFrom` / `resumeSession` 都是「发一次 IPC → await → set」，
+ * 中间没有任何令牌。快速连点两个历史会话时，**先发后到**的响应会把后选会话的消息流
+ * 覆盖成旧会话的内容，界面与 `activeRootId` 不一致（点 B 却看到 A 的消息）。
+ * 交付时给每次载入编号，回来时比对序号，过期的响应直接丢弃。
+ *
+ * 放模块级而不是 store：它只是「最近一次请求」的记号，不需要触发任何重渲染；
+ * 全应用只有一个 store 实例，不存在串味。
+ */
+let sessionLoadSeq = 0
 
 export function dataActions(
   set: SliceSet,
@@ -74,6 +88,34 @@ export function dataActions(
     return nodeId ? { rootId, nodeId, nodes } : null
   }
 
+  /**
+   * N18：把某个会话载入视图（打开 / 换路重走 / 断点续跑共用同一入口）。
+   *
+   * 返回 `false` 表示这次载入已被更新的请求取代 —— 调用方（`resumeSession`）据此
+   * 决定是否继续发「继续上次任务」的指令：若用户已经点了别的会话，就不要再往新会话里
+   * 塞一条补跑指令。
+   */
+  async function loadSessionView(
+    rootId: string,
+    startNodeId: string | null,
+    extra?: Partial<AppState>
+  ): Promise<boolean> {
+    const seq = ++sessionLoadSeq
+    const nodes = await window.api.session.get(rootId)
+    if (seq !== sessionLoadSeq) return false
+    const todos = await window.api.session.todos(rootId).catch(() => [])
+    if (seq !== sessionLoadSeq) return false
+    set({
+      activeRootId: rootId,
+      activeStartNodeId: startNodeId,
+      messages: nodesToMessages(nodes),
+      queueCount: 0,
+      agentTodos: todos,
+      ...extra
+    })
+    return true
+  }
+
   return {
     async init() {
       ensureSubscribed(set, get)
@@ -124,29 +166,13 @@ export function dataActions(
     },
 
     async continueFrom(rootId: string, node: SessionNode) {
-      const nodes = await window.api.session.get(rootId)
-      set({
-        activeRootId: rootId,
-        activeStartNodeId: node.id,
-        messages: nodesToMessages(nodes),
-        queueCount: 0,
-        agentTodos: await window.api.session.todos(rootId).catch(() => [])
-      })
+      await loadSessionView(rootId, node.id)
     },
 
     /** v2.2：进入旧会话 —— 载入完整消息流，后续发送追加到该会话尾部 */
     async openSession(rootId: string) {
-      const nodes = await window.api.session.get(rootId)
-      set({
-        activeRootId: rootId,
-        activeStartNodeId: null,
-        messages: nodesToMessages(nodes),
-        queueCount: 0,
-        // v2.8：用户主动进了某个会话 = 已做出选择，收起续跑提示
-        resumable: null,
-        // v2.7：切会话时连同任务清单一起换 —— 不换会显示上一段对话的进度
-        agentTodos: await window.api.session.todos(rootId).catch(() => [])
-      })
+      // v2.8：用户主动进了某个会话 = 已做出选择，收起续跑提示
+      await loadSessionView(rootId, null, { resumable: null })
     },
 
     // ————— v2.2：会话管理（历史列表右键菜单） —————
@@ -206,15 +232,9 @@ export function dataActions(
      * 工具摘要）后自己判断「哪些已经做完」，比机械重发安全得多。
      */
     async resumeSession(rootId: string) {
-      const nodes = await window.api.session.get(rootId)
-      set({
-        activeRootId: rootId,
-        activeStartNodeId: null,
-        messages: nodesToMessages(nodes),
-        queueCount: 0,
-        resumable: null,
-        agentTodos: await window.api.session.todos(rootId).catch(() => [])
-      })
+      // N18：载入若被更新的请求取代（用户又点了别的会话），就不要再往新会话里塞指令
+      const applied = await loadSessionView(rootId, null, { resumable: null })
+      if (!applied) return
       await get().send(
         '上次任务在本机中断了。请先阅读上面的历史轨迹（尤其是各次工具调用的结果摘要），' +
           '判断哪些步骤已经完成、哪些还没做，然后接着把原目标做完；不要重复执行已经生效的配置。'
@@ -311,9 +331,31 @@ export function dataActions(
       await get().updateSettings({ theme })
     },
 
+    /**
+     * 保存设置补丁。
+     *
+     * **N64：只回写本 patch 涉及的顶层字段**，不再整份覆盖。
+     * 主进程返回的是整份 `settings`，而多个入口（设置页多项即时生效、`doScan` 写扫描范围、
+     * `setProfileKey`、面板拖拽结束）可能并发调用 —— 响应回来顺序与请求顺序不一致时，
+     * 后到者的**整份**快照会抹掉另一处刚写入的字段，表现就是「刚开的开关自己弹回去」。
+     * 只合并本次 patch 的键，等价于把「服务端权威值」限制在自己负责的范围内。
+     *
+     * **N65/N56：失败必须可见**。`settings:set` 是唯一会 reject 的 IPC 通道
+     * （`sanitizeStorageSettings` 会抛），而调用点大量写成 `void updateSettings(...)`，
+     * 过去失败会退化成一条泛化的未处理 rejection。这里统一就地提示。
+     */
     async updateSettings(patch: Partial<Settings>) {
-      const { settings, hasApiKey, configuredProfileIds } = await window.api.settings.set(patch)
-      set({ settings, hasApiKey, configuredProfileIds })
+      try {
+        const { settings, hasApiKey, configuredProfileIds } = await window.api.settings.set(patch)
+        // N64：只回写本 patch 涉及的顶层字段（合并口径见 storeUtil#mergeTouchedSettings）
+        set((s) => ({
+          settings: mergeTouchedSettings(s.settings, patch, settings),
+          hasApiKey,
+          configuredProfileIds
+        }))
+      } catch (e) {
+        get().noteSystemMessage(`保存设置失败：${errorText(e)}`, 'error')
+      }
     },
 
     async setProfileKey(profileId: string, key: string) {

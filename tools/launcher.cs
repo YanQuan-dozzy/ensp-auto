@@ -4,7 +4,7 @@ using System.IO;
 
 // ensp-auto 无窗口启动器（编译产物 = start.exe）
 // 行为：读取 exe 所在目录（即项目根），静默调用 powershell 执行 start.ps1。
-// 由 tools/make-launcher-cs.py 用 csc 编译（GUI 子系统，无控制台）。
+// 由 tools/make-launcher.py 用 csc 编译（GUI 子系统，无控制台）。
 class ENSPAutoLauncher
 {
     static int Main()

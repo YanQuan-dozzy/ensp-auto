@@ -8,6 +8,7 @@ import {
   sanitizeIndexItems
 } from './index-shape'
 import { atomicWriteJsonSync } from '../fs/atomic'
+import { quarantineFile } from '../fs/quarantine'
 
 /**
  * 变更记录（F-4.5：谁在何时改了什么、依据哪次快照）。
@@ -72,11 +73,16 @@ export class ChangeStore {
 
   private load(): void {
     this.loadWarnings = []
+    if (!fs.existsSync(this.indexFile)) return
     try {
-      if (!fs.existsSync(this.indexFile)) return
       const parsed = JSON.parse(fs.readFileSync(this.indexFile, 'utf8')) as Partial<IndexFile>
       // R22：形状校验（同 SnapshotStore 的说明）
       const shaped = sanitizeIndexItems(parsed?.items, isChangeRecord)
+      if (shaped.notArray) {
+        // N22：整个 items 字段不可用 → 与解析失败同等处置（留档），否则下一次写入即覆盖
+        this.recoverFromUnusableIndex('的 items 字段不是数组')
+        return
+      }
       this.index = { version: 1, items: shaped.items }
       const warning = describeShapeWarning('变更记录', shaped)
       if (warning) {
@@ -84,10 +90,21 @@ export class ChangeStore {
         console.warn(`[changes] ${warning}（${this.indexFile}）`)
       }
     } catch {
-      this.index = { version: 1, items: [] }
-      this.loadWarnings.push('变更记录索引无法解析（文件损坏），已按空列表处理')
-      console.warn(`[changes] 变更记录索引无法解析，已按空列表处理：${this.indexFile}`)
+      this.recoverFromUnusableIndex('无法解析（文件损坏）')
     }
+  }
+
+  /**
+   * N22：索引不可用（解析失败 / items 整体不是数组）时的统一处置：留档 + 空兜底。
+   * 变更记录**没有独立实体文件**（changes.json 本身就是唯一存储），无法从磁盘重建，
+   * 但留档后原文件仍可人工抢救 —— 绝不静默覆盖。
+   */
+  private recoverFromUnusableIndex(reason: string): void {
+    const archived = quarantineFile(this.indexFile)
+    this.index = { version: 1, items: [] }
+    const msg = `变更记录索引${reason}${archived ? `，原文件已留档为 ${archived}` : ''}，已按空列表处理`
+    this.loadWarnings.push(msg)
+    console.warn(`[changes] ${msg}`)
   }
 
   private persist(): void {

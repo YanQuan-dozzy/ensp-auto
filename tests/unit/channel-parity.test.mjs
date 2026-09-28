@@ -1,7 +1,12 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
-import path from 'node:path'
+import {
+  CHANNELS,
+  readDeclaredKeys,
+  readHandledKeys,
+  readPreloadUsedKeys
+} from '../harness/ipc-scan.mjs'
 
 /**
  * 通道与处理器的一一对应（T5.3 引入的守卫）。
@@ -13,33 +18,15 @@ import path from 'node:path'
  *
  * 这里刻意**用源码文本扫描**而不是 import：ipc 层 import 了 electron，
  * 一旦真去 import 就需要 Electron 运行时，测试就没法在纯 Node 下跑了。
+ *
+ * N82/N83：扫描正则与路径推导已抽到 `tests/harness/ipc-scan.mjs`，与 ipc-coverage 共用
+ * （此前两处正则宽严不一，同一份源码会一边过一边假失败）。
  */
 
-const ROOT = path.resolve(import.meta.dirname, '../..')
-const PRELOAD = path.join(ROOT, 'src/preload/index.ts')
-const CHANNELS = path.join(ROOT, 'src/shared/channels.ts')
-const IPC_DIR = path.join(ROOT, 'src/main/ipc')
-
-function readAll(dir) {
-  return fs
-    .readdirSync(dir)
-    .filter((f) => f.endsWith('.ts'))
-    .map((f) => fs.readFileSync(path.join(dir, f), 'utf8'))
-    .join('\n')
-}
-
-function keysOf(source, re) {
-  return new Set([...source.matchAll(re)].map((m) => m[1]))
-}
-
 test('每个 preload 暴露的通道，主进程都有对应处理器', () => {
-  const preload = fs.readFileSync(PRELOAD, 'utf8')
-  const channels = fs.readFileSync(CHANNELS, 'utf8')
-  const ipc = readAll(IPC_DIR)
-
-  const used = keysOf(preload, /INVOKE\.([A-Za-z0-9_]+)/g)
-  const handled = keysOf(ipc, /ipcMain\.handle\(\s*INVOKE\.([A-Za-z0-9_]+)/g)
-  const declared = keysOf(channels, /^\s+([A-Za-z0-9_]+):\s*['"]/gm)
+  const used = readPreloadUsedKeys()
+  const handled = readHandledKeys()
+  const declared = readDeclaredKeys()
 
   assert.ok(used.size > 0, '应当能扫到 preload 的通道引用')
   assert.deepEqual(
@@ -56,8 +43,9 @@ test('每个 preload 暴露的通道，主进程都有对应处理器', () => {
 })
 
 test('事件通道名在 channels.ts 里唯一（避免两处同名互相顶掉）', () => {
-  const channels = fs.readFileSync(CHANNELS, 'utf8')
-  const names = [...channels.matchAll(/^\s+[A-Za-z0-9_]+:\s*['"]([^'"]+)['"]/gm)].map((m) => m[1])
+  const names = [
+    ...fs.readFileSync(CHANNELS, 'utf8').matchAll(/^\s+[A-Za-z0-9_]+:\s*['"]([^'"]+)['"]/gm)
+  ].map((m) => m[1])
   const seen = new Map()
   const dups = []
   for (const n of names) {

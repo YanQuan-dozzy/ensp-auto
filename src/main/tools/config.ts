@@ -1,6 +1,14 @@
-import type { CommandResult, DeviceId, Expectation, ExpectationMode, ToolResult } from '@shared/types'
-import { classifyDanger } from '@shared/risk'
+import type {
+  CommandResult,
+  DeviceId,
+  Expectation,
+  ExpectationMode,
+  ToolResult
+} from '@shared/types'
+import { classifyDanger, isReadOnlyCommand, isViewNavigationCommand } from '@shared/risk'
 import { genRollbackCommands } from '../core/rollback'
+import { explainVrpError, preflightCommands } from '../core/knowledge/vrp-errors'
+import { ensureSystemView, type NavSession } from '../core/session/viewNav'
 import { diffLines } from './command'
 import {
   fail,
@@ -28,13 +36,40 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
 
 const EXPECTATION_MODES: readonly ExpectationMode[] = ['contains', 'notContains', 'regex']
 
+/** N15：regex 模式期望表达式的长度上限（超长正则只可能来自模型臆造，直接拒绝） */
+const MAX_EXPECT_REGEX_LEN = 200
+
+/**
+ * N15：灾难性回溯的高风险形态 —— 量词作用于「内部已含量词的分组」，如 `(a+)+`、`(\w*)*`。
+ *
+ * 为什么必须拦：`checkExpectation` 的正则跑在**主进程线程**上，输入是设备回显
+ * （`apply_config` 的 display current-configuration 可达数十万字符，且用户可指定任意内容）。
+ * 灾难性回溯会直接冻结窗口与整个任务，而且**不会抛异常** —— 现有针对非法正则的
+ * `SyntaxError` 兜底挡不住它。
+ *
+ * 代价：少数复杂但无害的正则会被一并拒绝。对「变更后的状态校验」这种场景，期望值本该是
+ * 简单子串/正则，值得用这点保守换掉一次冻结。**已知残余**：`(a|a)+` 这类重叠分支交替
+ * 量词不在此启发式覆盖内（检测它需要误杀 `(up|down)+` 这类常见合法写法）。
+ */
+const NESTED_QUANTIFIER_RE = /\([^()]*[+*][^()]*\)\s*(?:[+*]|\{\d)/
+
+/** regex 模式的安全闸：长度上限 + 嵌套量词启发式。不安全抛 SyntaxError（与非法正则同口径） */
+function assertSafeRegex(pattern: string): void {
+  if (pattern.length > MAX_EXPECT_REGEX_LEN) {
+    throw new SyntaxError(`期望正则过长（${pattern.length} > ${MAX_EXPECT_REGEX_LEN} 字符）`)
+  }
+  if (NESTED_QUANTIFIER_RE.test(pattern)) {
+    throw new SyntaxError('期望正则含嵌套量词（形如 (a+)+），可能造成灾难性回溯，已拒绝')
+  }
+}
+
 const expectationMode = Type.Union([
   Type.Literal('contains'),
   Type.Literal('notContains'),
   Type.Literal('regex')
 ])
 
-/** 判断回显是否满足期望。模式非法抛出，正则非法抛出 SyntaxError。 */
+/** 判断回显是否满足期望。模式非法抛出，正则非法（或过于危险）抛出 SyntaxError。 */
 export function checkExpectation(
   clean: string,
   exp: { expect: string; mode: ExpectationMode }
@@ -44,8 +79,11 @@ export function checkExpectation(
       return clean.includes(exp.expect)
     case 'notContains':
       return !clean.includes(exp.expect)
-    case 'regex':
+    case 'regex': {
+      // N15：先过安全闸再编译（contains / notContains 不做正则，天然无回溯风险）
+      assertSafeRegex(exp.expect)
       return new RegExp(exp.expect, 'i').test(clean)
+    }
   }
 }
 
@@ -79,16 +117,45 @@ interface ExecOutcome {
   awaitingConfirm?: StepAwaitingConfirm
 }
 
+/** 下发/校验管道共用的最小会话面（见 core/session/viewNav 的 NavSession） */
+type ExecSession = NavSession
+
+/**
+ * 「整批命令只有一条视图切换命令」= 工具选错了，必须显式拒绝（v2.24）。
+ *
+ * 为什么不能照发：本工具的契约是「先把设备带到系统视图，再逐条下发」，于是同一句 `quit`
+ * 在这里的含义与模型写下它时的意图**不同** —— 模型想「从接口视图退一层」，实际执行的是
+ * 「从系统视图退回用户视图」，而且工具**报成功**、返回里还不带视图字段，从结果里看不出来
+ * （下游命令是否有效完全取决于当前视图，于是错误会以「莫名其妙 Unrecognized」的形式晚点浮现）。
+ * 切视图请走 `change_view`。
+ *
+ * 为什么只拦「仅此一条」：批量下发**中间**的 `quit` 是合法且必要的写法
+ * （`interface X` → 配置 → `quit` → 再进另一个视图，见 core/tasks/plans.ts 与
+ * core/lab/templates.ts），它们相对系统视图的位置是确定的，不能一并拒掉。
+ */
+export function loneViewNavCommand(commands: readonly string[]): string | null {
+  if (commands.length !== 1) return null
+  const only = commands[0]!.trim()
+  return isViewNavigationCommand(only) ? only : null
+}
+
+/**
+ * 把设备带到系统视图（下发管道第 2 步）。
+ *
+ * v2.24：实现已抽到 `core/session/viewNav.ts#ensureSystemView` —— 与 `change_view`
+ * 工具共用同一份判定（「怎么算到了系统视图」只能有一处真相），行为不变。
+ */
+
 /**
  * 下发管道（apply / restore 共用）：
  * 1. 逐条危险扫描，命中即整体拦截（TOOLS.md「拦在 ToolRegistry 执行前」）
- * 2. 进入系统视图（幂等；已在该视图时重复进入无害）
+ * 2. 确保处于系统视图（已在该视图则跳过，子视图先 `return` —— 见 ensureSystemView）
  * 3. 逐条下发，每条读回显判定成败，任一失败即停止
  * 4. 命中设备确认提示（[Y/N]）立即停止 —— 绝不自作主张应答（决策 D3 = 停止并上报），
  *    也不继续下发后续命令：此时设备把任何输入都当成对提示的回答。
  */
 async function executeCommands(
-  session: { exec(cmd: string, opts?: { timeoutMs?: number; signal?: AbortSignal }): Promise<CommandResult> },
+  session: ExecSession,
   commands: string[],
   signal: AbortSignal | undefined
 ): Promise<ExecOutcome> {
@@ -99,9 +166,9 @@ async function executeCommands(
     }
   }
 
-  const sys = await session.exec('system-view', { ...(signal ? { signal } : {}) })
+  const sys = await ensureSystemView(session, signal)
   if (!sys.ok) {
-    return { applied: [], sysViewError: sys.error ?? '无法进入系统视图' }
+    return { applied: [], sysViewError: sys.error }
   }
 
   const applied: string[] = []
@@ -137,7 +204,32 @@ async function runExpectation(
   session: { exec(cmd: string, opts?: { timeoutMs?: number; signal?: AbortSignal }): Promise<CommandResult> },
   exp: Expectation,
   signal: AbortSignal | undefined
-): Promise<{ pass: boolean; actual: string; invalid?: boolean }> {
+): Promise<{ pass: boolean; actual: string; invalid?: boolean; reason?: string }> {
+  /*
+   * N2 / N13：expectation.command 来自模型参数，而本函数既被 risk:'read' 的
+   * verify_expectation 直接调用，也被 apply_config 复用。工具级 risk 挡不住参数级
+   * 任意命令 —— 不在这里兜底，就等于「以只读身份执行任意命令」：
+   * ① 计划模式的 PLAN_MODE_READONLY 硬约束被架空（它只按工具级 risk 判）；
+   * ② 对外 MCP 出口只过滤 danger 工具，同一条旁路被绕过。
+   * 校验命令本就只能是只读命令，这里同时做危险扫描与只读白名单两道强校验。
+   */
+  const danger = classifyDanger(exp.command)
+  if (danger.dangerous) {
+    return {
+      pass: false,
+      actual: '',
+      invalid: true,
+      reason: `校验命令命中危险清单，已拒绝：${danger.reason ?? exp.command}`
+    }
+  }
+  if (!isReadOnlyCommand(exp.command)) {
+    return {
+      pass: false,
+      actual: '',
+      invalid: true,
+      reason: `校验命令必须是只读命令（display / show / dir / more / ping / tracert）：${exp.command}`
+    }
+  }
   const times = Math.max(1, Math.min(10, exp.times ?? 1))
   let last = ''
   for (let i = 0; i < times; i++) {
@@ -150,8 +242,14 @@ async function runExpectation(
       let pass: boolean
       try {
         pass = checkExpectation(r.clean, exp)
-      } catch {
-        return { pass: false, actual: r.clean, invalid: true }
+      } catch (e) {
+        // 正则非法 / 过于危险（N15）→ 带出具体原因，别只回一句「无效」
+        return {
+          pass: false,
+          actual: r.clean,
+          invalid: true,
+          reason: `期望校验的表达式不可用：${e instanceof Error ? e.message : String(e)}`
+        }
       }
       if (pass) return { pass: true, actual: r.clean }
     }
@@ -179,6 +277,8 @@ export const applyConfig: ToolSpec<{
   description:
     '下发配置变更集（核心写工具）。自动先采集快照 → 逐条下发 → 每条读回显判定成败 → ' +
     '全部成功后再用 expectation 校验。任一命令失败立即停止并返回失败点，不自动回滚，由你判断修正或回滚。' +
+    '返回里会带 `preflight`（下发前的静态预检：反掩码/掩码互换、全角字符、trunk 未放行等）与失败时的 ' +
+    '`diagnosis`（错误码 → 常见根因 → 可照做的纠正 → 相关词典主题）—— **先按它改，不要照着原样重试同一条命令**。' +
     '变更前请先用 get_device_context 了解设备现状。',
   risk: 'write',
   scope: 'device',
@@ -186,7 +286,9 @@ export const applyConfig: ToolSpec<{
     {
       deviceId: Type.String({ description: '设备 ID' }),
       commands: Type.Array(Type.String(), {
-        description: '按顺序下发的配置命令（会先自动进入系统视图，无需带 system-view）'
+        description:
+          '按顺序下发的配置命令（会自动确保处于系统视图：已在系统视图则跳过；' +
+          '处于接口/协议等子视图则先 return 回用户视图再进，无需带 system-view）'
       }),
       description: Type.String({ description: '变更意图说明，用于展示与变更记录' }),
       expectation: Type.Optional(
@@ -231,7 +333,35 @@ export const applyConfig: ToolSpec<{
       return fail('BAD_PARAM', 'expectation 非法：需提供 command/expect/mode', metaOf(t0, deviceId))
     }
 
+    // 工具选错了要当场说清，而不是照发一条含义已变的命令（见 loneViewNavCommand 的说明）。
+    // 放在快照之前：这类调用根本没有变更意图，不该先浪费一次配置采集。
+    const loneNav = loneViewNavCommand(commands)
+    if (loneNav) {
+      return fail(
+        'BAD_PARAM',
+        `本工具会先把设备带到系统视图再逐条下发，因此单独一条「${loneNav}」在这里的含义是` +
+          '「从系统视图退回用户视图」，与「退一层视图」的意图不一致 —— 而且工具会报成功，' +
+          '你从结果里看不出视图已经变了。' +
+          "切视图请用 change_view（target: 'user' 回用户视图 / 'system' 进系统视图 / " +
+          "'interface' 进指定接口视图）。" +
+          '若要在批量下发中间退视图（interface X → 配置 → quit → 再进另一个视图），' +
+          '把它和其它命令放在同一次调用里即可。',
+        metaOf(t0, deviceId)
+      )
+    }
+
     const description = args.description.trim()
+
+    /*
+     * 下发前静态预检（v2.27）：纯本地扫描命令集，提前点出可预见的翻车写法
+     * —— 反掩码/掩码互换、全角字符、trunk 未放行、单臂路由漏 arp broadcast、save 会卡 [Y/N] 等。
+     *
+     * 为什么**只提示不拦截**：静态分析看不到设备上已有的配置（allow-pass 可能上一批刚配过、
+     * VLAN 可能已存在），误拦一次会让正确的变更做不下去，代价远高于漏报一次。
+     * 它的价值是把「可能的坑」摆到模型眼前，配合下方的错误诊断形成「配前提醒 → 配后解释」闭环。
+     */
+    const preflight = preflightCommands(commands)
+
     let snapshotId = args.snapshotId
     let snapshotText: string | null = null
     /**
@@ -335,6 +465,7 @@ export const applyConfig: ToolSpec<{
           applied: execOutcome.applied,
           awaitingConfirm: ac,
           needsUserInput: true,
+          ...(preflight.length ? { preflight } : {}),
           ...snapshotInfo
         } as never,
         meta: metaOf(t0, deviceId)
@@ -348,12 +479,23 @@ export const applyConfig: ToolSpec<{
         verified: false,
         error: { code: f.errorCode, message: f.error }
       })
+      /*
+       * 失败即带修正线索（v2.27）：设备只回一句 `Error: Wrong parameter found at '^' position.`，
+       * 信息量不足以让模型改方向 —— 实测它会照着原样重试同一句。这里把「错误码 → 常见根因 →
+       * 可照做的纠正 → 相关词典主题」接在失败返回里，把一次失败变成一次定位。
+       */
+      const diagnosis = explainVrpError(f.errorCode, f.command)
       return {
         ok: false,
-        error: { code: f.errorCode, message: f.error },
+        error: {
+          code: f.errorCode,
+          message: f.error + (diagnosis ? `\n诊断提示：${diagnosis.hint}` : '')
+        },
         data: {
           applied: execOutcome.applied,
           failed: f,
+          ...(diagnosis ? { diagnosis: diagnosis.guide } : {}),
+          ...(preflight.length ? { preflight } : {}),
           ...snapshotInfo
         } as never,
         meta
@@ -368,15 +510,22 @@ export const applyConfig: ToolSpec<{
       verified = e.pass
       actual = e.actual
       if (e.invalid) {
-        log('failed', { verified: false, error: { code: 'BAD_PARAM', message: '期望校验的命令无法执行或正则非法' } })
-        return fail('BAD_PARAM', 'expectation 非法：校验命令无法执行或正则非法', meta)
+        const msg = e.reason ?? 'expectation 非法：校验命令无法执行或正则非法'
+        log('failed', { verified: false, error: { code: 'BAD_PARAM', message: msg } })
+        return fail('BAD_PARAM', msg, meta)
       }
       if (!e.pass) {
         log('failed', { verified: false, error: { code: 'EXPECTATION_UNMET', message: '期望校验未通过' } })
         return {
           ok: false,
           error: { code: 'EXPECTATION_UNMET', message: '配置已下发但未达到期望状态，请修正或回滚' },
-          data: { applied: execOutcome.applied, verified: false, actual, ...snapshotInfo } as never,
+          data: {
+            applied: execOutcome.applied,
+            verified: false,
+            actual,
+            ...(preflight.length ? { preflight } : {}),
+            ...snapshotInfo
+          } as never,
           meta
         }
       }
@@ -398,7 +547,10 @@ export const applyConfig: ToolSpec<{
         applied: execOutcome.applied,
         ...snapshotInfo,
         ...(args.expectation ? { verified: verified ?? false } : {}),
-        ...(diff ? { diff } : {})
+        ...(diff ? { diff } : {}),
+        // 成功也带预检结论：这批命令没有语法层面的风险，但静态反模式仍值得模型复核
+        // （例如 trunk 未放行属于「下发成功但业务不通」，只有提示才能提前拦住）
+        ...(preflight.length ? { preflight } : {})
       } as never,
       meta
     )
@@ -420,6 +572,8 @@ export const verifyExpectation: ToolSpec<{
     '可选重试等待协议收敛。用于变更后的状态验证。',
   risk: 'read',
   scope: 'device',
+  // N2：risk/concurrencySafe 成立的前提是「命令已只读校验」——由 runExpectation 内的
+  // classifyDanger + isReadOnlyCommand 兜底（命令来自模型参数，工具级 risk 判不到参数级）。
   concurrencySafe: true,
   schema: Type.Object(
     {
@@ -453,7 +607,7 @@ export const verifyExpectation: ToolSpec<{
     }
     const r = await runExpectation(session, exp, ctx.signal)
     if (r.invalid) {
-      return fail('BAD_PARAM', '正则表达式无效，无法校验', metaOf(t0, deviceId))
+      return fail('BAD_PARAM', r.reason ?? '正则表达式无效，无法校验', metaOf(t0, deviceId))
     }
     return ok({ pass: r.pass, actual: r.actual.slice(0, 8000) } as never, metaOf(t0, deviceId))
   }

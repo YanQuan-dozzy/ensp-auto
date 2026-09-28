@@ -73,6 +73,9 @@ const TOOL_CATEGORY: Record<string, ToolCategory> = {
   // —— 执行命令（只读回显）——
   run_show_command: 'exec',
   collect_device_diagnostics: 'exec',
+  // v2.24：视图切换也是「往设备上发命令」（quit / return / system-view / interface），
+  // 只是它不改配置 —— 归到 exec 比归到 read 更贴近用户看到的动作
+  change_view: 'exec',
 
   // —— 修改 / 落盘 ——
   apply_config: 'edit',

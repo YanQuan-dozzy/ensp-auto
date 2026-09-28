@@ -12,6 +12,8 @@ import {
   TOOLS,
   parseOspfPeers,
   commandsForCheck,
+  checkInputError,
+  isTolerablePingFailure,
   evaluateCheck,
   describeCheck,
   checkExperiment
@@ -269,4 +271,78 @@ test('check_experiment：设备未连接记为 error（不谎报 fail）；空�
   const bad = await checkExperiment.handler({ checks: [] }, ctx)
   assert.equal(bad.ok, false)
   assert.equal(bad.error.code, 'BAD_PARAM')
+})
+
+// ———————————————————————— N12：命令由参数拼成，必须先校验 ————————————————————————
+
+test('N12 checkInputError：ping 的 target 必须是严格 IPv4（换行 / 非法地址一律拒绝）', () => {
+  assert.equal(checkInputError({ kind: 'ping', deviceId: 'd', target: '10.0.0.2' }), null)
+  assert.ok(checkInputError({ kind: 'ping', deviceId: 'd', target: '8.8.8.8\nreset saved-configuration' }))
+  assert.ok(checkInputError({ kind: 'ping', deviceId: 'd', target: '999.1.1.1' }), '越界段也应拒绝')
+  assert.ok(checkInputError({ kind: 'ping', deviceId: 'd', target: 'example.com' }))
+  // 缺参数不算「非法」：交给 commandsForCheck 走「参数不完整」那条
+  assert.equal(checkInputError({ kind: 'ping', deviceId: 'd' }), null)
+})
+
+test('N12 checkInputError：config 的 contains 不得含换行或命令分隔符', () => {
+  assert.equal(checkInputError({ kind: 'config', deviceId: 'd', contains: 'ospf 1' }), null)
+  assert.ok(checkInputError({ kind: 'config', deviceId: 'd', contains: 'ospf | include x' }))
+  assert.ok(checkInputError({ kind: 'config', deviceId: 'd', contains: 'a;reset' }))
+  assert.ok(checkInputError({ kind: 'config', deviceId: 'd', contains: 'a\r\nb' }))
+})
+
+test('N12 commandsForCheck：非法 ping target / contains 不生成任何命令', () => {
+  assert.deepEqual(commandsForCheck({ kind: 'ping', deviceId: 'd', target: '8.8.8.8\nreset' }), [])
+  assert.deepEqual(commandsForCheck({ kind: 'config', deviceId: 'd', contains: 'x|y' }), [])
+})
+
+test('N12 check_experiment：注入型 target 整体 BAD_PARAM，且设备未收到任何命令', async () => {
+  const seen = []
+  const session = {
+    exec: async (cmd) => {
+      seen.push(cmd)
+      return { ok: true, clean: '', raw: '', settled: 'prompt' }
+    }
+  }
+  const ctx = { sessions: { get: () => session }, settings: {}, signal: undefined }
+  const res = await checkExperiment.handler(
+    { checks: [{ kind: 'ping', deviceId: 'd', target: '8.8.8.8\nreset saved-configuration' }] },
+    ctx
+  )
+  assert.equal(res.ok, false)
+  assert.equal(res.error.code, 'BAD_PARAM')
+  assert.deepEqual(seen, [], '非法参数拼出的命令绝不能下发到设备')
+})
+
+test('N12 check_experiment：checks 里的非对象条目也按 BAD_PARAM 拒绝（外部 MCP 可传任意 JSON）', async () => {
+  const ctx = { sessions: { get: () => undefined }, settings: {}, signal: undefined }
+  const res = await checkExperiment.handler({ checks: [null] }, ctx)
+  assert.equal(res.ok, false)
+  assert.equal(res.error.code, 'BAD_PARAM')
+})
+
+// ———————————————————————— N26：ping 容忍规则单一事实源 ————————————————————————
+
+test('N26 isTolerablePingFailure：失败但回显含统计行 → 可用；否则不可用', () => {
+  assert.equal(isTolerablePingFailure({ clean: '3 packet(s) transmitted, 0 packet(s) received' }), true)
+  assert.equal(isTolerablePingFailure({ clean: 'Error: Unrecognized command' }), false)
+})
+
+test('N26 check_experiment：ping 命令 ok=false 但有统计行 → 仍按回显判定（不再记 error）', async () => {
+  const session = {
+    exec: async () => ({
+      ok: false,
+      clean: '3 packet(s) transmitted, 3 packet(s) received, 0.0% packet loss',
+      raw: '',
+      settled: 'prompt',
+      error: 'busy'
+    })
+  }
+  const ctx = { sessions: { get: () => session }, settings: {}, signal: undefined }
+  const res = await checkExperiment.handler(
+    { checks: [{ kind: 'ping', deviceId: 'd', target: '10.0.0.2' }] },
+    ctx
+  )
+  assert.equal(res.data.errors, 0, '有统计行就不该记「无法判定」')
+  assert.equal(res.data.passed, 1)
 })

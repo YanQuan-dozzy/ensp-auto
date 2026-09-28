@@ -17,8 +17,18 @@ import { TerminalBuffer, type TerminalBufferSegment } from './TerminalBuffer'
  */
 
 export interface SessionDeps {
-  /** seq 为该段在设备回放缓冲中的序号，渲染层用它跟快照水位对齐去重 */
-  onRaw: (deviceId: DeviceId, chunk: Uint8Array, fromAgent: boolean, seq: number) => void
+  /**
+   * seq 为该段在设备回放缓冲中的序号，渲染层用它跟快照水位对齐去重。
+   * `encoding` 是**这一段字节所属的回显编码**（取值时机在编码判定之后）——
+   * 终端必须按它解码，否则设备切中文（GBK）后屏幕上全是乱码。
+   */
+  onRaw: (
+    deviceId: DeviceId,
+    chunk: Uint8Array,
+    fromAgent: boolean,
+    seq: number,
+    encoding: Encoding
+  ) => void
   onClosed: (deviceId: DeviceId, reason: string) => void
   onStateChanged: (device: Device) => void
 }
@@ -90,9 +100,16 @@ export class DeviceSession {
     this.unsubscribeRaw = client.onRawData((chunk) => {
       this.lastSeenAt = Date.now()
       const fromAgent = this.agentDepth > 0
+      // 编码判定归通信层（它才看得见回显）：判定/锁定/被设置改写后立刻同步到会话元数据，
+      // 界面状态栏与终端解码器都读它。少了这一步，设备切中文后只有代理看得见中文。
+      const enc = this.client.currentEncoding
+      if (enc !== this.encoding) {
+        this.encoding = enc
+        deps.onStateChanged(this.toDevice())
+      }
       // 先落回放缓冲再广播：渲染层拿到 seq 后可以和 buffer 快照对齐去重
       const seq = this.terminal.append(chunk, fromAgent)
-      deps.onRaw(this.id, chunk, fromAgent, seq)
+      deps.onRaw(this.id, chunk, fromAgent, seq, enc)
     })
     this.unsubscribeClose = client.onClose((reason) => {
       this.closed = true
@@ -187,9 +204,21 @@ export class DeviceSession {
     return this.client.writeInteractive(data)
   }
 
-  /** 终端回放快照（渲染层挂载 xterm 时拉取一次） */
-  terminalBuffer(): TerminalBufferSegment[] {
-    return this.terminal.snapshot()
+  /** 终端回放快照（渲染层挂载 xterm 时拉取一次）+ 当前回显编码 */
+  terminalBuffer(): { segments: TerminalBufferSegment[]; encoding: Encoding } {
+    return { segments: this.terminal.snapshot(), encoding: this.client.currentEncoding }
+  }
+
+  /**
+   * 运行时应用「设备回显编码」新偏好（设置页改了立刻生效，不必重连）。
+   * 编码有变化时补一次状态广播 —— 界面状态栏与终端重绘都靠它。
+   */
+  setEncodingPref(pref: 'auto' | Encoding): void {
+    this.client.setEncodingPref(pref)
+    if (this.client.currentEncoding !== this.encoding) {
+      this.encoding = this.client.currentEncoding
+      this.deps.onStateChanged(this.toDevice())
+    }
   }
 
   /** 清空终端回放缓冲（用户执行「清空当前终端」） */

@@ -228,6 +228,16 @@ export function agentActions(
             : [...s.mcpServers, st]
         }))
         return st
+      } catch (e) {
+        // N65：测试连接失败必须落到界面上 —— 过去只有 try/finally，
+        // 「测试连接」点了没反应（原因只在控制台里）
+        set((s) => ({
+          messages: [
+            ...s.messages,
+            { kind: 'system', id: nextId(), text: `测试 MCP 连接失败：${errText(e)}`, tone: 'error' }
+          ]
+        }))
+        return null
       } finally {
         set({ mcpBusy: false })
       }

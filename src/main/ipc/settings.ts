@@ -25,7 +25,9 @@ export function registerSettingsIpc(services: Services): void {
     // 只接受已知字段，避免渲染层塞入任意键污染持久化文件
     const safe: Partial<Settings> = {}
     if (patch?.theme === 'dark' || patch?.theme === 'light') safe.theme = patch.theme
-    if (typeof patch?.deviceEncoding === 'string') safe.deviceEncoding = patch.deviceEncoding
+    if (patch?.deviceEncoding === 'auto' || patch?.deviceEncoding === 'utf8' || patch?.deviceEncoding === 'gbk') {
+      safe.deviceEncoding = patch.deviceEncoding
+    }
     if (typeof patch?.terminalEchoAgentCommands === 'boolean') {
       safe.terminalEchoAgentCommands = patch.terminalEchoAgentCommands
     }

@@ -44,6 +44,10 @@ export interface InterfaceStatusRow {
 /** 解析 `display interface brief` 表格（Interface | PHY | Protocol | …），描述列可选 */
 export function parseInterfaceBrief(text: string): InterfaceStatusRow[] {
   const rows: InterfaceStatusRow[] = []
+  // N39：只有表头**确实带 Description 列**时，才把行尾剩余内容当描述。
+  // 默认 brief 表的剩余列是 InUti / OutUti / inErrors 这类数字，旧的 `(\S.*)` 会把它们
+  // 统统塞进 description —— 一个没有任何消费方的假字段，还会误导人以为设备配了描述。
+  const hasDescriptionColumn = /\bdescription\b/i.test(text)
   for (const raw of text.split('\n')) {
     const line = raw.trim()
     if (!line) continue
@@ -57,7 +61,7 @@ export function parseInterfaceBrief(text: string): InterfaceStatusRow[] {
       name,
       phy: m[2]!.toLowerCase(),
       protocol: m[3]!.toLowerCase(),
-      ...(m[4]?.trim() ? { description: m[4].trim() } : {})
+      ...(hasDescriptionColumn && m[4]?.trim() ? { description: m[4].trim() } : {})
     })
   }
   return rows
@@ -324,6 +328,29 @@ export function ipToInt(ip: string): number | null {
   return ((parts[0]! << 24) | (parts[1]! << 16) | (parts[2]! << 8) | parts[3]!) >>> 0
 }
 
+/**
+ * 严格 IPv4 地址判定（N12）。
+ *
+ * 比 `ipToInt(x) !== null` 更严：`ipToInt` 对 `' 1.2.3.4'`（前导空格）也返回数字，
+ * 而工具层要用它决定「能不能把这个字符串拼进设备命令」，必须完全干净。
+ */
+export function isIpv4Address(ip: string): boolean {
+  const t = ip.trim()
+  return /^\d{1,3}(?:\.\d{1,3}){3}$/.test(t) && ipToInt(t) !== null
+}
+
+/**
+ * ping 命令「整体失败但回显仍可用」的判据（N26）。
+ *
+ * VRP 在 ping 不通时可能把整条命令算作失败，但回显里仍有统计行（含 "packet"）。
+ * 这条规则原本在 `verify_ping` 与 `check_experiment` 各写一份（`!r.ok && !clean.includes('packet')`
+ * 与 `kind === 'ping' && clean.includes('packet')`）—— 改一处忘一处就会漂移，
+ * 故上提到这里做单一事实源。**只对 ping 生效**，别拿去放宽其它命令的失败判定。
+ */
+export function isTolerablePingFailure(r: { clean: string }): boolean {
+  return r.clean.includes('packet')
+}
+
 /** 把 "10.0.12.0/24" 解析成 { base, prefix }；非法返回 null。
  *  默认路由 0.0.0.0/0（prefix=0）必须是合法输入（D10）：
  *  旧实现 `prefix < 1` 把它当非法，导致路由表里的默认路由永远匹配不上任何目标，
@@ -334,8 +361,12 @@ export function parseNetwork(network: string): IpNetwork | null {
   const base = ipToInt(m[1]!)
   const prefix = Number.parseInt(m[2]!, 10)
   if (base === null || prefix < 0 || prefix > 32) return null
-  // prefix===0 时归一化为 0（覆盖全部地址）；JS 移位以 32 为模，直接 shift 会得到原值
-  return { base: prefix === 0 ? 0 : (base >> (32 - prefix)) << (32 - prefix), prefix }
+  // prefix===0 时归一化为 0（覆盖全部地址）；JS 移位以 32 为模，直接 shift 会得到原值。
+  // N38：`>>`/`<<` 产出**有符号** 32 位整数，而 ipToInt 返回无符号 —— 末位为 1 的网段
+  // （如 128.0.0.0/1）会变成负数。routeMatches 目前因两侧同补码比较而侥幸正确，
+  // 但那是隐式依赖；这里 `>>> 0` 显式归一，不再依赖巧合。
+  const masked = prefix === 0 ? 0 : ((base >> (32 - prefix)) << (32 - prefix)) >>> 0
+  return { base: masked, prefix }
 }
 
 /** 从 "10.0.12.0/24" 这类条目里抽出前缀长度（用于最长前缀排序）；解析失败按 0 处理 */

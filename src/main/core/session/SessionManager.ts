@@ -1,5 +1,5 @@
 import net from 'node:net'
-import type { Device, DeviceId, Settings } from '@shared/types'
+import type { Device, DeviceId, Encoding, Settings } from '@shared/types'
 import {
   DEFAULT_TELNET_HOST,
   deviceIdForSsh,
@@ -11,6 +11,7 @@ import { DEFAULT_HOST } from '../telnet/patterns'
 import { openChannel, type SshTarget } from '../transport'
 import type { JsonStore } from '../store/store'
 import { DeviceSession, deviceIdOf, type SessionDeps } from './DeviceSession'
+import type { TelnetClientOptions } from '../telnet/TelnetClient'
 import type { TerminalBufferSegment } from './TerminalBuffer'
 
 export interface ScanProgress {
@@ -138,6 +139,49 @@ export class SessionManager {
     private readonly hooks: SessionManagerHooks
   ) {}
 
+  /**
+   * 由设置推出的通信选项。
+   *
+   * 解码：`auto` 交给探测，否则按用户声明。
+   * 出站编码（N10）：**只在用户显式声明设备字符集时**才跟随 —— 设备「回显是 GBK」
+   * 不等于「接受 GBK 命令」，后者需真机定性，所以默认仍是 utf8（行为不变）。
+   */
+  private clientOptions(): TelnetClientOptions {
+    const decl = this.hooks.getSettings().deviceEncoding
+    return {
+      encoding: decl === 'auto' ? 'auto' : decl,
+      ...(decl !== 'auto' ? { outboundEncoding: decl } : {})
+    }
+  }
+
+  /**
+   * 传给 DeviceSession 的钩子：在转发给上层之前，先做**远端断开**的清理（N30）。
+   *
+   * 为什么要在这里做：socket 断开 / 设备重启不会走 `disconnect()`，旧实现只在
+   * `disconnect` / `forget` 里删 `sessions` 与 `deviceLocks` —— 于是已关闭的
+   * `DeviceSession`（含最多 256KB 回放缓冲）与锁条目会一直常驻，直到手动断开或 TTL，
+   * 而且设备列表也不会收到任何状态更新（界面继续显示「已连接」）。
+   *
+   * 注意：显式 `close()` 时 DeviceSession 会先摘掉自己的 close 监听再关客户端，
+   * 所以这里只会在「远端真的断了」时触发，不会与 disconnect() 重复清理。
+   */
+  private sessionDeps(): SessionManagerHooks {
+    return {
+      getSettings: this.hooks.getSettings,
+      onRaw: this.hooks.onRaw,
+      onStateChanged: this.hooks.onStateChanged,
+      onClosed: (deviceId, reason) => {
+        this.sessions.delete(deviceId)
+        this.deviceLocks.delete(deviceId)
+        const known = this.known.get(deviceId)
+        if (known) this.known.set(deviceId, { ...known, connected: false })
+        this.hooks.onClosed(deviceId, reason)
+        const device = this.known.get(deviceId)
+        if (device) this.hooks.onStateChanged(device)
+      }
+    }
+  }
+
   private baseDeviceForTarget(target: DeviceTarget): Device {
     const id =
       target.transport === 'ssh'
@@ -179,17 +223,9 @@ export class SessionManager {
 
     this.connecting.add(id)
     try {
-      const settings = this.hooks.getSettings()
       const alias =
         name ?? this.store.getAlias(id) ?? this.baseDeviceForTarget(this.telnetTarget(port)).name
-      const { session, info } = await DeviceSession.open(
-        port,
-        alias,
-        {
-          encoding: settings.deviceEncoding === 'auto' ? 'auto' : settings.deviceEncoding
-        },
-        this.hooks
-      )
+      const { session, info } = await DeviceSession.open(port, alias, this.clientOptions(), this.sessionDeps())
       this.sessions.set(id, session)
       this.known.set(id, session.toDevice())
       this.ignored.delete(id)
@@ -221,7 +257,6 @@ export class SessionManager {
 
     this.connecting.add(id)
     try {
-      const settings = this.hooks.getSettings()
       const alias =
         target.name ?? this.store.getAlias(id) ?? this.baseDeviceForTarget(deviceTarget).name
       const ch = await openChannel(deviceTarget, {
@@ -232,8 +267,8 @@ export class SessionManager {
         ch,
         deviceTarget,
         alias,
-        { encoding: settings.deviceEncoding === 'auto' ? 'auto' : settings.deviceEncoding },
-        this.hooks,
+        this.clientOptions(),
+        this.sessionDeps(),
         target.credentialId
       )
       this.sessions.set(id, session)
@@ -344,9 +379,28 @@ export class SessionManager {
   /**
    * 终端回放快照。设备未连接（或已断开）返回空数组 ——
    * 断开时 DeviceSession 就销毁了，缓冲随之消失，重连看不到上一次会话的画面（符合预期）。
+   *
+   * `encoding` 随快照一起回传：终端要把这些原始字节解成文本，而字节本身不带编码信息。
    */
-  terminalBuffer(deviceId: DeviceId): TerminalBufferSegment[] {
-    return this.get(deviceId)?.terminalBuffer() ?? []
+  terminalBuffer(deviceId: DeviceId): { segments: TerminalBufferSegment[]; encoding: Encoding } {
+    return this.get(deviceId)?.terminalBuffer() ?? { segments: [], encoding: 'utf8' }
+  }
+
+  /**
+   * 把「设备回显编码」的新设置即时应用到**所有活动会话**（无需重连）。
+   *
+   * 为什么必须即时：用户改这一项时正盯着终端看中文是不是正常了。
+   * 只在下次连接时生效的话，界面会「改了没反应」，用户只会以为设置项是坏的。
+   * 返回受影响的会话数（供测试与日志）。
+   */
+  applyEncodingPref(pref: 'auto' | Encoding): number {
+    let n = 0
+    for (const s of this.sessions.values()) {
+      if (s.isClosed) continue
+      s.setEncodingPref(pref)
+      n++
+    }
+    return n
   }
 
   /** 清空终端回放缓冲；返回 false 表示该设备当前没有活动会话 */

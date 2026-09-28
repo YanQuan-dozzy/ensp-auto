@@ -16,6 +16,7 @@ import {
   DEFAULT_SETTINGS,
   JsonStore
 } from '../.build/harness.mjs'
+import { tmpDirFactory } from '../harness/tmp.mjs'
 
 /**
  * v1.9：Wireshark 抓包分析接入。
@@ -25,16 +26,21 @@ import {
  * 这样「探测链」「缺失判断」「配置生成」「幂等键」都能稳定复现。
  */
 
-/** 造一个假的 Wireshark 目录；tools 里列出的工具会创建为空文件 */
+/**
+ * 造一个假的 Wireshark 目录；tools 里列出的工具会创建为空文件。
+ * N80：临时目录统一由文件级 after() 钩子清理（此前从不删）。
+ */
+const makeTmp = tmpDirFactory('ws-')
+
 function fakeSuite(tools) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-suite-'))
+  const dir = makeTmp()
   const ext = process.platform === 'win32' ? '.exe' : ''
   for (const t of tools) fs.writeFileSync(path.join(dir, `${t}${ext}`), '')
   return dir
 }
 
 function fakeUserData() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'ws-ud-'))
+  return makeTmp()
 }
 
 test('v1.9 探测：目录里有 tshark 时判定可分析', () => {
@@ -65,7 +71,7 @@ test('v1.9 探测：override 目录不含 tshark 时会继续往后续来源找'
   // 注意这条**不能**断言「结果为 false」：探测链在 override 失败后还会查环境变量、
   // 注册表与常见路径 —— 开发机上真的装了 Wireshark 时，结果本来就是 true。
   // 断言「不再停在 setting 来源」才是这条用例真正要守的行为。
-  const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-empty-'))
+  const empty = makeTmp()
   const p = probeWireshark({ overrideDir: empty })
   if (p.canAnalyze) {
     assert.notEqual(p.source, 'setting', 'override 无效时不该声称命中了它')
@@ -108,7 +114,7 @@ test('v1.9 可用性：组件没装时如实报不可用，且给出原因', () 
 test('v1.9 可用性：组件路径不存在时无论如何都不能算 usable', () => {
   // 不看 tshark 了 —— 本机可能真装了 Wireshark，那条分支的结果依赖环境。
   // 「没装组件就不可用」是纯逻辑约束，与环境无关，这才是稳定的断言。
-  const a = checkWiresharkMcp(fakeUserData(), fs.mkdtempSync(path.join(os.tmpdir(), 'ws-none-')))
+  const a = checkWiresharkMcp(fakeUserData(), makeTmp())
   assert.equal(a.installed, false)
   assert.equal(a.usable, false)
   assert.ok(a.paths.entry === null)
@@ -132,7 +138,7 @@ test('v1.9 配置生成：未就绪时拒绝产出配置（避免挂上一个必
 
   const noTshark = checkWiresharkMcp(
     fakeUserData(),
-    fs.mkdtempSync(path.join(os.tmpdir(), 'ws-none2-'))
+    makeTmp()
   )
   assert.equal(buildWiresharkMcpConfig(noTshark), null)
 })

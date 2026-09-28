@@ -125,8 +125,12 @@ export interface CommandResult {
  * 渲染层要消费它，与 CommandResult 同层次，不属于纯 IPC 载荷。
  *
  * `data` 是 latin1 字符串：**每个 code unit 恰好一个原始字节**，
- * 渲染层 `Uint8Array.from(data, (c) => c.charCodeAt(0))` 无损还原后交给 xterm 解码。
- * 不要在传输层做文本解码 —— 终端显示必须是设备原始字节。
+ * 渲染层 `Uint8Array.from(data, (c) => c.charCodeAt(0))` 即可无损还原。
+ *
+ * 还原出来的是**原始字节**，渲染层必须**按设备回显编码**（`TerminalBufferPayload.encoding`）
+ * 解成文本文再交给 xterm —— xterm 的输入解码器只认 UTF-8，把 GBK 字节丢给它
+ * 会解出「ǷĵǰԻȷл」这类拉丁扩展字母（2026-09-28 修的中文乱码就是这个）。
+ * 保留字节而不是直接存文本，是为了编码变更时能**整屏按新编码重画**。
  */
 export interface TerminalBufferSegment {
   data: string

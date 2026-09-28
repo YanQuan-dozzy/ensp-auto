@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useApp } from '@/stores/app'
 import { activeProfileOf } from '@shared/profiles'
+import { EVENT } from '@shared/channels'
+import type { WindowStatePayload } from '@shared/api'
 import { DevicePanel } from '@/features/devices/DevicePanel'
 import { TerminalPane } from '@/features/terminal/TerminalPane'
 import { AgentPanel } from '@/features/agent/AgentPanel'
@@ -12,10 +14,12 @@ import { SkillsPanel } from '@/features/skills/SkillsPanel'
 import { ChangeTimeline } from '@/features/changes/ChangeTimeline'
 import { TracePanel } from '@/features/trace/TracePanel'
 import {
+  DEFAULT_SHORTCUTS_MAP,
   formatKeys,
   getEffectiveShortcuts,
   matchesShortcut
 } from '@/features/shortcuts/shortcutsData'
+import { escLayerOpen } from '@/features/shortcuts/escLayers'
 import {
   IconLogo,
   IconSidebar,
@@ -44,6 +48,21 @@ import {
   computeClampedRight,
   computeWindowResizeShrink
 } from './features/layout/panelSizing'
+
+/**
+ * N73：给 `role="button"` 的 div 补最小键盘支持 —— Enter / Space 等价于点击。
+ *
+ * 只认这两个键，其余原样放过（不与全局快捷键抢键）。桌面端多为鼠标操作，
+ * 但纯键盘用户此前**完全无法**切换工作区 tab（Tab 键走不到 div）。
+ */
+function activateOnKey(
+  e: { key: string; preventDefault: () => void },
+  activate: () => void
+): void {
+  if (e.key !== 'Enter' && e.key !== ' ') return
+  e.preventDefault()
+  activate()
+}
 
 /**
  * 三栏主布局。
@@ -78,17 +97,17 @@ export function App(): ReactNode {
     () => getEffectiveShortcuts(settings.shortcuts),
     [settings.shortcuts]
   )
-  const settingsShortcut = effShortcuts['app:settings'] ?? ['Ctrl', ',']
+  const settingsShortcut = effShortcuts['app:settings'] ?? DEFAULT_SHORTCUTS_MAP['app:settings'] ?? []
   const settingsShortcutDisplay = formatKeys(settingsShortcut)
   const settingsShortcutBadge =
     settingsShortcut.find((k) => !['Ctrl', 'Shift', 'Alt', 'Cmd', 'Meta'].includes(k)) ??
     settingsShortcut[settingsShortcut.length - 1] ??
-    ','
+    '?'
 
   // 监听窗口最大化状态
   useEffect(() => {
     void window.api.window.isMaximized().then(setIsMaximized)
-    const off = window.api.on<{ isMaximized: boolean }>('window:state-changed', (p) => {
+    const off = window.api.on<WindowStatePayload>(EVENT.windowStateChanged, (p) => {
       setIsMaximized(p.isMaximized)
     })
     return off
@@ -259,9 +278,17 @@ export function App(): ReactNode {
 
       // 停止生成 / 取消 (Esc 或自定义)
       if (matchesShortcut(e, eff['agent:stop'])) {
+        // N66：有浮层认领 Esc（如「编辑模型」子弹窗）时一律让行 ——
+        // 本监听在捕获阶段且会 stopPropagation，不让行的话事件到不了浮层，
+        // 结果是「按一次 Esc 连关两层」，未保存的草稿静默丢失。
+        if (escLayerOpen()) return
         // R23：闸门开着时 Esc 归闸门（= 拒绝本次调用），不能顺手中止整个任务。
         // 本监听在捕获阶段先执行，过去会在这里把事件吞掉，闸门永远收不到 Esc。
         if (st.gate) return
+        // N3：提问卡同理 —— Esc 归提问卡（= 取消这一问），不能中止整个任务。
+        // 卡片自身在冒泡阶段监听 Esc；本监听在捕获阶段且会 stopPropagation，
+        // 不让行的话事件根本到不了卡片（R23 只给 gate 开了口，漏了 v2.7 的提问路径）。
+        if (st.question) return
         if (settingsOpen) {
           e.preventDefault()
           e.stopPropagation()
@@ -500,41 +527,64 @@ export function App(): ReactNode {
           <div className="col" style={{ flex: 1, minWidth: 0 }}>
             <div className="tabstrip">
               <div className="tab-pill-group">
+                {/* N73：键盘可达性 —— 这些 tab 原本是纯 `<div onClick>`，Tab 键走不到，
+                    纯键盘用户无法切换工作区。内部无嵌套可交互元素，直接补
+                    role/tabIndex + Enter·Space 即可（带嵌套按钮的列表行另议）。 */}
                 <div
+                  role="button"
+                  tabIndex={0}
+                  aria-current={activeTab === 'terminal' ? 'page' : undefined}
                   className={`tab${activeTab === 'terminal' ? ' active' : ''}`}
                   onClick={() => setTab('terminal')}
+                  onKeyDown={(e) => activateOnKey(e, () => setTab('terminal'))}
                   title={`设备交互终端 (${formatKeys(effShortcuts['nav:terminal'] ?? ['Ctrl', '1'])})`}
                 >
                   <IconTerminal size={14} />
                   终端
                 </div>
                 <div
+                  role="button"
+                  tabIndex={0}
+                  aria-current={activeTab === 'topology' ? 'page' : undefined}
                   className={`tab${activeTab === 'topology' ? ' active' : ''}`}
                   onClick={() => setTab('topology')}
+                  onKeyDown={(e) => activateOnKey(e, () => setTab('topology'))}
                   title={`拓扑画布 (${formatKeys(effShortcuts['nav:topology'] ?? ['Ctrl', '2'])})`}
                 >
                   <IconTopology size={14} />
                   拓扑画布
                 </div>
                 <div
+                  role="button"
+                  tabIndex={0}
+                  aria-current={activeTab === 'skills' ? 'page' : undefined}
                   className={`tab${activeTab === 'skills' ? ' active' : ''}`}
                   onClick={() => setTab('skills')}
+                  onKeyDown={(e) => activateOnKey(e, () => setTab('skills'))}
                   title={`技能库与提示词管理 (${formatKeys(effShortcuts['nav:skills'] ?? ['Ctrl', '3'])})`}
                 >
                   <IconSparkles size={14} />
                   技能
                 </div>
                 <div
+                  role="button"
+                  tabIndex={0}
+                  aria-current={activeTab === 'changes' ? 'page' : undefined}
                   className={`tab${activeTab === 'changes' ? ' active' : ''}`}
                   onClick={() => setTab('changes')}
+                  onKeyDown={(e) => activateOnKey(e, () => setTab('changes'))}
                   title="变更时间线：所有设备的配置变更审计"
                 >
                   <IconActivity size={14} />
                   变更
                 </div>
                 <div
+                  role="button"
+                  tabIndex={0}
+                  aria-current={activeTab === 'trace' ? 'page' : undefined}
                   className={`tab${activeTab === 'trace' ? ' active' : ''}`}
                   onClick={() => setTab('trace')}
+                  onKeyDown={(e) => activateOnKey(e, () => setTab('trace'))}
                   title="执行轨迹：书签 / 分支对比 / 回放"
                 >
                   <IconRotateCcw size={14} />

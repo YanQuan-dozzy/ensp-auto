@@ -10,6 +10,7 @@
  */
 import { useState, type ReactNode } from 'react'
 import { ALL_PROVIDERS, PROVIDER_ORDER, isNativeProvider, type LlmProvider } from '@shared/providers'
+import { useEscLayer } from '@/features/shortcuts/useEscLayer'
 import {
   PROFILE_BOUNDS,
   REASONING_EFFORT_LABEL,
@@ -59,6 +60,17 @@ export function ModelEditorDialog({
   const [advanced, setAdvanced] = useState(true)
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState('')
+
+  /**
+   * N66：Esc 只关本层。
+   *
+   * 这个弹窗是**本地草稿 + 点保存才落盘**（见文件头取舍说明），误按 Esc 的代价
+   * 是「填了十几个字段的草稿静默丢失」。原实现没有任何 Esc 处理，而
+   * `SettingsDialog` 在冒泡阶段、`App.tsx` 在捕获阶段都会把 Esc 变成「关掉整个设置页」——
+   * 一次按键连关两层。`useEscLayer` 同时解决两件事：捕获阶段 `stopPropagation`
+   * 挡住 SettingsDialog，认领一层让 App 的全局监听早退。
+   */
+  useEscLayer(onClose)
 
   const meta = ALL_PROVIDERS[draft.provider]
   const models = meta?.models ?? []

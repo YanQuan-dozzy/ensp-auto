@@ -3,7 +3,9 @@ import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
 import { EVENT } from '@shared/channels'
-import type { TerminalClearPayload, TerminalDataPayload } from '@shared/api'
+import type { TerminalBufferPayload, TerminalClearPayload, TerminalDataPayload } from '@shared/api'
+import type { Encoding } from '@shared/types'
+import { createStreamDecoder } from '@shared/terminal-decode'
 import { useApp } from '@/stores/app'
 import { Empty, IconTerminal } from '@/components/ui'
 import { readTerminalFont, readXtermTheme } from './xtermTheme'
@@ -13,16 +15,21 @@ import { matchesShortcut, terminalPassthroughShortcuts } from '@/features/shortc
  * xterm 终端。
  *
  * 实现要点：
- * 1. 原始字节直接交给 xterm（Uint8Array），由 xterm 自己解码 ——
- *    我们在主进程做的是「业务用」的解码，终端显示要保持与设备端一致。
+ * 1. 设备原始字节在**这一层**按设备回显编码解成文本再写进 xterm（2026-09-28 修）。
+ *    原因：xterm 的输入解码器只认 UTF-8，而设备切到中文后回显是 GBK ——
+ *    把 GBK 字节丢给它只会解出「ǷĵǰԻȷл」这类拉丁/希腊字母乱码，
+ *    且与设置里的 utf8/gbk 毫无关系（那条设置过去只管主进程的业务解码）。
+ *    载荷自带 `encoding`，解码用 `createStreamDecoder`（有状态，半截汉字跨片不丢）。
  * 2. 代理下发的命令用 --agent 色加 ⟨agent⟩ 前缀标注，与用户手输可区分。
  * 3. **挂载时先拉一次回放快照**（2026-09-25）：设备字节流从连接成功那一刻就开始到达，
  *    而 xterm 是后建的（切设备还会整个重建），不拉快照就只能看到一片空白，
  *    连接握手的 banner / 提示符 / 探针输出全都看不到。
  *    快照与实时事件用 seq 对齐去重（先订阅、后回放，只写 seq 大于快照水位的实时段）。
- * 4. 设备被代理占用时主进程只缓冲不回显，这里负责**本地回显** ——
+ * 4. 回显编码变化时**整屏重画**（回放缓冲存的是原始字节，按新编码重解一遍就对）
+ *    —— 已经画到屏幕上的乱码没有别的修法，xterm 内部没有「换编码」这种操作。
+ * 5. 设备被代理占用时主进程只缓冲不回显，这里负责**本地回显** ——
  *    否则用户敲键盘屏幕上毫无反应，观感就是「终端打不了字」。
- * 5. 按键放行只认终端适用作用域的快捷键：`agent:send` 绑的是裸 Enter，
+ * 6. 按键放行只认终端适用作用域的快捷键：`agent:send` 绑的是裸 Enter，
  *    若一并放行，xterm 就收不到回车，命令永远发不出去。
  */
 export function TerminalPane(): React.ReactNode {
@@ -32,6 +39,10 @@ export function TerminalPane(): React.ReactNode {
   const lastFromAgent = useRef(false)
   /** 已本地回显、但设备端还没收到的字符数（占用期回显，提交/让位时清掉） */
   const localEchoRef = useRef(0)
+  /** 屏幕上的内容是用哪个编码画的（'' = 还没画过）；编码一变就整屏重画 */
+  const appliedEncRef = useRef<Encoding | ''>('')
+  /** 供「编码变化」effect 触发重画（重画函数活在终端实例的闭包里） */
+  const replayRef = useRef<((reset: boolean) => void) | null>(null)
 
   const activeDeviceId = useApp((s) => s.activeDeviceId)
   const devices = useApp((s) => s.devices)
@@ -86,6 +97,12 @@ export function TerminalPane(): React.ReactNode {
     fitRef.current = fit
     lastFromAgent.current = false
     localEchoRef.current = 0
+    appliedEncRef.current = ''
+
+    /** 设备字节 → 文本的解码器（有状态：半截汉字会等下一片字节） */
+    let decoder = createStreamDecoder('utf8')
+
+    const welcome = `\x1b[38;5;245m已连接到 ${activeDeviceId}\x1b[0m`
 
     const safeFit = (): void => {
       try {
@@ -97,19 +114,24 @@ export function TerminalPane(): React.ReactNode {
     }
     safeFit()
 
-    term.writeln(`\x1b[38;5;245m已连接到 ${activeDeviceId}\x1b[0m`)
-
-    /** 把一段设备原始字节写进终端（含代理标注与「显示代理命令」开关） */
-    const writeChunk = (chunk: Uint8Array, fromAgent: boolean): void => {
-      // 「终端显示代理命令」关闭时，代理下发的命令与其回显都不落地到终端，
-      // 用户仍能在右侧 AI 面板的执行轨迹里逐条看到（原始字节不丢，只是不往这里写）。
+    /**
+     * 把一段设备原始字节写进终端（含代理标注与「显示代理命令」开关）。
+     *
+     * `encoding` 省略时沿用解码器当前编码（回放同一编码的连续段就走这条）。
+     */
+    const writeChunk = (bytes: Uint8Array, fromAgent: boolean, encoding?: Encoding): void => {
+      // 先喂解码器、再决定写不写：即便这段因为开关被跳过，也不能把字节丢在解码器外 ——
+      // 落掉半截多字节序列，后面每一个字符都会错位。
+      if (encoding) decoder.setEncoding(encoding)
+      const text = decoder.push(bytes)
+      if (!text) return
       if (fromAgent && !echoRef.current) return
       if (fromAgent && !lastFromAgent.current) {
         // 代理下发的命令：以代理色标注来源，设备自身的回显紧随其后
         term.write('\r\n\x1b[38;5;183m⟨agent⟩\x1b[0m ')
       }
       lastFromAgent.current = fromAgent
-      term.write(chunk)
+      term.write(text)
     }
 
     /** latin1 字符串 → 原始字节（一 code unit = 一字节） */
@@ -122,7 +144,53 @@ export function TerminalPane(): React.ReactNode {
     // —— 数据通道：先订阅（未就绪时暂存），回放快照后再放行 ——
     let disposed = false
     let live = false
+    /** 重画代次：并发重画只有最后一次算数，在途的旧重画作废 */
+    let replayId = 0
     const pending: TerminalDataPayload[] = []
+
+    /**
+     * 用主进程的回放缓冲重建画面（挂载时 + 回显编码变化时）。
+     *
+     * 之所以能「重画」：缓冲里存的是**原始字节**，按新编码重解一遍就对了；
+     * 而屏幕上已经画出来的乱码只能靠重画修掉。
+     */
+    const replay = async (reset: boolean): Promise<void> => {
+      const myId = ++replayId
+      live = false
+      pending.length = 0
+
+      let snap: TerminalBufferPayload | null = null
+      try {
+        snap = await window.api.terminal.buffer(activeDeviceId)
+      } catch {
+        /* 拉快照失败不该把终端卡死：切到实时模式，后续数据照常显示 */
+      }
+      if (disposed || myId !== replayId) return
+
+      if (reset) {
+        term.reset()
+        term.writeln(welcome)
+        // 画面被清空，本地回显与「上一段是否来自代理」的记号也一并归零，
+        // 否则后续第一段代理输出会被少画一个 ⟨agent⟩ 前缀
+        localEchoRef.current = 0
+        lastFromAgent.current = false
+      }
+      if (snap) {
+        decoder = createStreamDecoder(snap.encoding)
+        appliedEncRef.current = snap.encoding
+        for (const seg of snap.segments) writeChunk(latin1ToBytes(seg.data), seg.fromAgent)
+        live = true
+        // 快照期间到达的实时段：只写水位之后的，避免同一段内容被写两遍
+        for (const p of pending) {
+          if (p.seq > snap.seq) writeChunk(p.chunk, p.fromAgent, p.encoding)
+        }
+      } else {
+        live = true
+        for (const p of pending) writeChunk(p.chunk, p.fromAgent, p.encoding)
+      }
+      pending.length = 0
+    }
+    replayRef.current = (reset: boolean): void => void replay(reset)
 
     const offData = window.api.on<TerminalDataPayload>(EVENT.terminalData, (payload) => {
       if (payload.deviceId !== activeDeviceId) return
@@ -130,28 +198,18 @@ export function TerminalPane(): React.ReactNode {
         pending.push(payload)
         return
       }
+      if (payload.encoding !== decoder.encoding) {
+        // 回显编码变了（自动探测刚锁定 GBK，或用户改了设置）：
+        // 旧画面是拿旧编码解出来的，只有整屏重画才能修掉。
+        // 先记下新编码，免得紧随其后的状态广播（device.encoding）再触发一次重画。
+        appliedEncRef.current = payload.encoding
+        void replay(true)
+        // replay 已同步把 live 置回 false，这一段会进 pending，由重画后的水位判断写入
+        pending.push(payload)
+        return
+      }
       writeChunk(payload.chunk, payload.fromAgent)
     })
-
-    void window.api.terminal
-      .buffer(activeDeviceId)
-      .then((snap) => {
-        if (disposed) return
-        for (const seg of snap.segments) writeChunk(latin1ToBytes(seg.data), seg.fromAgent)
-        live = true
-        // 快照期间到达的实时段：只写水位之后的，避免同一段内容被写两遍
-        for (const p of pending) {
-          if (p.seq > snap.seq) writeChunk(p.chunk, p.fromAgent)
-        }
-        pending.length = 0
-      })
-      .catch(() => {
-        if (disposed) return
-        // 拉快照失败不该把终端卡死：直接切到实时模式
-        live = true
-        for (const p of pending) writeChunk(p.chunk, p.fromAgent)
-        pending.length = 0
-      })
 
     const offClosed = window.api.on<{ deviceId: string; reason: string }>(
       EVENT.terminalClosed,
@@ -214,8 +272,14 @@ export function TerminalPane(): React.ReactNode {
     const ro = new ResizeObserver(() => safeFit())
     ro.observe(host)
 
+    term.writeln(welcome)
+    void replay(false)
+
     return () => {
       disposed = true
+      // 让在途的重画作废：终端已 dispose，晚到的写入会抛
+      replayId++
+      replayRef.current = null
       disposeData.dispose()
       offData()
       offClosed()
@@ -234,6 +298,25 @@ export function TerminalPane(): React.ReactNode {
     if (!term) return
     term.options.theme = readXtermTheme()
   }, [theme])
+
+  /**
+   * 回显编码变化 → 整屏重画。
+   *
+   * 两个来源都会走到这里：① 主进程自动探测刚锁定 GBK（此前几段中文是按 UTF-8 解的，
+   * 屏幕上是乱码，重画后一并修好）；② 用户在设置里切换编码（主进程已即时应用到会话，
+   * 并广播 device.encoding）。
+   *
+   * 少了这一步，用户改完设置看不到任何变化 —— 只会以为设置项是坏的。
+   * 首次（挂载）不同步：那一屏由回放快照负责画，它自带 encoding。
+   */
+  useEffect(() => {
+    const next = device?.encoding
+    if (!next || appliedEncRef.current === next) return
+    const first = appliedEncRef.current === ''
+    appliedEncRef.current = next
+    if (first) return
+    replayRef.current?.(true)
+  }, [device?.encoding])
 
   if (!activeDeviceId) {
     return (

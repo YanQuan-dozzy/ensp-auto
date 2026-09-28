@@ -46,6 +46,9 @@ const FILTERS: Array<{ id: 'all' | ChangeResult; label: string }> = [
   { id: 'blocked', label: '被拦截' }
 ]
 
+/** N17：长列表首屏条数（其余按「显示更多」追加） */
+const PAGE_SIZE = 120
+
 function formatTime(at: number): string {
   const d = new Date(at)
   const p = (n: number): string => String(n).padStart(2, '0')
@@ -137,6 +140,23 @@ export function ChangeTimeline(): ReactNode {
     () => (filter === 'all' ? records : records.filter((r) => r.result === filter)),
     [records, filter]
   )
+
+  /**
+   * N17：渐进渲染（长列表）。
+   *
+   * 每次最多拉 300 条并**一次性全部挂进 DOM** —— 变更记录是审计流水，跑一整天实验
+   * 很容易攒到几百条，DOM 节点数与布局开销随之线性增长（叠加消息流后就是掉帧）。
+   * 这里不引入虚拟滚动库（会与现有行内展开/删除的局部 state 冲突），只做**分页展开**：
+   * 首屏 120 条，其余按需追加 —— 既保住「点开看完整命令」的交互，又把首屏成本固定住。
+   */
+  const [limit, setLimit] = useState(PAGE_SIZE)
+  useEffect(() => {
+    // 换筛选条件 = 换了一份列表，回到首屏（否则「只看失败」时可能一上来就展开一大截）
+    setLimit(PAGE_SIZE)
+  }, [filter])
+
+  const visible = useMemo(() => shown.slice(0, limit), [shown, limit])
+  const hiddenCount = shown.length - visible.length
 
   const counts = useMemo(() => {
     const c: Record<string, number> = { ok: 0, failed: 0, rejected: 0, blocked: 0 }
@@ -240,9 +260,23 @@ export function ChangeTimeline(): ReactNode {
             </div>
           </div>
         ) : (
-          shown.map((r) => (
-            <ChangeRow key={r.id} record={r} deviceName={nameOf(r.deviceId)} onRemove={removeOne} />
-          ))
+          <>
+            {visible.map((r) => (
+              <ChangeRow key={r.id} record={r} deviceName={nameOf(r.deviceId)} onRemove={removeOne} />
+            ))}
+            {/* N17：其余条目按需展开 —— 明确写出还剩多少，避免用户以为列表就这么长 */}
+            {hiddenCount > 0 ? (
+              <div style={{ display: 'flex', justifyContent: 'center', padding: '10px 0' }}>
+                <button
+                  className="btn sm"
+                  onClick={() => setLimit((l) => l + PAGE_SIZE)}
+                  title="继续往下显示（不改变磁盘数据）"
+                >
+                  显示更多（还有 {hiddenCount} 条）
+                </button>
+              </div>
+            ) : null}
+          </>
         )}
       </div>
     </div>

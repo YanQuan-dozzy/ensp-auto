@@ -168,8 +168,10 @@ export function decode(buf: Buffer, encoding: Encoding): DecodeResult {
  * 从字节流的尾部截取一段用于增量检测（分页 / 提示符 / 确认提示）。
  *
  * 关键细节：截断点可能落在多字节字符中间。这里回退跳过 UTF-8 续接字节（0b10xxxxxx），
- * 避免在尾部检测时产生虚假的替换符；GBK 的双字节序列同样跳过 0x40–0xFE 区间的续字节。
- * 由于检测只看尾部，起点处的少量偏差不影响判定。
+ * 避免在尾部检测时产生虚假的替换符。
+ * **已知局限**（N34-9，此前注释与实现不符）：这里只跳过 UTF-8 续接字节，GBK 的双字节
+ * 序列没有专门处理 —— 起点落在 GBK 汉字中间时，最多产生 1 个替换符。因为检测只看尾部，
+ * 这点偏差不影响判定，故不做额外处理（保持简单）。
  */
 export function tailSlice(buf: Buffer, tailBytes: number): Buffer {
   if (buf.length <= tailBytes) return buf
@@ -182,4 +184,60 @@ export function tailSlice(buf: Buffer, tailBytes: number): Buffer {
 /** 探测当前环境的 GBK 支持情况，用于启动日志与设置页展示 */
 export function probeEncodingSupport(): { utf8: boolean; gbk: boolean } {
   return { utf8: true, gbk: getGbkDecoder() !== null }
+}
+
+// ———————————————————————————— 出站编码（N10） ————————————————————————————
+
+/** 出站编码失败（环境不支持 / 字符无法映射）。调用方必须显式处理，绝不静默替换字符 */
+export class EncodeError extends Error {}
+
+let gbkTable: Map<string, number[]> | null = null
+
+/**
+ * 构建「字符 → GBK 字节」反查表。
+ *
+ * 为什么要手搓：Node 的 `TextEncoder` **只有 UTF-8**，没有 GBK 编码器。这里的反查表以
+ * 系统自带的 GBK **解码器**为唯一事实源 —— 遍历所有合法双字节组合
+ * （首字节 0x81–0xFE，尾字节 0x40–0xFE 去掉 0x7F），能解出单个字符的即为一组映射。
+ * 只在**首次真正需要编码 GBK** 时构建一次（约 2.4 万次解码）。
+ */
+function getGbkEncoderTable(): Map<string, number[]> | null {
+  const dec = getGbkDecoder()
+  if (!dec) return null
+  if (gbkTable) return gbkTable
+  const table = new Map<string, number[]>()
+  for (let hi = 0x81; hi <= 0xfe; hi++) {
+    for (let lo = 0x40; lo <= 0xfe; lo++) {
+      if (lo === 0x7f) continue
+      const ch = dec.decode(new Uint8Array([hi, lo]))
+      if (ch.length === 1 && ch !== REPLACEMENT_CHAR) table.set(ch, [hi, lo])
+    }
+  }
+  // ASCII 直通（含 \r \n \x03 等控制字符 —— 它们必须原样下发，不能因为「不在表里」被拒）
+  for (let c = 0; c < 0x80; c++) table.set(String.fromCharCode(c), [c])
+  gbkTable = table
+  return table
+}
+
+/**
+ * 把文本编码成设备可接受的字节（N10）。
+ *
+ * - `utf8`：与历史上的 `Buffer.from(str)` **逐字节一致**（默认路径行为不变）；
+ * - `gbk`：走反查表，遇到无法映射的字符**显式抛 EncodeError**，而不是替换成 `?` ——
+ *   静默替换会让设备存下一串「看起来正常」的错误配置（回读时也是乱码，但没人知道源头）。
+ *
+ * 说明：是否真的要用 GBK 下发，取决于「设备接受什么编码的命令」，
+ * 这需要真机定性（CODE-REVIEW-2026-09-27 §7 #1），所以调用方默认仍用 utf8。
+ */
+export function encode(text: string, encoding: Encoding): Buffer {
+  if (encoding === 'utf8') return Buffer.from(text, 'utf8')
+  const table = getGbkEncoderTable()
+  if (!table) throw new EncodeError('当前运行环境不支持 GBK 编码（TextDecoder 无 gbk）')
+  const bytes: number[] = []
+  for (const ch of text) {
+    const pair = table.get(ch)
+    if (!pair) throw new EncodeError(`字符「${ch}」无法用 GBK 编码`)
+    for (const b of pair) bytes.push(b)
+  }
+  return Buffer.from(bytes)
 }

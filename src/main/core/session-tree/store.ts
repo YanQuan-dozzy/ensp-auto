@@ -3,6 +3,8 @@ import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import type { SessionNode, SessionNodeMeta, TurnFinishRecord } from '@shared/types'
 import { atomicWriteFileSync, atomicWriteJsonSync } from '../fs/atomic'
+import { quarantineFile } from '../fs/quarantine'
+import { describeShapeWarning, isFiniteNumber, isNonEmptyString, sanitizeIndexItems } from '../store/index-shape'
 
 /**
  * 会话树存储（v0.4 / F-6.2）。
@@ -29,12 +31,29 @@ interface IndexFile {
   sessions: Record<string, SessionNodeMeta>
 }
 
+/** N19：会话列表广播的合流窗口（同一窗口内的多次变更只推一份） */
+const NOTIFY_COALESCE_MS = 60
+
+/**
+ * 索引条目的形状判定（N44）：只要求 id 存在，其余字段在归一化阶段补齐。
+ *
+ * 为什么不像 snapshots/changes 那样要求全部字段：id 缺失的条目无法被寻址（等于垃圾），
+ * 但 title/updatedAt 等字段缺失的老索引**仍对应一个可打开的会话**，丢掉整条就是丢会话。
+ * 所以这里宽进，缺的数值字段在 loadIndex 里补（避免 list() 排序出 NaN）。
+ */
+function isSessionNodeMeta(v: unknown): v is SessionNodeMeta {
+  if (!v || typeof v !== 'object') return false
+  return isNonEmptyString((v as Partial<SessionNodeMeta>).id)
+}
+
 export class SessionTreeStore {
   private index: Map<string, SessionNodeMeta> = new Map()
   /** rootId → 已加载的节点数组（惰性） */
   private cache = new Map<string, SessionNode[]>()
   /** nodeId → rootId（追加时定位所属会话） */
   private owner = new Map<string, string>()
+  /** N19：列表广播的待发定时器（合流用，见 notify） */
+  private notifyTimer: ReturnType<typeof setTimeout> | null = null
 
   constructor(private readonly opts: SessionTreeStoreOptions) {
     fs.mkdirSync(opts.dir, { recursive: true })
@@ -64,27 +83,60 @@ export class SessionTreeStore {
   }
 
   private loadIndex(): void {
+    // 没有索引文件不是「损坏」：新目录直接以空索引开始，别误报损坏、更别去留档
+    if (!fs.existsSync(this.indexFile())) return
     try {
-      const raw = JSON.parse(fs.readFileSync(this.indexFile(), 'utf8')) as IndexFile
-      const sessions = raw?.sessions ?? {}
-      for (const m of Object.values(sessions)) {
-        if (m && typeof m.id === 'string') {
-          // v2.8：老索引缺字段一律归一化 —— 缺 `titleSource` 说明是用户/AI 之前留下的，
-          // 视为 auto（可被 AI 重写）；缺 `resumable` 视为 false（不主动骚扰用户续跑）。
-          if (m.titleSource !== 'user') m.titleSource = 'auto'
-          m.resumable = m.resumable === true
-          // v2.15：缺 `aiTitled` 视为 false —— 老会话视为「还欠一个 AI 标题」，
-          // 之后成功收尾的轮次会补起（前提是标题没被用户钉住）。
-          m.aiTitled = m.aiTitled === true
-          // v2.14：完整性标记只认 'damaged' 这一个取值，别的（手改索引 / 老版本残留）一律清掉，
-          // 免得界面读到一个无法解释的状态
-          if (m.integrity !== 'damaged') delete m.integrity
-          this.index.set(m.id, m)
-        }
+      const raw = JSON.parse(fs.readFileSync(this.indexFile(), 'utf8')) as Partial<IndexFile>
+      // N44：与 snapshots/changes 复用同一套形状校验（此前是手写的 `raw?.sessions ?? {}`）。
+      // 索引是「id → meta」的 map，先摊平成数组；sessions 不是对象/数组时由
+      // sanitizeIndexItems 按 notArray 统一告警，坏条目丢弃并计数。
+      const rawSessions = raw?.sessions
+      const list =
+        rawSessions && typeof rawSessions === 'object' && !Array.isArray(rawSessions)
+          ? Object.values(rawSessions)
+          : rawSessions
+      const shaped = sanitizeIndexItems(list, isSessionNodeMeta)
+      if (shaped.notArray) {
+        // N22：sessions 整体不是「对象/数组」→ 与解析失败同等处置（留档 + 清空）
+        this.recoverFromUnusableIndex('的 sessions 字段不是对象/数组')
+        return
       }
+      for (const m of shaped.items) {
+        // 数值字段缺失会让 list() 的 `b.updatedAt - a.updatedAt` 算出 NaN、排序不稳定 ——
+        // 一律归一化（宽进），而不是把整条会话丢掉
+        if (!isFiniteNumber(m.createdAt)) m.createdAt = 0
+        if (!isFiniteNumber(m.updatedAt)) m.updatedAt = m.createdAt
+        if (!isFiniteNumber(m.nodeCount)) m.nodeCount = 0
+        if (typeof m.title !== 'string') m.title = ''
+        // v2.8：老索引缺字段一律归一化 —— 缺 `titleSource` 说明是用户/AI 之前留下的，
+        // 视为 auto（可被 AI 重写）；缺 `resumable` 视为 false（不主动骚扰用户续跑）。
+        if (m.titleSource !== 'user') m.titleSource = 'auto'
+        m.resumable = m.resumable === true
+        // v2.15：缺 `aiTitled` 视为 false —— 老会话视为「还欠一个 AI 标题」，
+        // 之后成功收尾的轮次会补起（前提是标题没被用户钉住）。
+        m.aiTitled = m.aiTitled === true
+        // v2.14：完整性标记只认 'damaged' 这一个取值，别的（手改索引 / 老版本残留）一律清掉，
+        // 免得界面读到一个无法解释的状态
+        if (m.integrity !== 'damaged') delete m.integrity
+        this.index.set(m.id, m)
+      }
+      const warning = describeShapeWarning('会话', shaped)
+      if (warning) console.warn(`[session-tree] ${warning}（${this.indexFile()}）`)
     } catch {
-      this.index.clear()
+      this.recoverFromUnusableIndex('无法解析（文件损坏）')
     }
+  }
+
+  /**
+   * N22：索引不可用（解析失败 / sessions 整体形状错误）时的统一处置：留档 + 清空。
+   * 会话索引可由 `tree-*.jsonl` 另行重建，但绝不静默覆盖损坏文件（否则无法人工抢救）。
+   */
+  private recoverFromUnusableIndex(reason: string): void {
+    const archived = quarantineFile(this.indexFile())
+    this.index.clear()
+    console.warn(
+      `[session-tree] 会话索引${reason}${archived ? `，原文件已留档为 ${archived}` : ''}，已按空列表处理：${this.indexFile()}`
+    )
   }
 
   private persistIndex(): void {
@@ -93,8 +145,26 @@ export class SessionTreeStore {
     atomicWriteJsonSync(this.indexFile(), data)
   }
 
+  /**
+   * 会话列表变化广播（N19：合流）。
+   *
+   * 一次任务里 `append` 被调用得极密（每个节点一次），而每次都会 `this.list()`
+   * 并把**整份**列表 IPC 推给渲染层 —— 长任务下这是纯浪费：渲染层只需要「最新那一份」。
+   * 这里做短延迟合流，一个 60ms 窗口内多次变更只推一份。
+   *
+   * 三点边界：
+   * ① 没接 `onChange`（测试里的纯存储实例）直接返回 —— 不创建任何定时器；
+   * ② `unref()`：定时器不该拖住进程退出；
+   * ③ 合流只影响**推送**；渲染层随时可以走 `session.list` 主动拉，语义不受影响。
+   */
   private notify(): void {
-    this.opts.onChange?.(this.list())
+    if (!this.opts.onChange) return
+    if (this.notifyTimer) return
+    this.notifyTimer = setTimeout(() => {
+      this.notifyTimer = null
+      this.opts.onChange?.(this.list())
+    }, NOTIFY_COALESCE_MS)
+    this.notifyTimer.unref?.()
   }
 
   /**
@@ -523,11 +593,12 @@ export class SessionTreeStore {
    * `keepSelf`：只删后代、保留节点自身。用于「重新生成第一条指令的回答」——
    * root 节点不能删（它是会话本体），只能把它下面的旧回答分支清掉再重跑。
    *
-   * 同步维护四件事，缺一就是静默腐化：
+   * 同步维护五件事，缺一就是静默腐化：
    * ① jsonl 整份重写（只追加的格式表达不了删除）；
    * ② owner 引用清理（孤儿 nodeId 还能定位到 root）；
    * ③ 索引 nodeCount / updatedAt；
-   * ④ root 的 lastDoneNodeId 悬挂修正（指向被删节点时改指新尾部）。
+   * ④ root 的 lastDoneNodeId 悬挂修正（指向被删节点时改指新尾部）；
+   * ⑤ root 的 turnFinishes 悬挂清理（v2.26：删掉的轮不该再合成收尾卡）。
    * resumable **不**翻回 true：用户手动编辑过的会话不该再弹「继续上次任务」。
    *
    * @returns 实际删除的节点数与新尾部节点 id（keepSelf 时为节点自身）
@@ -566,6 +637,28 @@ export class SessionTreeStore {
     if (root?.lastDoneNodeId && doomed.has(root.lastDoneNodeId)) {
       if (newTailId && newTailId !== root.id) root.lastDoneNodeId = newTailId
       else delete root.lastDoneNodeId
+    }
+
+    /**
+     * v2.26：清掉「已经不存在的轮」的收尾记录（`turnFinishes` 的键 = 该轮 user 节点 id）。
+     *
+     * 历史回放（`nodesToMessages`）按这份记录在每轮末尾合成收尾卡，截断时不清就会留下幽灵：
+     * - 非 keepSelf：被删的 user 节点已经不在树里，那张卡再也不会被合成（残留但无害）；
+     * - **keepSelf（重新生成第一条指令的回答）**：节点自身保留、旧回答全部删掉，记录却还挂着 ——
+     *   重新载入一次会话，第一条指令下面就凭空多出一行「任务已完成 · 任务耗时 …」，
+     *   看起来像「重新生成之后收尾卡还是旧的」，而它对应的回答早已被删。
+     */
+    if (root?.turnFinishes) {
+      const kept = Object.keys(root.turnFinishes).filter(
+        (key) => !doomed.has(key) && !(opts?.keepSelf && key === nodeId)
+      )
+      if (kept.length > 0) {
+        const next: Record<string, TurnFinishRecord> = {}
+        for (const key of kept) next[key] = root.turnFinishes[key]!
+        root.turnFinishes = next
+      } else {
+        delete root.turnFinishes
+      }
     }
 
     // 内存三张表同步

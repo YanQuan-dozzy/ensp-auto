@@ -13,6 +13,9 @@
 - 允许只写文件名（如 `TelnetClient.ts`）—— 全仓能找到同名文件即算通过；
 - 允许白名单里的**运行期产物**路径（如 exports/xxx.json，不是源码）；
 - 不检查代码块里的命令行示例（只认形如 a/b/c.ext 的相对路径）。
+  注意：**必须含 `/`**才会被抽取 —— 「只写文件名」是靠 PATH_RE 匹配到 `a/b/name.ts`
+  之后再退回 basename 比对实现的，而不是逐个裸文件名去扫（那样会把正文里的泛指词
+  也当路径，噪声大到没法用）。
 """
 from __future__ import print_function
 
@@ -22,14 +25,16 @@ import re
 import sys
 import glob
 
-# 运行期产物 / 外部依赖路径：文档里描述的是「文件会生成在哪」，不是仓库里的文件
-ALLOW = (
-    'exports/',
-    'attachments/',
-    'snapshots-data/',
-    'userData/',
-    'node_modules/',
-    'out/',
+# 运行期产物 / 外部依赖目录：文档里描述的是「文件会生成在哪」，不是仓库里的文件。
+# 只按**路径段**匹配（而不是 `a in raw` 的子串包含）—— 后者会把 `myexports/x.json`、
+# `output/` 这类含相同子串的路径也放过去。
+ALLOW_SEGMENTS = (
+    'exports',
+    'attachments',
+    'snapshots-data',
+    'userData',
+    'node_modules',
+    'out',
 )
 
 TARGETS = ['README.md'] + [
@@ -37,7 +42,17 @@ TARGETS = ['README.md'] + [
 ]
 
 # 注意：扩展名分支里 tsx 必须排在 ts 前面，否则正则会把 .tsx 截成 .ts
-PATH_RE = re.compile(r'[A-Za-z0-9_@./-]+/[A-Za-z0-9_.-]+\.(?:tsx|mjs|json|css|md|topo|ps1|ts)')
+# 扩展名清单要覆盖仓库里真实存在的类型（漏一种 = 该类路径漂移不会被发现）
+PATH_RE = re.compile(
+    r'[A-Za-z0-9_@./-]+/[A-Za-z0-9_.-]+\.'
+    r'(?:tsx|mts|cts|cjs|mjs|ts|py|json|yml|yaml|css|md|topo|ps1|cmd|vbs|cs|ico)'
+)
+
+
+def is_allowed(raw):
+    """白名单匹配：按路径段比对，而不是子串包含"""
+    parts = [p for p in raw.split('/') if p]
+    return parts[0] in ALLOW_SEGMENTS if parts else False
 
 
 def build_name_index():
@@ -62,7 +77,7 @@ def main():
         text = io.open(doc, encoding='utf-8').read()
         for m in PATH_RE.finditer(text):
             raw = m.group(0).strip('`(),.:;')
-            if any(raw.startswith(a) or a in raw for a in ALLOW):
+            if is_allowed(raw):
                 continue
             total += 1
             rel = raw.lstrip('./')

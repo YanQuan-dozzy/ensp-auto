@@ -12,9 +12,15 @@
  * 避免「快照期间到达的数据」被写两遍。
  *
  * 字节编码：`data` 用 latin1 字符串承载，**每个 code unit 恰好对应一个原始字节**，
- * 渲染层 `Uint8Array.from(data, (c) => c.charCodeAt(0))` 即可无损还原，
- * 再由 xterm 自己按 UTF-8 解码（中文不会被破坏）。
- * 不要在这里做文本解码 —— 解码口径归通信层（cleaner/encoding）管，终端显示要原始字节。
+ * 渲染层 `Uint8Array.from(data, (c) => c.charCodeAt(0))` 即可无损还原。
+ * 不要在这里做文本解码 —— 解码口径归通信层（cleaner/encoding）管，
+ * 且终端要能**按新编码整屏重画**（编码变了就把这些原始字节重解一遍），
+ * 所以这里必须留字节而不是留文本。
+ *
+ * 注意（2026-09-28）：还原出来的字节**不能直接交给 xterm** ——
+ * xterm 的输入解码器只认 UTF-8，GBK 中文会被解成拉丁字母乱码。
+ * 渲染层要用 `TerminalBufferPayload.encoding` 走 `shared/terminal-decode`
+ * （见 TELNET-SPEC §7.1）。
  */
 
 import type { TerminalBufferSegment } from '@shared/types'

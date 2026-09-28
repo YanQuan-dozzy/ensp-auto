@@ -10,6 +10,7 @@ import {
 } from './device'
 import {
   answerDevicePrompt,
+  changeView,
   diffWithSnapshot,
   getDeviceContext,
   listSnapshots,
@@ -59,6 +60,9 @@ export const TOOLS: readonly ToolSpec[] = [
   renameDevice,
   getDeviceContext,
   runShowCommand,
+  // v2.24：视图切换（quit / return / 进接口视图）的专属出口 ——
+  // 不再让模型把导航命令塞进 run_show_command（被白名单拒）或 apply_config（被顶到系统视图后去错地方）
+  changeView,
   saveConfigSnapshot,
   listSnapshots,
   diffWithSnapshot,

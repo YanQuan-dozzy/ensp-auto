@@ -1,6 +1,7 @@
 import {
   Fragment,
   memo,
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -177,13 +178,18 @@ export function AgentPanel({ onOpenSettings }: { onOpenSettings?: () => void }):
    * 把用户已经手动展开的块反复拉回收起态。
    */
   const [turnCollapse, setTurnCollapse] = useState<Record<string, CollapseSignal>>({})
-  const toggleTurn = (key: string): void => {
+  /**
+   * N16：必须是**稳定引用** —— 它会被透传给 `FinalResponseView`（memo 组件），
+   * 每次渲染新建函数会让 memo 全部失效，历史轮在流式期间照样整棵重渲染。
+   * 只用函数式 setState（不读任何外部值），所以依赖为空。
+   */
+  const toggleTurn = useCallback((key: string): void => {
     setTurnCollapse((prev) => {
       const cur = prev[key]
       const next: CollapseSignal = { epoch: (cur?.epoch ?? 0) + 1, open: !(cur?.open ?? false) }
       return { ...prev, [key]: next }
     })
-  }
+  }, [])
   /**
    * 工具栏的「收起 / 展开全部」：给**每一轮**下发同一个意图（各自 epoch 递增）。
    * 未收尾的轮拿到的信号不产生可见变化 —— 它本来就不受折叠控制（过程必须可见）。
@@ -220,13 +226,6 @@ export function AgentPanel({ onOpenSettings }: { onOpenSettings?: () => void }):
     }
   }, [])
 
-  /**
-   * 是否「贴着底部」跟随流式输出（R28）。
-   *
-   * 判据必须由 onScroll 维护：旧实现在 effect 里**当场量**，
-   * 而 effect 跑的时候新消息已经进了 DOM、scrollHeight 已经变大，
-   * 量出来的「离底 80px 内」是个假结论 —— 连续输出时会莫名其妙停止跟随。
-   */
   /**
    * 是否「贴着底部」跟随流式输出（R28）。
    *
@@ -644,14 +643,23 @@ export function AgentPanel({ onOpenSettings }: { onOpenSettings?: () => void }):
                    */
                   const folded = turnEnd !== undefined && !sig.open
 
-                  /** 过程段：本轮 body 里除「回答」与「收尾卡」之外的全部段，保持事件顺序 */
-                  const processNodes = turn.body.map((seg, i) => {
-                    if (i === replyIdx || i === tailIdx) return null
-                    if (seg.kind === 'toolGroup') {
-                      return <ToolGroup key={seg.key} items={seg.items} />
-                    }
-                    return <MessageView key={seg.id} m={seg} />
-                  })
+                  /**
+                   * 过程段：本轮 body 里除「回答」与「收尾卡」之外的全部段，保持事件顺序。
+                   *
+                   * **N16：折叠的轮根本不构造这段**。原实现无条件 `turn.body.map(...)`，
+                   * 于是一轮已收尾（= 已折叠）的历史轮，在每个流式 delta 上都要重建
+                   * O(段数) 个 React 元素对象 —— 这些对象随后被 `process={null}` 丢掉，
+                   * 纯浪费，而且长会话下正是掉帧的主因。折叠时不构造，展开的那一轮照旧。
+                   */
+                  const processNodes = folded
+                    ? null
+                    : turn.body.map((seg, i) => {
+                        if (i === replyIdx || i === tailIdx) return null
+                        if (seg.kind === 'toolGroup') {
+                          return <ToolGroup key={seg.key} items={seg.items} />
+                        }
+                        return <MessageView key={seg.id} m={seg} />
+                      })
 
                   return (
                     <Fragment key={turn.key}>
@@ -661,20 +669,21 @@ export function AgentPanel({ onOpenSettings }: { onOpenSettings?: () => void }):
                           <FinalResponseView
                             text={reply.text}
                             {...(turnEnd ? { turnEnd } : {})}
-                            {...(turnEnd ? { onToggleProcess: () => toggleTurn(turn.key) } : {})}
+                            {...(turnEnd ? { turnKey: turn.key, onToggleTurn: toggleTurn } : {})}
                             allOpen={sig.open}
                             msgId={reply.id}
-                            process={folded ? null : processNodes}
+                            process={processNodes}
                           />
                         ) : (
                           <>
-                            {folded ? null : processNodes}
+                            {processNodes}
                             {/* 没有可挂靠的正文（失败 / 达轮次上限而结束在工具上）时，
                                 收尾行在本轮末尾单独成块 —— 信息不丢，也照样是过程开关 */}
                             {turnEnd ? (
                               <TurnCompleteBanner
                                 m={turnEnd}
-                                onExpandAll={() => toggleTurn(turn.key)}
+                                turnKey={turn.key}
+                                onToggleTurn={toggleTurn}
                                 allOpen={sig.open}
                               />
                             ) : null}
@@ -1518,8 +1527,11 @@ function MsgActions({
  * 展开时机（这也是「平常收起」的例外，必须保留）：**失败** 或 **正在执行**。
  * 后者尤其重要：执行中收起等于把「正在干什么」藏起来，用户会以为卡死。
  * 展开态不对全局收起/展开信号免疫 —— `useCollapsible` 已经处理。
+ *
+ * N16：`memo` 化 —— `items` 来自复用的段对象（`groupMessages` 的前缀复用），
+ * 引用稳定，流式期间历史轮的工具组不再重渲染。
  */
-function ToolGroup({ items }: { items: ToolMsg[] }): ReactNode {
+const ToolGroup = memo(function ToolGroup({ items }: { items: ToolMsg[] }): ReactNode {
   const ok = items.filter((m) => m.status === 'ok').length
   const fail = items.filter((m) => m.status === 'fail').length
   const hasRunning = items.some((m) => m.status === 'running')
@@ -1571,7 +1583,7 @@ function ToolGroup({ items }: { items: ToolMsg[] }): ReactNode {
       ) : null}
     </div>
   )
-}
+})
 
 /**
  * 助手消息步骤块（v2.4）：与思考信息、工具调用统一规范。
@@ -1680,27 +1692,36 @@ function ThinkingBlock({ text }: { text: string }): ReactNode {
  *    展开第 3 轮不该把第 8 轮的过程也翻出来（各轮状态见 `AgentPanel.turnCollapse`）；
  * ③ 耗时行本身就是全部信息，**不再另开一期展开区** —— 用量与模型移到右下角状态行
  *    （见 `TurnStatusLine`），它们和耗时行是同一类元信息。
+ *
+ * N16：`memo` 化。props 全是稳定引用（`m` 是复用的段对象，
+ * `onToggleTurn` 是 `useCallback` 的稳定函数，其余是字符串/布尔），
+ * 于是流式输出时历史轮的收尾行完全不重渲染。
+ * 回调签名改为 `(turnKey, onToggleTurn)` 而不是传内联箭头 —— 传箭头会让 memo 失效。
  */
-function TurnCompleteBanner({
+const TurnCompleteBanner = memo(function TurnCompleteBanner({
   m,
-  onExpandAll,
+  turnKey,
+  onToggleTurn,
   allOpen = false
 }: {
   m: Extract<UiMessage, { kind: 'finish' }>
-  onExpandAll?: () => void
+  /** N16：本轮的 key（与 `onToggleTurn` 配对，避免为了传闭包而破坏 memo） */
+  turnKey?: string
+  onToggleTurn?: (key: string) => void
   allOpen?: boolean
 }): ReactNode {
   const ok = m.reason === 'completed'
   const isAborted = m.reason === 'aborted'
   const lead = ok ? '任务已完成' : isAborted ? '任务已中止' : '任务未完成'
+  const expand = turnKey && onToggleTurn ? (): void => onToggleTurn(turnKey) : undefined
   return (
     <div className={`turn-complete-banner ${m.reason}`}>
       <button
         type="button"
         className="turn-complete-head"
-        onClick={onExpandAll}
+        onClick={expand}
         title="展开 / 收起本轮全部过程（工具调用 · 思考 · 参考内容）"
-        disabled={!onExpandAll}
+        disabled={!expand}
       >
         <span className="turn-complete-icon">
           {ok ? (
@@ -1724,7 +1745,7 @@ function TurnCompleteBanner({
       </button>
     </div>
   )
-}
+})
 
 /**
  * 类 Codex 最终交付成果视图（v2.11 改版 / v2.19 加过程区）。
@@ -1744,19 +1765,27 @@ function TurnCompleteBanner({
  * 收尾后默认收起（只剩耗时行 + 正文），点耗时行才把过程铺在耗时行与正文之间。
  * 过程区由调用方（`AgentPanel`）装配好传进来：它需要按轮过滤哪些段属于过程，
  * 那部分判断不该塞进这个纯展示组件里。
+ *
+ * N16：`memo` 化 + 回调改为 `(turnKey, onToggleTurn)`。
+ * 这是全消息流最重的一棵子树（含 `MarkdownView`），而历史轮的 props 在流式期间
+ * 完全不变（`text` / `msgId` 是字符串，`turnEnd` 是复用的段对象，`process` 折叠时是
+ * `null`）—— memo 一挂，流式 delta 就只重渲染"正在进行的那一轮"。
+ * **不要**把 `onToggleTurn` 换回内联箭头（那是 memo 失效的直接原因）。
  */
-function FinalResponseView({
+const FinalResponseView = memo(function FinalResponseView({
   text,
   turnEnd,
-  onToggleProcess,
+  turnKey,
+  onToggleTurn,
   process,
   allOpen = false,
   msgId
 }: {
   text: string
   turnEnd?: Extract<UiMessage, { kind: 'finish' }>
-  /** v2.19：收尾行的点击 = 开合**本轮**过程区（undefined = 本轮无收尾卡，不可点） */
-  onToggleProcess?: () => void
+  /** N16：本轮 key（与 `onToggleTurn` 配对，避免传内联闭包破坏 memo） */
+  turnKey?: string
+  onToggleTurn?: (key: string) => void
   /** v2.19：本轮过程段（收起时为 null，整段不渲染） */
   process?: ReactNode
   /** v2.19：本轮过程区的开合态（决定收尾行箭头方向） */
@@ -1767,7 +1796,7 @@ function FinalResponseView({
   const agentRunning = useApp((s) => s.agentRunning)
   const rootId = useApp((s) => s.activeRootId)
 
-  const onExport = async (): Promise<void> => {
+  const onExport = useCallback(async (): Promise<void> => {
     try {
       if (!rootId) {
         noteSystemMessageToStore('当前会话尚未落盘，稍后再试导出')
@@ -1778,7 +1807,10 @@ function FinalResponseView({
     } catch (e) {
       noteSystemMessageToStore(e instanceof Error ? e.message : String(e))
     }
-  }
+  }, [rootId])
+
+  // N16：传给 `TurnStatusLine` 的两个回调必须稳定引用，否则 memo 白挂
+  const copyReply = useCallback((): string => text, [text])
 
   return (
     <div className="turn-final-response">
@@ -1791,7 +1823,7 @@ function FinalResponseView({
         </div>
       </div>
       {turnEnd ? (
-        <TurnCompleteBanner m={turnEnd} onExpandAll={onToggleProcess} allOpen={allOpen} />
+        <TurnCompleteBanner m={turnEnd} {...(turnKey ? { turnKey } : {})} {...(onToggleTurn ? { onToggleTurn } : {})} allOpen={allOpen} />
       ) : null}
       {process ? <div className="turn-process">{process}</div> : null}
       <div className="turn-final-body">
@@ -1799,14 +1831,14 @@ function FinalResponseView({
       </div>
       <TurnStatusLine
         turnEnd={turnEnd}
-        copyText={() => text}
-        onExport={() => void onExport()}
+        copyText={copyReply}
+        onExport={onExport}
         running={agentRunning}
         msgId={msgId}
       />
     </div>
   )
-}
+})
 
 /** 通知 store 追加一条系统消息（导出结果 / 失败提示）—— 借 noteSystemMessage */
 function noteSystemMessageToStore(text: string): void {
@@ -1819,8 +1851,10 @@ function noteSystemMessageToStore(text: string): void {
  * 为什么以「手动终止输出」起头：中止/失败时用户最想知道的是「它是怎么结束的」——
  * 这句话就是结论；正常完成时换成「已完成」，语义一致但语气不同。
  * 右侧只留**用量 + 模型**这类客观运行信息，不放「由 AI 生成」这类署名式文案。
+ *
+ * N16：`memo` 化（props 全稳定 —— 两个回调由 `FinalResponseView` 用 `useCallback` 备好）。
  */
-function TurnStatusLine({
+const TurnStatusLine = memo(function TurnStatusLine({
   turnEnd,
   copyText,
   onExport,
@@ -1887,7 +1921,7 @@ function TurnStatusLine({
       {meta ? <span className="turn-status-meta">{meta}</span> : null}
     </div>
   )
-}
+})
 
 /**
  * 执行计划步骤块（类 Codex 步骤流规范）
@@ -1942,7 +1976,13 @@ function formatDuration(ms: number): string {
   return m > 0 ? `${m}m ${s}s` : `${s}s`
 }
 
-function ToolCard({
+/**
+ * 单次工具调用卡。
+ *
+ * N16：`memo` 化 —— props 是 `m`（复用的消息对象）+ `compact`，
+ * 状态没变时（`status` / `ms` / `raw` 都不动）不再整块重渲染。
+ */
+const ToolCard = memo(function ToolCard({
   m,
   compact = false
 }: {
@@ -2011,7 +2051,7 @@ function ToolCard({
       </div>
     </div>
   )
-}
+})
 
 /**
  * v2.9：长回显二级折叠 —— 头 RAW_COLLAPSE_LINES 行 + 「展开全部 N 行」。

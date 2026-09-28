@@ -198,6 +198,27 @@ test('期望校验：非法正则抛出 SyntaxError', () => {
   assert.throws(() => checkExpectation(CLEAN, { expect: 'State: [', mode: 'regex' }), SyntaxError)
 })
 
+test('N15 期望校验：嵌套量词正则被拒（防灾难性回溯冻结主进程），且是立刻返回', () => {
+  const huge = 'a'.repeat(100_000)
+  const t0 = Date.now()
+  assert.throws(() => checkExpectation(huge, { expect: '(a+)+$', mode: 'regex' }), SyntaxError)
+  assert.throws(() => checkExpectation(CLEAN, { expect: '(\\w*)*', mode: 'regex' }), SyntaxError)
+  assert.ok(Date.now() - t0 < 1000, '必须在阈值内返回 —— 真跑回溯的话这里会挂死')
+})
+
+test('N15 期望校验：常见合法正则不被误杀（分组量词 / 交替 / 大输入）', () => {
+  assert.equal(checkExpectation(CLEAN, { expect: '(State: F\\w+)', mode: 'regex' }), true)
+  assert.equal(checkExpectation(CLEAN, { expect: 'State: (Full|Down)', mode: 'regex' }), true)
+  assert.equal(checkExpectation('ab'.repeat(5000), { expect: '(ab)+', mode: 'regex' }), true)
+})
+
+test('N15 期望校验：超长正则被拒（模型臆造的长表达式）', () => {
+  assert.throws(
+    () => checkExpectation(CLEAN, { expect: `State: F${'x'.repeat(250)}`, mode: 'regex' }),
+    SyntaxError
+  )
+})
+
 // ———————————————————— 变更记录 ————————————————————
 
 function tmpDir() {

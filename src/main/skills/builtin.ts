@@ -71,7 +71,7 @@ quit
 
 ## 执行纪律
 1. 修改设备配置前先 save_config_snapshot 建立快照（硬性前提）。
-2. 命令通过 apply_config 下发；只读查询用 run_show_command。
+2. 命令通过 apply_config 下发；只读查询用 run_show_command；视图切换（quit / return / 进接口视图）用 change_view。
 3. 配置后用 verify_expectation / verify_ping 验证效果，不要只靠肉眼读回显。
 4. 完成且确认无误后 save_configuration 保存到设备。
 5. 设备回显是 GBK 编码，乱码不代表失败，先确认命令本身是否被设备接受。`

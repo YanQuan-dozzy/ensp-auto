@@ -1,6 +1,8 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { app } from 'electron'
+import { atomicWriteJsonSync } from '../fs/atomic'
+import { quarantineFile } from '../fs/quarantine'
 
 export interface BootstrapConfig {
   userDataDir?: string
@@ -19,12 +21,20 @@ export function getBootstrapFilePath(): string {
 }
 
 export function readBootstrapStorage(): BootstrapConfig {
+  const file = getBootstrapFilePath()
   try {
-    const file = getBootstrapFilePath()
     if (!fs.existsSync(file)) return {}
     const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as BootstrapConfig
     return typeof parsed === 'object' && parsed !== null ? parsed : {}
   } catch {
+    // N42：读坏时不能静默回落默认目录 —— 那等于「自定义数据主目录的用户数据凭空消失」。
+    // 留档 + 告警，让用户/开发者知道引导文件坏了，而不是以为数据丢了。
+    const archived = quarantineFile(file)
+    console.warn(
+      `[bootstrap] 引导文件无法解析（文件损坏）${
+        archived ? `，原文件已留档为 ${archived}` : ''
+      }。本次将回退默认数据目录（%APPDATA%\\ensp-auto）：${file}`
+    )
     return {}
   }
 }
@@ -44,7 +54,9 @@ export function writeBootstrapStorage(config: BootstrapConfig): void {
       }
     }
   } else {
-    fs.writeFileSync(file, JSON.stringify(config, null, 2), 'utf8')
+    // N42：引导文件决定「下次启动读哪个数据目录」，半截写入会让整个用户数据「消失」，
+    // 必须走原子写（统一口径：唯一临时名 + fsync + rename）
+    atomicWriteJsonSync(file, config)
   }
 }
 

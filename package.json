@@ -6,7 +6,7 @@
   "description": "eNSP 网络实验的 AI 代理工作台",
   "main": "./out/main/index.js",
   "scripts": {
-    "dev": "node tools/patch-electron-exe.cjs && powershell -NoProfile -ExecutionPolicy Bypass -File tools/ensure-shortcut.ps1 && electron-vite dev",
+    "dev": "node tools/patch-electron-exe.cjs && powershell -NoProfile -ExecutionPolicy Bypass -File tools/clear-shell-cache.ps1 && powershell -NoProfile -ExecutionPolicy Bypass -File tools/ensure-shortcut.ps1 && electron-vite dev",
     "postinstall": "node tools/patch-electron-exe.cjs",
     "build": "electron-vite build",
     "preview": "electron-vite preview",
@@ -14,7 +14,7 @@
     "typecheck:web": "tsc --noEmit -p tsconfig.web.json --composite false",
     "typecheck:tests": "tsc --noEmit -p tsconfig.tests.json",
     "typecheck": "npm run typecheck:node && npm run typecheck:web && npm run typecheck:tests",
-    "verify": "npm run typecheck && npm run build",
+    "verify": "npm run typecheck && python tools/check-doc-paths.py && npm run build",
     "test": "node tests/harness/bundle.mjs && node --test \"tests/unit/*.test.mjs\"",
     "dist:prepare": "electron-vite build",
     "dist": "npm run dist:prepare && electron-builder --win --publish never"

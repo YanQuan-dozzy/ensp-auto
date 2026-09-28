@@ -66,7 +66,16 @@ export function atomicWriteFileSync(
     // mkdir 也放在 try 里：父路径不可用时它同样会抛，
     // 而 throwOnError:false 的调用方要的是「返回 false」而不是被异常打断
     fs.mkdirSync(path.dirname(file), { recursive: true })
-    fs.writeFileSync(tmp, data)
+    // N40：写临时文件后必须 fsync 再 rename。否则断电时可能「rename 已持久化、数据未落盘」，
+    // 目标文件变成 0 字节 / 半截 JSON —— 而 rename 是原子的这件事只保证「要么旧要么新」，
+    // 不保证新内容已经落盘。父目录 fsync 在 Windows 上不受支持（可忽略），属已知限制。
+    const fd = fs.openSync(tmp, 'w')
+    try {
+      fs.writeFileSync(fd, data)
+      fs.fsyncSync(fd)
+    } finally {
+      fs.closeSync(fd)
+    }
     for (let attempt = 0; ; attempt++) {
       try {
         fs.renameSync(tmp, file)

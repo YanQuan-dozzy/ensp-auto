@@ -14,6 +14,7 @@ import {
   IconKey
 } from '@/components/ui'
 import { Row, Section } from '@/components/settings-kit'
+import { escLayerOpen } from '@/features/shortcuts/escLayers'
 import { McpDialog } from '@/features/agent/McpDialog'
 import { DiagPanel } from './DiagPanel'
 import { GeneralPanel } from './GeneralPanel'
@@ -150,8 +151,11 @@ export function SettingsDialog({ onClose }: { onClose: () => void }): ReactNode 
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => {
-      // 连接 MCP 弹窗开着时，Esc 归它 —— 否则一次按键会连着关掉两层
-      if (e.key === 'Escape' && !mcpOpen) onCloseRef.current()
+      // 连接 MCP 弹窗开着时，Esc 归它 —— 否则一次按键会连着关掉两层。
+      // N66：内层认领了 Esc（`escLayerOpen()`，如「编辑模型」子弹窗）时同样让行 ——
+      // 内层会在捕获阶段 stopPropagation，正常到不了这里；这条是兜底，防将来
+      // 有人把内层监听改回冒泡阶段。
+      if (e.key === 'Escape' && !mcpOpen && !escLayerOpen()) onCloseRef.current()
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
@@ -245,7 +249,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }): ReactNode 
                   <Section label="终端">
                     <Row
                       title="设备回显编码"
-                      desc="仅影响主进程对回显的「业务解码」（供代理理解与解析）；终端显示始终按设备原始字节渲染。"
+                      desc="设备回显与终端显示共用的字符集。华为设备切到中文（language-mode chinese）后回显是 GBK，此时终端里的中文必须按 GBK 解，否则是一片拉丁字母乱码。自动 = UTF-8 优先、失败回退 GBK（遇到中文回显会自动锁定并重画终端）。改完立刻对已连接设备生效，无需重连。"
                       control={
                         <select
                           value={settings.deviceEncoding}

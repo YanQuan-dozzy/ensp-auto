@@ -1,13 +1,18 @@
-﻿# ensure-shortcut.ps1 —— 开始菜单快捷方式 + AppUserModelID 绑定（dev 任务栏身份的前提）
+﻿# ensure-shortcut.ps1 —— 在开始菜单放一份指向 eNSPAuto 的快捷方式（dev/便携任务栏身份的前提）
 #
 # 为什么需要（两处调用，本文件是唯一实现）：
 #   1. package.json 的 dev script 前置：npm run dev 由 electron-vite 直拉 electron.exe，
-#      没有「启动快捷方式」可关联；而任务栏对设置了 AUMID 的窗口，按「开始菜单/桌面里
-#      带同 AUMID 的 .lnk」解析名称与图标 —— 找不到就回退 exe 元数据（名称 Electron +
-#      Electron 图标）。start.ps1 在 %LOCALAPPDATA% 的 .lnk 不在解析搜索范围内。
+#      没有「启动快捷方式」可关联。放一份开始菜单快捷方式后，Explorer 解析任务栏
+#      名称/图标时能命中的应用入口（图标 + 名称都取它）。
 #   2. start.ps1 默认分支（start.cmd / start.exe）§7.2：开始菜单多一个可用入口。
-# AUMID 必须与 src/main/index.ts 的 APP_ID、electron-builder.yml 的 appId、
-# start.ps1 §7.1 的 $AppAumid 一致：cn.enspauto.workbench。
+#
+# ★ v2.23 重要变更：**不再尝试给 .lnk 写 AUMID**。
+#   本机 Win11 无法用标准 API 写 .lnk 的 PKEY_AppUserModel_ID（HRESULT 级实测
+#   STG_E_ACCESSDENIED；ShellLink 对象 commit 返回 S_OK 也不落盘），此路已封死。
+#   同时主进程已改为**只在 app.isPackaged 时设 AUMID**（见 src/main/index.ts），
+#   dev/便携不设 AUMID → Explorer 走启动快捷方式/exe 元数据，本脚本只需提供入口。
+#   AUMID 仍是安装版的事；这里不再需要与它对齐。
+#
 # 任何失败只告警、恒 exit 0 —— 绝不能挡住 dev 启动。
 param(
   [string]$Root = (Split-Path -Parent $PSScriptRoot)
@@ -27,8 +32,8 @@ try {
     exit 0
   }
 
-  # 已安装 NSIS 版则跳过：安装版的开始菜单快捷方式带同一 AUMID，
-  # dev 的任务栏直接借它解析；覆盖它反而会把开始菜单入口改成指向 electron.exe
+  # 已安装 NSIS 版则跳过：安装版自带带 AUMID 的开始菜单快捷方式，
+  # 覆盖它反而会把开始菜单入口改成指向 node_modules 里的 electron.exe。
   $installedExe = Join-Path $env:LOCALAPPDATA 'Programs\ensp-auto\ensp-auto.exe'
   if (Test-Path $installedExe) {
     Write-Host 'ensure-shortcut: installed build detected, reuse its shortcut'
@@ -38,73 +43,7 @@ try {
   $iconPath = Join-Path $Root 'resources\enspauto.ico'
   if (-not (Test-Path $iconPath)) { $iconPath = Join-Path $Root 'resources\app.ico' }
 
-  $appAumid = 'cn.enspauto.workbench'
   $lnkPath = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\eNSPAuto.lnk'
-
-  # WScript.Shell 不支持写 AUMID，走 IPropertyStore（PKEY_AppUserModel_ID）。
-  # C# 与 start.ps1 §7.1 相同 —— 改这里记得那边同步。
-  Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-
-public static class LnkAumid {
-    [StructLayout(LayoutKind.Sequential)]
-    private struct PropertyKey { public Guid fmtid; public uint pid; }
-    [StructLayout(LayoutKind.Explicit)]
-    private struct PropVariant {
-        [FieldOffset(0)] public ushort vt;
-        [FieldOffset(8)] public IntPtr pointerValue;
-    }
-    [ComImport, Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-    private interface IPropertyStore {
-        [PreserveSig] int GetCount(out uint cProps);
-        [PreserveSig] int GetAt(uint iProp, out PropertyKey pkey);
-        [PreserveSig] int GetValue(ref PropertyKey key, out PropVariant pv);
-        [PreserveSig] int SetValue(ref PropertyKey key, ref PropVariant pv);
-        [PreserveSig] int Commit();
-    }
-    [DllImport("shell32.dll", CharSet = CharSet.Unicode, PreserveSig = false)]
-    private static extern void SHGetPropertyStoreFromParsingName(string pszPath, IntPtr pbc, uint gpsFlags, ref Guid riid, [MarshalAs(UnmanagedType.Interface)] out IPropertyStore ppv);
-    [DllImport("ole32.dll")]
-    private static extern int PropVariantClear(ref PropVariant pv);
-    private static PropertyKey PkeyAumid = new PropertyKey {
-        fmtid = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"), pid = 5
-    };
-    public static bool SetLnkAumid(string lnkPath, string aumid) {
-        try {
-            Guid iid = typeof(IPropertyStore).GUID;
-            IPropertyStore store;
-            // GPS_READWRITE(0x1)：SHCreateItemFromParsingName 拿到的是只读存储，
-            // SetValue/Commit 会静默失败 —— 这是此前 AUMID 绑定一直不生效的根因
-            SHGetPropertyStoreFromParsingName(lnkPath, IntPtr.Zero, 0x1, ref iid, out store);
-            PropVariant pv = new PropVariant();
-            try {
-                pv.vt = 31;
-                pv.pointerValue = Marshal.StringToCoTaskMemUni(aumid);
-                PropertyKey k = PkeyAumid;
-                if (store.SetValue(ref k, ref pv) != 0) return false;
-                return store.Commit() == 0;
-            } finally { PropVariantClear(ref pv); }
-        } catch { return false; }
-    }
-    public static string GetLnkAumid(string lnkPath) {
-        try {
-            Guid iid = typeof(IPropertyStore).GUID;
-            IPropertyStore store;
-            // GPS_READWRITE(0x1)：SHCreateItemFromParsingName 拿到的是只读存储，
-            // SetValue/Commit 会静默失败 —— 这是此前 AUMID 绑定一直不生效的根因
-            SHGetPropertyStoreFromParsingName(lnkPath, IntPtr.Zero, 0x1, ref iid, out store);
-            PropertyKey k = PkeyAumid;
-            PropVariant pv;
-            if (store.GetValue(ref k, out pv) != 0) return null;
-            try {
-                if (pv.vt != 31 || pv.pointerValue == IntPtr.Zero) return null;
-                return Marshal.PtrToStringUni(pv.pointerValue);
-            } finally { PropVariantClear(ref pv); }
-        } catch { return null; }
-    }
-}
-'@
 
   $ws = New-Object -ComObject WScript.Shell
   $sc = $ws.CreateShortcut($lnkPath)
@@ -115,16 +54,10 @@ public static class LnkAumid {
   $sc.Description = 'eNSPAuto - eNSP AI workbench (dev)'
   $sc.Save()
 
-  if ([LnkAumid]::SetLnkAumid($lnkPath, $appAumid)) {
-    # 写后读回断言，结果进启动日志/控制台 —— 真机排查有据可查
-    $readback = [LnkAumid]::GetLnkAumid($lnkPath)
-    if ($readback -eq $appAumid) {
-      Write-Host ('ensure-shortcut: OK ' + $lnkPath)
-    } else {
-      Write-Host ('ensure-shortcut: AUMID readback mismatch: ' + $readback)
-    }
+  if (Test-Path $lnkPath) {
+    Write-Host ('ensure-shortcut: OK ' + $lnkPath)
   } else {
-    Write-Host 'ensure-shortcut: bind AUMID failed (taskbar name falls back to exe image name eNSPAuto, still correct)'
+    Write-Host 'ensure-shortcut: shortcut not created (unexpected)'
   }
 } catch {
   Write-Host ('ensure-shortcut: warn ' + $_.Exception.Message)

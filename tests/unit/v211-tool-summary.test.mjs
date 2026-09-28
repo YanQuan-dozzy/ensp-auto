@@ -104,7 +104,7 @@ test('文案：other 类别有兜底量词（不出现空单位）', () => {
 // 现在补上双向对账（见下方 `与 TOOLS 注册表双向对账`），清单再漏就会直接失败。
 const ALL_TOOL_NAMES = [
   'analyze_reference_configs', 'answer_device_prompt', 'apply_config', 'ask_user_question',
-  'auto_discover_devices', 'batch_configure', 'check_experiment', 'collect_device_diagnostics',
+  'auto_discover_devices', 'batch_configure', 'change_view', 'check_experiment', 'collect_device_diagnostics',
   'connect_device', 'diff_with_snapshot', 'disconnect_device', 'execute_task',
   'export_change_report', 'export_lab_guide', 'export_session_report', 'find_topology_files',
   'get_device_context', 'get_topology', 'import_topology_file', 'list_devices',
@@ -118,14 +118,14 @@ const ALL_TOOL_NAMES = [
   'verify_route'
 ]
 
-test('覆盖面：全部 50 个工具都已登记类别（无漏网）', () => {
+test('覆盖面：全部 51 个工具都已登记类别（无漏网）', () => {
   const unregistered = ALL_TOOL_NAMES.filter((n) => !isRegisteredTool(n))
   assert.deepEqual(unregistered, [], `以下工具未登记类别：${unregistered.join(', ')}`)
 })
 
-test('覆盖面：清单本身无重复且数量为 50', () => {
-  assert.equal(ALL_TOOL_NAMES.length, 50)
-  assert.equal(new Set(ALL_TOOL_NAMES).size, 50)
+test('覆盖面：清单本身无重复且数量为 51', () => {
+  assert.equal(ALL_TOOL_NAMES.length, 51)
+  assert.equal(new Set(ALL_TOOL_NAMES).size, 51)
 })
 
 test('覆盖面：清单与 TOOLS 注册表双向对账（防清单自身漏登记）', () => {

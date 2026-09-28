@@ -556,6 +556,11 @@ function layoutPeerNetwork(
   const positions = new Map<string, NodePoint>()
   const nodeGapX = DEFAULT_SW_GAP_X
 
+  // N68：成员判定用具 Set —— 原来对数组做线性查找（成员判定写在「BFS 队列 ×
+  // 邻居」双层循环里，每步扫一遍数组），设备多时是 O(n²)。
+  // 同文件的 findBackboneChain 已刻意 Set 化（T4.6），这里是漏网的一处。
+  const memberSet = new Set(compNodeIds)
+
   // 寻找骨干直径链
   const path = findBackboneChain(compNodeIds, adj)
 
@@ -576,7 +581,7 @@ function layoutPeerNetwork(
     const parentX = positions.get(cur)?.x ?? 0
     let childIdx = 0
     for (const nb of adj.get(cur) ?? []) {
-      if (!compNodeIds.includes(nb) || visited.has(nb)) continue
+      if (!memberSet.has(nb) || visited.has(nb)) continue
       visited.add(nb)
       levelOf.set(nb, curL + 1)
       queue.push(nb)

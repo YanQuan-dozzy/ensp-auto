@@ -68,9 +68,19 @@ export function SshConnectionsPanel(): ReactNode {
 
   const doRemove = async (cred: SshCredentialMeta): Promise<void> => {
     const d = deviceOf(cred.id)
-    if (d && d.connected) await useApp.getState().disconnect(d.id)
-    await window.api.device.ssh.remove(cred.id)
-    load()
+    setError(null)
+    setBusyId(cred.id)
+    try {
+      if (d && d.connected) await useApp.getState().disconnect(d.id)
+      await window.api.device.ssh.remove(cred.id)
+      load()
+    } catch (e) {
+      // N65：失败必须落在**本面板**里 —— 过去这个函数既没有 catch 也没有 busyId，
+      // 删除失败只会在控制台留一条未处理 rejection，用户看到的是「点了没反应」
+      setError(`删除连接 ${cred.name} 失败：${e instanceof Error ? e.message : String(e)}`)
+    } finally {
+      setBusyId(null)
+    }
   }
 
   const authPayload = (): SshAuthInput | null => {
@@ -122,8 +132,10 @@ export function SshConnectionsPanel(): ReactNode {
     }
   }
 
+  // N34-15：原先写的 `settings-scroll-inner` 在 CSS 里根本不存在（全仓 0 定义），
+  // 样式其实全靠下面的内联 style —— 留着假类名会误导后人去找它的定义
   return (
-    <div className="settings-scroll-inner" style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-3)' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-3)' }}>
       <Section
         label={`已保存的 SSH 连接（${creds.length}）`}
         action={

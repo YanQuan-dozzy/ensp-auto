@@ -17,7 +17,10 @@
  * 步骤：
  *   A. rcedit 改 electron.exe 的 FileDescription/ProductName/图标/版本（幂等，已打跳过）；
  *   B. 复制为 dist/eNSPAuto.exe（仅当源较新或大小不同）；
- *   C. path.txt 写为 eNSPAuto.exe（eNSPAuto.exe 就位才写，防止悬空）。
+ *   C. path.txt 写为 eNSPAuto.exe（eNSPAuto.exe 就位才写，防止悬空）；
+ *   D. 清 MuiCache 里这两条 exe 路径的陈旧 FriendlyAppName/ApplicationCompany ——
+ *      Explorer 把「exe 路径 → 友好名」缓存住，原地改元数据也不刷新（v2.23 发现的
+ *      「隐藏缓存」，是补丁后仍显示 Electron 的直接原因）。
  *
  * 幂等；electron/eNSPAuto.exe 被占用（应用正在运行）时仅警告不失败 ——
  * postinstall 里抛错会让 npm install 失败。npm install / postinstall 自动重打。
@@ -100,4 +103,26 @@ try {
   // eNSPAuto.exe 正在运行时复制会被锁 —— 保持现状即可，下次启动前会再补
   console.warn('[patch-electron] eNSPAuto.exe sync failed (running? ignore):', e.message)
 }
+
+// ---- D：清 MuiCache 的陈旧友好名（Explorer 缓存 exe 路径→名称，原地改元数据不刷新）----
+// 键名形如 "<exe 全路径>.FriendlyAppName" / ".ApplicationCompany"，值缓存后即使 exe 元数据
+// 变了也沿用旧值 —— 这是「补丁已生效、任务栏仍显示 Electron」的隐藏原因。
+try {
+  const targets = [electronExe, appExe]
+  const ps = [
+    "$ProgressPreference='SilentlyContinue'",
+    "$k='HKCU:\\Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell\\MuiCache'",
+    'if(Test-Path $k){$n=(Get-Item $k).GetValueNames();$rm=0;',
+    `foreach($e in @(${targets.map((t) => `'${t.replace(/'/g, "''")}'`).join(',')})){`,
+    "foreach($s in @('.FriendlyAppName','.ApplicationCompany')){",
+    '$key=$e+$s; if($n -contains $key){Remove-ItemProperty -Path $k -Name $key -Force -ErrorAction SilentlyContinue;$rm++}}}',
+    "if($rm -gt 0){Write-Output ('cleared '+$rm+' MuiCache entry(ies)')}}}"
+  ].join('')
+  const r = spawnSync('powershell.exe', ['-NoProfile', '-Command', ps], { encoding: 'utf8' })
+  const msg = String(r.stdout || '').trim()
+  if (msg) console.log('[patch-electron]', msg)
+} catch (e) {
+  console.warn('[patch-electron] MuiCache clear skipped:', e.message)
+}
+
 process.exit(0)

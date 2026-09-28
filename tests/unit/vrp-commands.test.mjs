@@ -71,3 +71,74 @@ test('未命中：返回可用主题清单（matched=false），不算空手而�
   assert.equal(lookupVrpTopic('   ').matched, false)
   assert.ok(lookupVrpTopic('').available?.length > 0)
 })
+
+// —— v2.27：新增主题 + 三级检索 ——
+
+test('v2.27 新增主题：三层交换 / 单臂路由 / STP / VRRP / DHCP 中继 / 路由引入 / 设备管理 / 报错速查', () => {
+  for (const id of [
+    'l3_switch',
+    'single_arm',
+    'stp',
+    'vrrp',
+    'dhcp_relay',
+    'route_adv',
+    'device_mgmt',
+    'error_ref'
+  ]) {
+    assert.equal(lookupVrpTopic(id).entry?.id, id, `${id} 主题缺失或不可按 id 命中`)
+  }
+  assert.ok(VRP_TOPICS.length >= 20, `主题覆盖面不足（当前 ${VRP_TOPICS.length} 个）`)
+})
+
+test('子串检索取「匹配键最长」者：「三层交换」不能落到 vlan 主题上', () => {
+  // vlan 的别名含「交换」，l3_switch 的别名含「三层交换」—— 按数组顺序会错命中 vlan
+  const r = lookupVrpTopic('三层交换怎么配')
+  assert.equal(r.entry?.id, 'l3_switch', `实际命中 ${r.entry?.id}，最长匹配优先失效`)
+  // 反方向：只写「交换」时仍应落到 vlan（既有主题优先级不被新主题抢走）
+  assert.equal(lookupVrpTopic('交换').entry?.id, 'vlan')
+})
+
+test('v2.27 正文全文检索：按命令关键字或报错现象也能查到主题', () => {
+  // 只记得半条命令
+  const allowPass = lookupVrpTopic('allow-pass')
+  assert.equal(allowPass.matched, true)
+  assert.equal(allowPass.entry?.id, 'vlan')
+  assert.equal(allowPass.matchedBy, 'content', '正文命中要标出来，提示模型核对后再照抄')
+
+  // 只记得报错现象
+  assert.equal(lookupVrpTopic('wrong parameter').entry?.id, 'error_ref')
+  // 命令名（别名与正文都能覆盖）
+  assert.equal(lookupVrpTopic('arp broadcast enable').entry?.id, 'single_arm')
+  assert.equal(lookupVrpTopic('import-route').entry?.id, 'route_adv')
+})
+
+test('v2.27 命中方式回传：精确 / 子串 / 正文三态可区分', () => {
+  assert.equal(lookupVrpTopic('ospf').matchedBy, 'exact')
+  assert.equal(lookupVrpTopic('ospf邻居起不来').matchedBy, 'alias')
+  assert.equal(lookupVrpTopic('region-configuration').entry?.id, 'stp')
+  // 精确命中优先于正文命中（dhcpv6 仍归 ipv6，不被 dhcp/dhcp_relay 抢走）
+  assert.equal(lookupVrpTopic('dhcpv6').entry?.id, 'ipv6')
+  assert.equal(lookupVrpTopic('dhcp中继').entry?.id, 'dhcp_relay')
+  assert.equal(lookupVrpTopic('dhcp').entry?.id, 'dhcp')
+})
+
+/**
+ * 构建守卫（2026-09-28，真事故）：electron-vite 的 `esmShimPlugin` 用一条**未锚定行首**的
+ * 正则（见 node_modules/electron-vite `ESMStaticImportRe`）在产物里找「最后一个 import 语句」，
+ * 再把 CJS shim `appendRight(indexToAppend, ...)` 追加到匹配结束处。若词典里出现
+ * **以 `import` 结尾的字符串**，匹配会跨过 `",` 与下一个 `"…`，落到字符串中间 ——
+ * 产物直接变成 `Unterminated string literal`，`electron-vite build` 报错、`out/main` 被清空。
+ *
+ * 已真实踩过一次：`'filter-policy <acl号|ip-prefix 名> export | import'`。
+ * 词典是纯文本重灾区，这条用例把「文本措辞」和「构建能不能过」绑在一起。
+ */
+test('构建守卫：词典文本不得让 electron-vite 的 CJS shim 注入错位', () => {
+  // 模拟 Rollup 的产物形态：字符串用双引号（单引号串会被输出成双引号串）
+  const emitted = JSON.stringify(VRP_TOPICS).replace(/\\"/g, '"').replace(/\\'/g, "'")
+  const bad = /import\s*["']/.exec(emitted)
+  assert.equal(
+    bad,
+    null,
+    `词典文本里有「import 紧跟引号」的片段，会让 electron-vite 的 shim 注入落在字符串中间：${bad && bad[0]}`
+  )
+})

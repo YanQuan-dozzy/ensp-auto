@@ -11,6 +11,7 @@ import {
   QUICK_PROMPT_COUNT,
   MAX_GOALS
 } from '../.build/harness.mjs'
+import { tmpDirFactory } from '../harness/tmp.mjs'
 
 // ———————————————————— sanitizeGoals：清洗与收敛 ————————————————————
 
@@ -79,9 +80,8 @@ test('预设存档含示例目标，且抽样条数与 QUICK_PROMPT_COUNT 一致
 
 // ———————————————————— GoalArchiveStore：持久化 ————————————————————
 
-function tmpDir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'ensp-goals-'))
-}
+// N80：临时目录统一由文件级 after() 钩子清理（此前从不删，每跑一次测试就留一批）
+const tmpDir = tmpDirFactory('ensp-goals-')
 
 test('GoalArchiveStore：首次创建（无文件）返回预设，不落盘', () => {
   const dir = tmpDir()

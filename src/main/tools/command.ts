@@ -1,6 +1,15 @@
-import type { ToolResult } from '@shared/types'
-import { isReadOnlyCommand } from '@shared/risk'
-import { fail, failFromCommand, ok, Type, type ToolSpec } from './registry'
+import type { ToolResult, ViewKind } from '@shared/types'
+import { isReadOnlyCommand, isViewNavigationCommand } from '@shared/risk'
+import { viewLabel } from '../core/telnet/prompt'
+import {
+  ensureSystemView,
+  ensureUserView,
+  enterInterfaceView,
+  isSafeInterfaceName,
+  normalizeViewTarget
+} from '../core/session/viewNav'
+import { fail, failFromCommand, ok, withDeviceLock, Type, type ToolSpec } from './registry'
+import { explainVrpError } from '../core/knowledge/vrp-errors'
 
 /**
  * 只读交互类工具。
@@ -9,6 +18,7 @@ import { fail, failFromCommand, ok, Type, type ToolSpec } from './registry'
  * 1. run_show_command 有**白名单前缀硬约束**，不依赖提示词约束模型
  * 2. 返回的是结构化 CommandResult（含 settled / view / errorCode），不是裸字符串
  * 3. get_device_context 是聚合工具，一次拿全上下文，省代理往返与 token
+ * 4. v2.24 起视图切换有专属工具 change_view —— quit / return 不再无处可去
  */
 
 interface InterfaceRow {
@@ -126,6 +136,22 @@ export const runShowCommand: ToolSpec<{ deviceId: string; command: string }> = {
 
     // 硬约束：不依赖提示词约束模型
     if (!isReadOnlyCommand(args.command)) {
+      /*
+       * v2.24：`quit` / `return` 是视图切换命令，模型想退视图时最容易把它们塞进本工具。
+       * 直接回「只读模式不允许」等于把模型堵死（它会反复换工具试），所以这里把它
+       * 明确指到 change_view —— 那条路会按**当前视图**生成最少命令，而裸下发做不到
+       * （同一句 `quit` 在系统视图与接口视图里去的地方不同）。
+       */
+      if (isViewNavigationCommand(args.command)) {
+        return fail(
+          'NOT_ALLOWED_IN_READ_MODE',
+          `「${args.command.trim().slice(0, 20)}」是视图切换命令，本工具只收只读命令` +
+            '（display / show / dir / more / ping / tracert）。' +
+            "请改用 change_view 工具：target 取 'user'（回用户视图）/ 'system'（进系统视图）/" +
+            "'interface'（进指定接口视图，需给 interfaceName）；它按当前视图生成最少命令且幂等。",
+          { ms: Date.now() - t0, deviceId: args.deviceId }
+        )
+      }
       return fail(
         'NOT_ALLOWED_IN_READ_MODE',
         `只读模式不允许该命令：${args.command.slice(0, 40)}。如需修改配置，请使用配置类工具。`,
@@ -137,11 +163,22 @@ export const runShowCommand: ToolSpec<{ deviceId: string; command: string }> = {
     const meta = { ms: Date.now() - t0, deviceId: args.deviceId, settled: r.settled }
 
     if (!r.ok) {
-      return {
+      /*
+       * v2.27：只读查询失败同样带修正线索。`display` 命令报 Unrecognized 的高频原因是
+       * 「该型号/版本没有这条 display」或「命令拼写不对」，而模型的默认反应是把同一句
+       * 再发一遍 —— 附上错误码对应的根因与纠正，让它换个查法（或换 lookup_vrp_command 查证）。
+       */
+      const diagnosis = explainVrpError(r.errorCode, args.command)
+      const failed: ToolResult = {
         ok: false,
-        error: { code: r.errorCode ?? 'UNKNOWN', message: r.error ?? '命令执行失败', raw: r.clean },
+        error: {
+          code: r.errorCode ?? 'UNKNOWN',
+          message: (r.error ?? '命令执行失败') + (diagnosis ? `\n诊断提示：${diagnosis.hint}` : ''),
+          raw: r.clean
+        },
         meta
       }
+      return diagnosis ? { ...failed, data: { diagnosis: diagnosis.guide } } : failed
     }
 
     return ok(
@@ -158,6 +195,163 @@ export const runShowCommand: ToolSpec<{ deviceId: string; command: string }> = {
       meta
     )
   }
+}
+
+/**
+ * 视图切换（v2.24）。
+ *
+ * 存在的理由：`quit` / `return` / `system-view` 是**相对导航**，而模型过去的两个选择都不对 ——
+ * `run_show_command` 把它们挡在只读白名单外（报错），`apply_config` 会先被顶到系统视图
+ * 再执行 `quit`（于是「退一层」变成「回用户视图」，报成功但去错地方）。
+ *
+ * 这里刻意收**语义目标**而不是裸命令（target = user / system / interface）：
+ * 从目标视图反推「现在要发哪几条命令」是工具的责任 —— 它知道会话跟踪的当前视图，
+ * 模型不知道（它只看到上一次调用返回的 view 字符串，可能已被交互终端改掉）。
+ */
+export const changeView: ToolSpec<{
+  deviceId: string
+  target: 'user' | 'system' | 'interface'
+  interfaceName?: string
+}> = {
+  name: 'change_view',
+  description:
+    '切换设备的当前视图（等价于手工敲 quit / return / system-view / interface）。' +
+    "target='user' → 用户视图（return）；'system' → 系统视图（system-view，已在则跳过）；" +
+    "'interface' → 指定接口视图（需同时给 interfaceName，如 GigabitEthernet 0/0/1）。" +
+    '幂等：已在目标视图时不发任何命令（返回 changed=false）。' +
+    '视图切换不修改任何配置，只读探索阶段也能调用。' +
+    '注意 run_show_command 只收 display / show / dir / more / ping / tracert，不要用它发 quit / return。',
+  risk: 'read',
+  scope: 'device',
+  /*
+   * 刻意**不声明** concurrencySafe：视图是有状态的东西 ——
+   * 若允许它与相邻的只读调用并行，同一批里「导航 + 读」的先后就不再确定，
+   * 而下游命令是否有效完全取决于当前视图。缺省 false = 并发屏障（见 registry 的说明）。
+   */
+  schema: Type.Object(
+    {
+      deviceId: Type.String({ description: '设备 ID，形如 127.0.0.1:2008' }),
+      target: Type.Union(
+        [Type.Literal('user'), Type.Literal('system'), Type.Literal('interface')],
+        {
+          description:
+            "目标视图：'user' 用户视图 / 'system' 系统视图 / 'interface' 接口视图（需配 interfaceName）"
+        }
+      ),
+      interfaceName: Type.Optional(
+        Type.String({
+          description: "target='interface' 时的接口名，如 GigabitEthernet 0/0/1（也接受 GE0/0/1）"
+        })
+      )
+    },
+    { additionalProperties: false }
+  ),
+  summarize: (args, result) => {
+    if (!result.ok) return result.error?.message ?? '切换视图失败'
+    const d = result.data as { changed?: boolean; view?: ViewKind } | undefined
+    const label =
+      args?.target === 'interface' && args?.interfaceName
+        ? `接口视图 ${args.interfaceName}`
+        : viewLabel(d?.view ?? 'other')
+    return d?.changed ? `切到${label}` : `已在${label}，无需切换`
+  },
+  // 多步导航（可能要 return → system-view → interface），必须独占设备：
+  // 否则与 apply_config 的事务交错会让事务的下一条命令落在错误的视图里
+  handler: withDeviceLock('change_view', async (args, ctx) => {
+    const t0 = Date.now()
+    const deviceId = typeof args?.deviceId === 'string' ? args.deviceId.trim() : ''
+    if (!deviceId) return fail('BAD_PARAM', '缺少 deviceId', { ms: Date.now() - t0 })
+
+    const session = ctx.sessions.get(deviceId)
+    if (!session) return fail('NOT_CONNECTED', `设备未连接：${deviceId}`, { ms: Date.now() - t0, deviceId })
+
+    const target = normalizeViewTarget(args?.target)
+    if (!target) {
+      return fail(
+        'BAD_PARAM',
+        `target 非法：${JSON.stringify(args?.target)}。只能是 user / system / interface`,
+        { ms: Date.now() - t0, deviceId }
+      )
+    }
+
+    // 接口名会被拼进下发命令 —— 先校验再发任何字节（连 ensureSystemView 也不许提前跑）
+    const ifaceName = typeof args?.interfaceName === 'string' ? args.interfaceName.trim() : ''
+    if (target === 'interface') {
+      if (!ifaceName) {
+        return fail(
+          'BAD_PARAM',
+          "target='interface' 时必须给 interfaceName，如 GigabitEthernet 0/0/1",
+          { ms: Date.now() - t0, deviceId }
+        )
+      }
+      if (!isSafeInterfaceName(ifaceName)) {
+        return fail(
+          'BAD_PARAM',
+          `接口名不合法：${ifaceName.slice(0, 60)}。只接受形如 GigabitEthernet 0/0/1 / GE0/0/1 的` +
+            '接口名（字母开头，可含数字与 / . - : 及词间空格），不得含换行、管道符、分号等字符。',
+          { ms: Date.now() - t0, deviceId }
+        )
+      }
+    }
+
+    const from: ViewKind = session.view ?? 'other'
+    const outcome =
+      target === 'user'
+        ? await ensureUserView(session, ctx.signal)
+        : target === 'interface'
+          ? await enterInterfaceView(session, ifaceName, ctx.signal)
+          : await ensureSystemView(session, ctx.signal)
+
+    const view: ViewKind = outcome.last?.view ?? session.view ?? 'other'
+    const meta = {
+      ms: Date.now() - t0,
+      deviceId,
+      ...(outcome.last ? { settled: outcome.last.settled } : {})
+    }
+
+    if (!outcome.ok) {
+      return {
+        ok: false,
+        error: {
+          code: outcome.errorCode ?? 'FAILED',
+          message:
+            `切换视图失败（当前 ${viewLabel(from)} → 目标 ${viewLabel(viewOfTarget(target))}）：` +
+            `${outcome.error ?? '未知原因'}。已下发的命令：${outcome.commands.join(' → ') || '无'}。` +
+            '请用 get_device_context 确认设备当前视图与提示符后再决定下一步。',
+          ...(outcome.last?.clean ? { raw: outcome.last.clean } : {})
+        },
+        data: {
+          deviceId,
+          from,
+          target,
+          view,
+          commands: outcome.commands
+        } as never,
+        meta
+      }
+    }
+
+    return ok(
+      {
+        deviceId,
+        from,
+        target,
+        view,
+        /** 是否真的下发了命令（false = 设备本来就在目标视图，幂等跳过） */
+        changed: outcome.commands.length > 0,
+        commands: outcome.commands,
+        ...(outcome.last?.prompt ? { prompt: outcome.last.prompt } : {}),
+        ...(outcome.stale ? { trackingStale: true } : {}),
+        clean: (outcome.last?.clean ?? '').slice(0, 4000)
+      } as never,
+      meta
+    )
+  })
+}
+
+/** 目标视图 → ViewKind（只为错误文案里的中文标签） */
+function viewOfTarget(target: 'user' | 'system' | 'interface'): ViewKind {
+  return target === 'interface' ? 'interface' : target
 }
 
 export const answerDevicePrompt: ToolSpec<{ deviceId: string; answer: 'y' | 'n'; reason: string }> = {

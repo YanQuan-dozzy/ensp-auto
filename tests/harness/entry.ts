@@ -26,6 +26,7 @@ export { matchPromptTail, splitTrailingPrompt, extractView, viewLabel } from '..
 export {
   cleanResponse,
   stripIac,
+  createIacStripper,
   stripAnsi,
   applyBackspaces,
   normalizeNewlines,
@@ -36,6 +37,8 @@ export {
 export { detectError, hasWarning, hasCaretMarker } from '../../src/main/core/telnet/errors'
 export {
   decode,
+  encode,
+  EncodeError,
   detectEncoding,
   detectEncodingDetailed,
   trimIncompleteTail,
@@ -49,6 +52,8 @@ export {
   AUTH_RE,
   ERROR_PATTERNS
 } from '../../src/main/core/telnet/patterns'
+// 终端字节 → 文本的流式解码器（渲染层终端用它，见 shared/terminal-decode.ts 的说明）
+export { createStreamDecoder, type StreamDecoder } from '../../src/shared/terminal-decode'
 
 export { parseInterfaces, diffLines } from '../../src/main/tools/command'
 export { saveTopoFile, importTopologyFile } from '../../src/main/tools/topology'
@@ -69,7 +74,7 @@ export {
 } from '../../src/main/tools/registry'
 // D7：两份工具集合的具名出口（toolsets 刻意零 electron 依赖，可进 harness）
 export { builtinTools, agentTools } from '../../src/main/tools/toolsets'
-export { classifyDanger, isReadOnlyCommand, DANGEROUS_COMMANDS } from '../../src/shared/risk'
+export { classifyDanger, isReadOnlyCommand, isViewNavigationCommand, DANGEROUS_COMMANDS } from '../../src/shared/risk'
 export {
   planDangerGate,
   GATE_DENIED_REASON,
@@ -107,10 +112,22 @@ export {
   verifyExpectation,
   restoreSnapshot,
   saveConfiguration,
-  checkExpectation
+  checkExpectation,
+  // v2.24：单一视图切换命令的「工具选错了」护栏
+  loneViewNavCommand
 } from '../../src/main/tools/config'
 // D2（2026-09-23）：[Y/N] 应答通道（含 NO_PENDING_PROMPT 不变量）
-export { answerDevicePrompt, runShowCommand, saveConfigSnapshot } from '../../src/main/tools/command'
+export { answerDevicePrompt, changeView, runShowCommand, saveConfigSnapshot } from '../../src/main/tools/command'
+// v2.24：视图导航（ensureSystemView 同时被 apply_config 与 change_view 复用）
+export {
+  ensureSystemView,
+  ensureUserView,
+  enterInterfaceView,
+  normalizeViewTarget,
+  isSafeInterfaceName,
+  INTERFACE_NAME_RE,
+  MAX_INTERFACE_NAME_LEN
+} from '../../src/main/core/session/viewNav'
 
 // —— v0.3：pi-ai 翻译层 + 拓扑 ——
 
@@ -144,6 +161,8 @@ export {
   parseEthTrunk,
   parseOspfPeers,
   ipToInt,
+  isIpv4Address,
+  isTolerablePingFailure,
   parseNetwork,
   routeMatches,
   networkPrefix
@@ -261,6 +280,7 @@ export { BUILTIN_SKILLS } from '../../src/main/skills/builtin'
 
 export {
   parseExeFromRegOutput,
+  detectEnspFromRegistry,
   locateEnsp,
   resolveEnspExe,
   ENSP_COMMON_PATHS
@@ -272,7 +292,7 @@ export {
   classifyHttpStatus,
   classifyNetworkError
 } from '../../src/main/core/diagnose/probe'
-export { runDiagnostics, probeModelEndpoint } from '../../src/main/core/diagnose'
+export { runDiagnostics, probeModelEndpoint, probePort } from '../../src/main/core/diagnose'
 
 // —— v2.3：逐模型思考能力表 ——
 
@@ -677,7 +697,7 @@ export { smallToolData, CARD_META_MAX_CHARS, cardMetaOf } from '../../src/main/a
 export { DIFF_CARD_LIMIT, diffWithSnapshot } from '../../src/main/tools/command'
 export { CHECK_CARD_LIMIT } from '../../src/main/tools/check'
 
-// —— v2.10：尾部操作栏 + 本轮用量归集 ——
+// —— v2.10：本轮用量归集 ——
 
 export {
   EMPTY_TURN_USAGE,
@@ -686,11 +706,6 @@ export {
   describeTurnUsage,
   shouldShowUsage
 } from '../../src/shared/turn-usage'
-export {
-  TURN_FOOTER_ITEMS,
-  buildDivergePrompt,
-  lastUserInstruction
-} from '../../src/shared/turn-footer'
 
 // —— v2.11：工具调用归类汇总 ——
 
@@ -710,8 +725,19 @@ export {
   lookupVrpTopic,
   type VrpTopicEntry,
   type VrpCommandFact,
-  type LookupOutcome
+  type LookupOutcome,
+  type VrpMatchKind
 } from '../../src/main/core/knowledge/vrp-commands'
+// v2.27：报错诊断表 + 下发前静态预检（apply_config / run_show_command 的失败引导来源）
+export {
+  VRP_ERROR_GUIDE,
+  listVrpErrorCodes,
+  explainVrpError,
+  preflightCommands,
+  type VrpErrorGuide,
+  type PreflightFinding,
+  type PreflightLevel
+} from '../../src/main/core/knowledge/vrp-errors'
 export {
   inferKind,
   deviceNumber,
@@ -727,13 +753,17 @@ export {
 export {
   stripAttachmentNote,
   matchTreeNodes,
-  nearestUserAncestor
+  nearestUserAncestor,
+  mergeTouchedSettings
 } from '../../src/renderer/stores/storeUtil'
+// B5（N66）：Esc 归属登记表（纯计数器，App 据此让行）
+export { claimEscLayer, escLayerOpen, resetEscLayers } from '../../src/renderer/features/shortcuts/escLayers'
 
 // —— v2.12（F7）：实验验收检查（目标清单 → 逐项 ✔/✘ + 证据，纯只读，不打分） ——
 
 export {
   commandsForCheck,
+  checkInputError,
   evaluateCheck,
   describeCheck,
   checkExperiment,
@@ -742,3 +772,17 @@ export {
   type CheckOutcome,
   type CheckStatus
 } from '../../src/main/tools/check'
+
+// —— B6（N23）：凭据加解密里不依赖 electron 的部分 ——
+// secrets.ts / sshSecrets.ts 顶层 import electron（safeStorage / app.getPath），
+// 故把「拿适配器打包/解包 + 形状归一化」抽到 secretCodec，生产注入真实 safeStorage、
+// 测试注入假适配器 —— 这条安全关键路径才有回归网。
+
+export {
+  packSecret,
+  unpackSecret,
+  normalizeKeyEntries,
+  normalizeSshMeta,
+  type KeyEntry,
+  type SecretCrypto
+} from '../../src/main/settings/secretCodec'

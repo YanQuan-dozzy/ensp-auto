@@ -216,6 +216,9 @@ export async function runGroupedBounded<T, R>(
       const group = queue[cursor++]
       if (!group) return
       for (const { item, index } of group) {
+        // 取消粒度是**调用级**（N34-27 的约定）：这里只在每项开始前检查一次 abort，
+        // 已经在跑的那一项不会被抢占 —— 真正的中断由 handler 自己响应传入的 signal 完成
+        // （如 Telnet 命令会向设备发 Ctrl+C）。因此 fn 必须接住 signal，不要依赖这里同步掐断。
         if (signal?.aborted) return
         results[index] = await fn(item, index)
       }

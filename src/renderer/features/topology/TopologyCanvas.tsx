@@ -181,7 +181,9 @@ function FlowInner(): ReactNode {
         label: '手动连线',
         source: 'manual'
       }
-      setEdges((es) => addEdge({ ...conn, id: linkId, type: 'smoothstep' }, es))
+      // N70：type 必须与 `toFlowEdges` 一致（'topo'）—— 原来写 'smoothstep'，
+      // 新拖的连线在保存回包/刷新之前没有自定义接口标签（与其余链路观感不一致）
+      setEdges((es) => addEdge({ ...conn, id: linkId, type: 'topo' }, es))
       void saveManual({ nodes: manualNodes, links: [...baseLinks, link] })
     },
     [editing.locked, topology, manualNodes, saveManual]

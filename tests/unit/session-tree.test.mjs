@@ -490,3 +490,115 @@ test('v2.12 formatMessageTime：对齐参考图 2 的时间戳格式化', () => 
     `昨天 ${pad(yesterday.getHours())}:${pad(yesterday.getMinutes())}`
   )
 })
+
+// ——————————————————— v2.26：重新生成（↺）按钮的点不进/点不动 ———————————————————
+
+/**
+ * 事故背景（用户报告「重新生成按钮不能正常使用」）：
+ *
+ * 点回答上的 ↺ 要先把「这条 UI 消息」对上「会话树里的节点」，对不上就只回一句
+ * 「无法定位该消息在会话树中的位置，暂不能重新生成」。旧实现里游标是**先取再进**的：
+ * `candidates[k]` 取完立刻 `k+1`，之后才校验内容 —— 于是一条对不上的消息会把游标永久推走，
+ * 同角色后面每一条都错位一格，内容校验跟着全灭，整条回答都找不到自己的节点。
+ *
+ * 而「界面比树多出一条 assistant」是**常规事件**，不是异常数据：
+ * `react.runtime` 每次重试都换新累加器（半截输出「只留在界面里」，不进树），
+ * 所以只要发生过一次请求失败重试，界面就比树多一条 assistant 消息。
+ */
+
+test('v2.26 matchTreeNodes：失败重试的半截输出不再让整类映射报废（★ 用户报的 bug）', () => {
+  const nodes = [
+    treeNode('r', null, 'user', '给 LSW18 配中文编码'),
+    treeNode('n-a1', 'r', 'assistant', '先看设备现状'),
+    treeNode('n-tl1', 'n-a1', 'tool', 'list_devices', {
+      toolCall: { callId: 'c1', name: 'list_devices', args: {}, ok: true }
+    }),
+    treeNode('n-a2', 'n-tl1', 'assistant', '中文编码已切换完成，验证通过。')
+  ]
+  // 界面：第一轮请求流出了半截正文后超时失败 → 重试换新累加器（半截输出只留在界面里）
+  const messages = [
+    { kind: 'user', id: 'm1', text: '给 LSW18 配中文编码' },
+    { kind: 'assistant', id: 'm2', text: '先看设备现状' },
+    { kind: 'tool', id: 'm3', callId: 'c1', name: 'list_devices', args: {}, risk: 'read', status: 'ok' },
+    { kind: 'assistant', id: 'm4', text: '中文编码已切换' }, // ← 半截输出：树里没有
+    { kind: 'system', id: 'm5', text: '请求失败，1.0s 后重试（第 1/3 次）：超时', tone: 'info' },
+    { kind: 'assistant', id: 'm6', text: '中文编码已切换完成，验证通过。' }
+  ]
+  const map = matchTreeNodes(messages, nodes)
+  assert.equal(map.get('m6'), 'n-a2', '★ 最终回答必须仍落在自己的节点上（↺ 靠它定位）')
+  assert.equal(map.has('m4'), false, '半截输出在树里没有对应节点，不该映射')
+  assert.deepEqual(
+    [...map.entries()],
+    [['m1', 'r'], ['m2', 'n-a1'], ['m3', 'n-tl1'], ['m6', 'n-a2']]
+  )
+})
+
+test('v2.26 matchTreeNodes：空白壳不占游标；半截输出与完整输出同前缀也不误配', () => {
+  const full = '这是一段足够长的最终回答，用来验证前缀兜底不会把半截输出错配到完整输出的节点上。'
+  const nodes = [treeNode('r', null, 'user', '目标'), treeNode('n-a1', 'r', 'assistant', full)]
+  const map = matchTreeNodes(
+    [
+      { kind: 'user', id: 'm1', text: '目标' },
+      { kind: 'assistant', id: 'm2', text: '  \n' }, // 空白壳：主进程 flushAssistant 会跳过空白内容
+      { kind: 'assistant', id: 'm3', text: full.slice(0, 30) }, // 半截输出（与完整输出同前缀）
+      { kind: 'assistant', id: 'm4', text: full }
+    ],
+    nodes
+  )
+  assert.deepEqual([...map.entries()], [['m1', 'r'], ['m4', 'n-a1']], '只有逐字相同的那条配得上')
+})
+
+test('v2.26 matchTreeNodes：树多出同类节点时窗口内重新对齐，窗口外宁可不映射', () => {
+  const nodes = [
+    treeNode('r', null, 'user', '目标'),
+    treeNode('n-a0', 'r', 'assistant', '历史遗留的一条回答（界面里没有）'),
+    treeNode('n-a1', 'n-a0', 'assistant', '第二条')
+  ]
+  const map = matchTreeNodes(
+    [
+      { kind: 'user', id: 'm1', text: '目标' },
+      { kind: 'assistant', id: 'm2', text: '第二条' }
+    ],
+    nodes
+  )
+  assert.equal(map.get('m2'), 'n-a1', '跳过树里多出的同类节点，重新对上下一条')
+
+  // 窗口外（≥5 条同类节点都没对上）→ 判定「树里没有这条」，绝不硬配
+  const far = [
+    ...Array.from({ length: 6 }, (_, i) => treeNode(`n-x${i}`, 'r', 'assistant', `无关 ${i}`)),
+    treeNode('n-target', 'r', 'assistant', '目标句')
+  ]
+  const miss = matchTreeNodes([{ kind: 'assistant', id: 'm9', text: '目标句' }], far)
+  assert.equal(miss.has('m9'), false, '超出窗口就是「树里没有」—— 宁可删不了，也不删错')
+})
+
+test('v2.26 deleteFromNode：清掉已删轮的收尾记录（否则重新生成后凭空多出旧收尾卡）', (t) => {
+  const dir = tempDir(t)
+  const store = new SessionTreeStore({ dir })
+  const root = store.createRoot('第一条指令')
+  const a1 = store.append(root.id, node('n-a1', 'assistant', '回答一'))
+  const u2 = store.append(a1.id, node('n-u2', 'user', '第二条指令'))
+  store.append(u2.id, node('n-a2', 'assistant', '回答二'))
+  store.recordTurnFinish(root.id, root.id, { reason: 'completed', ms: 1000 })
+  store.recordTurnFinish(root.id, u2.id, { reason: 'completed', ms: 2000 })
+
+  // 删掉第二条指令所在分支 → 它的收尾记录一并消失
+  store.deleteFromNode(root.id, u2.id)
+  const reloaded = new SessionTreeStore({ dir })
+  assert.deepEqual(
+    Object.keys(reloaded.getTree(root.id)[0].turnFinishes ?? {}),
+    [root.id],
+    '只剩第一轮的记录'
+  )
+
+  // keepSelf（＝重新生成第一条指令的回答）：root 自己的记录也清掉，且不留空对象
+  store.deleteFromNode(root.id, root.id, { keepSelf: true })
+  const after = new SessionTreeStore({ dir })
+  const tree = after.getTree(root.id)
+  assert.equal(tree[0].turnFinishes, undefined, '记录清空后字段一并删掉')
+  assert.equal(
+    nodesToMessages(tree).some((m) => m.kind === 'finish'),
+    false,
+    '★ 历史回放不再在第一条指令下面合成一张凭空的收尾卡'
+  )
+})

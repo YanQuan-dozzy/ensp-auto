@@ -272,8 +272,19 @@ public static class LnkAumid {
 # 任务栏按 AUMID 解析名称/图标只搜「开始菜单 + 桌面」；§7 的 .lnk 在 %LOCALAPPDATA%
 # 不在搜索范围，仅「经它启动」时生效。开始菜单放一份同 AUMID 的 .lnk，
 # dev（electron-vite 直拉 electron.exe）与任何绕过启动器的场景都能正确解析身份。
+# 注意：v2.23 起 dev/便携场景主进程已不设 AUMID（只 app.isPackaged 时设），
+# 本步主要为安装版之外的兜底与历史残留清理，失败不阻断。
 try {
   & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root 'tools\ensure-shortcut.ps1')
+} catch { }
+
+# ---- 7.3 清理 Shell 身份隐藏缓存（tools/clear-shell-cache.ps1）----
+# 头号元凶：设 AUMID 的 Electron 应用首次弹通知时，Windows 会自动在开始菜单创建
+# Electron.lnk 并与该 AUMID 永久绑定，其名称 "Electron" 按字典序压过 eNSPAuto →
+# 任务栏/Get-StartApps 一直显示 Electron（改 exe 元数据也不刷新）。启动前清一次。
+# 同时清 MuiCache / FeatureUsage / iconcache。幂等、失败不阻断。
+try {
+  & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root 'tools\clear-shell-cache.ps1') -Root $Root
 } catch { }
 
 Say '快捷方式就绪，启动 eNSPAuto…' 'Green'

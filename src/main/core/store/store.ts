@@ -8,6 +8,7 @@ import {
 } from '@shared/profiles'
 import { upgradeCompactionDefaults } from '@shared/runtime-policy'
 import { atomicWriteJsonSync } from '../fs/atomic'
+import { quarantineFile } from '../fs/quarantine'
 import { structuredCloneSafe } from '@shared/clone'
 
 /**
@@ -145,8 +146,15 @@ export class JsonStore {
         }
       }
     } catch {
-      // 读坏了就用默认值，不阻塞启动；下一次写入会覆盖
+      // N22：留档 + 告警。设置/别名/端口没有独立实体文件，无法从磁盘重建，
+      // 只能回退默认值；但原文件留档后仍可人工抢救（此前是静默覆盖）。
+      const archived = quarantineFile(this.file)
       this.data = structuredCloneSafe(EMPTY)
+      console.warn(
+        `[store] 持久化文件无法解析（文件损坏）${
+          archived ? `，原文件已留档为 ${archived}` : ''
+        }，已回退默认值：${this.file}`
+      )
     }
   }
 

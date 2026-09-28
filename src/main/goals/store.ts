@@ -2,6 +2,7 @@ import fs from 'node:fs'
 import type { GoalArchivePayload } from '@shared/api'
 import { MAX_GOALS, PRESET_GOALS, sanitizeGoals } from '@shared/goals'
 import { atomicWriteJsonSync } from '../core/fs/atomic'
+import { quarantineFile } from '../core/fs/quarantine'
 import { structuredCloneSafe } from '@shared/clone'
 
 /**
@@ -44,8 +45,12 @@ export class GoalArchiveStore {
         goals: goals.length > 0 ? goals : [...PRESET_GOALS]
       }
     } catch {
-      // 读坏/格式不对就用预设，不阻塞启动
+      // N22：留档 + 告警（存档无独立实体文件，无法从磁盘重建），再以预设兜底
+      const archived = quarantineFile(this.file)
       this.data = structuredCloneSafe(EMPTY)
+      console.warn(
+        `[goals] 目标存档无法解析（文件损坏）${archived ? `，原文件已留档为 ${archived}` : ''}，已回退预设：${this.file}`
+      )
     }
   }
 

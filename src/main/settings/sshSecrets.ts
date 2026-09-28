@@ -2,7 +2,9 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { decrypt, encrypt, type KeyEntry } from './secrets'
+import { normalizeKeyEntries, normalizeSshMeta } from './secretCodec'
 import { atomicWriteJsonSync } from '../core/fs/atomic'
+import { quarantineFile } from '../core/fs/quarantine'
 
 /**
  * SSH 连接凭据的保管。
@@ -64,28 +66,11 @@ function read(): SshFile {
       return cache
     }
     const parsed = JSON.parse(fs.readFileSync(file(), 'utf8')) as Partial<SshFile>
-    const meta: Record<string, SshCredentialMeta> = {}
-    const secrets: Record<string, KeyEntry> = {}
-    for (const [id, m] of Object.entries(parsed.meta ?? {})) {
-      if (!m || typeof m !== 'object') continue
-      const mm = m as Partial<SshCredentialMeta>
-      if (typeof mm.host !== 'string' || typeof mm.username !== 'string') continue
-      meta[id] = { id, name: mm.name ?? '', host: mm.host, port: mm.port ?? 22, username: mm.username }
-    }
-    for (const [id, e] of Object.entries(parsed.secrets ?? {})) {
-      if (!e || typeof e !== 'object') continue
-      const ee = e as Partial<KeyEntry>
-      if (typeof ee.data !== 'string' || !ee.data) continue
-      secrets[id] = { enc: ee.enc === 'plain' ? 'plain' : 'safe', data: ee.data }
-    }
-    cache = { version: 1, meta, secrets }
+    // 形状归一化与 api-keys 共用 secretCodec（N23）：坏条目丢弃，不抛出
+    cache = { version: 1, meta: normalizeSshMeta(parsed.meta), secrets: normalizeKeyEntries(parsed.secrets) }
   } catch {
     // 读坏不覆盖：留档供排查，然后从空开始（凭据可重填）
-    try {
-      fs.renameSync(file(), `${file()}.bad-${Date.now()}`)
-    } catch {
-      /* 忽略 */
-    }
+    quarantineFile(file())
     cache = structuredClone(EMPTY)
   }
   return cache

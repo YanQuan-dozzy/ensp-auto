@@ -265,6 +265,9 @@ const EXPECTED_PARALLEL = new Set([
   'verify_dhcp',
   'verify_nat',
   'verify_eth_trunk',
+  // N2：verify_expectation 声明 risk:'read' + concurrencySafe —— 其并发安全的**前提**
+  // 是「校验命令已被只读校验」。这一前提由 config.ts#runExpectation 内的
+  // classifyDanger + isReadOnlyCommand 强校验保证（命令来自模型参数，工具级 risk 挡不住）。
   'verify_expectation',
   'diff_with_snapshot',
   'read_attachment',

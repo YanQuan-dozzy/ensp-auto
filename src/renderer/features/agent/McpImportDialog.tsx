@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useMemo, useState, type ReactNode } from 'react'
 import type { McpServerConfig } from '@shared/types'
 import { MCP_IMPORT_EXAMPLE, parseMcpServersJson } from '@shared/mcp-import'
+import { useEscLayer } from '@/features/shortcuts/useEscLayer'
 import {
   DismissibleBanner,
   IconAlertTriangle,
@@ -35,22 +36,14 @@ export function McpImportDialog({
   const [error, setError] = useState('')
   const [warnings, setWarnings] = useState<string[]>([])
 
-  // v1.8：onCancel 是父组件内联箭头函数，每次 render 新引用 —— 用 ref 存最新回调，
-  // 避免 Esc 监听随每次渲染反复 remove/add（与 McpDialog / SettingsDialog 同一修法）
-  const onCancelRef = useRef(onCancel)
-  onCancelRef.current = onCancel
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent): void => {
-      // 本层开着时 Esc 只关本层 —— 否则一次按键会连着关掉设置页
-      if (e.key === 'Escape') {
-        e.stopPropagation()
-        onCancelRef.current()
-      }
-    }
-    window.addEventListener('keydown', onKey, true)
-    return () => window.removeEventListener('keydown', onKey, true)
-  }, [])
+  /**
+   * N66：本层开着时 Esc 只关本层 —— 否则一次按键会连着关掉设置页。
+   *
+   * 改用 `useEscLayer` 而不是自己挂捕获监听：除了在捕获阶段 `stopPropagation`
+   * （挡住冒泡阶段的父级监听），还**认领一层 Esc** —— App 的全局捕获监听先于本层
+   * 注册，光靠 stopPropagation 拦不住它，必须由它主动 `escLayerOpen()` 让行。
+   */
+  useEscLayer(onCancel)
 
   /** 实时给出「看起来能不能解析」的提示，但不拦着用户点确认（真正的判定在确认时做） */
   const preview = useMemo(() => {

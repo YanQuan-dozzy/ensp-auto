@@ -8,7 +8,7 @@
 import { useEffect, useState } from 'react'
 import { useApp } from '@/stores/app'
 import { ENSP_SOURCE_LABEL, type EnspLocatePayload } from '@shared/types'
-import { Switch, useDismissOnOutside } from '@/components/ui'
+import { DismissibleBanner, Switch, useDismissOnOutside } from '@/components/ui'
 import { Row, Section } from '@/components/settings-kit'
 
 export function IntegrationSettings({ onManage }: { onManage: () => void }) {
@@ -34,6 +34,8 @@ export function IntegrationSettings({ onManage }: { onManage: () => void }) {
   // eNSP 自动检测结果（只在本次打开面板期间有效；落盘的是输入框里的值）
   const [locate, setLocate] = useState<EnspLocatePayload | null>(null)
   const [locating, setLocating] = useState(false)
+  /** N65：自动检测本身的失败（IPC 异常）—— 与「探测完但没找到」是两回事，要分开说 */
+  const [locateError, setLocateError] = useState<string | null>(null)
   /**
    * 检测结果的外点关闭：ref 挂在**整块结果**（结论条 + 候选路径折叠）上，而不是只挂结论条 ——
    * 否则点「查看探测过的 N 个位置」会先被判定为「点了别处」而把要展开的内容一并抹掉。
@@ -43,6 +45,7 @@ export function IntegrationSettings({ onManage }: { onManage: () => void }) {
   /** 自动检测是只读探测：找到就把路径填进输入框并即时保存 */
   const doLocate = async (): Promise<void> => {
     setLocating(true)
+    setLocateError(null)
     try {
       const r = await window.api.ensp.locate()
       setLocate(r)
@@ -50,6 +53,10 @@ export function IntegrationSettings({ onManage }: { onManage: () => void }) {
         setEnspPath(r.found)
         void updateSettings({ ensp: { exePath: r.found } })
       }
+    } catch (e) {
+      // N65：原来只有 try/finally —— 探测失败只留一条未处理 rejection，
+      // 面板上不显示任何原因（用户看到「点了检测，什么也没发生」）
+      setLocateError(`自动检测失败：${e instanceof Error ? e.message : String(e)}`)
     } finally {
       setLocating(false)
     }
@@ -180,6 +187,19 @@ export function IntegrationSettings({ onManage }: { onManage: () => void }) {
                                     浏览…
                                   </button>
                                 </div>
+                                {/* N65：检测**本身失败**（IPC 报错）也要说清楚 —— 与下面
+                                    「探测完成但没找到」是两种不同结论，不能只留一条静默 rejection。
+                                    这是「点了一次检测」的一次性反馈，故用 DismissibleBanner
+                                    （点别处即消失），与下面常驻的检测结论区分开。 */}
+                                {locateError ? (
+                                  <DismissibleBanner
+                                    tone="danger"
+                                    onDismiss={() => setLocateError(null)}
+                                    style={{ marginTop: 4 }}
+                                  >
+                                    {locateError}
+                                  </DismissibleBanner>
+                                ) : null}
                                 {locate ? (
                                   <div ref={locateRef}>
                                     {locate.found ? (

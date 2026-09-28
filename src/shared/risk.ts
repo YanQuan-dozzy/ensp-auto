@@ -186,3 +186,26 @@ export function isReadOnlyCommand(command: string): boolean {
   const first = canonicalizeCommand(lines[0]!).split(' ')[0] ?? ''
   return READ_ONLY_PREFIXES.includes(first)
 }
+
+/**
+ * 视图导航命令（v2.24）。
+ *
+ * `quit` 退一层视图、`return` 一步回用户视图 —— 它们既不是只读命令（会改变提示符
+ * 所在的视图），也不是配置变更（不改任何配置项），因此在旧的工具面里无处容身：
+ * 模型想退视图时，调 `run_show_command` 被只读白名单拒绝，改调 `apply_config` 又会
+ * 先被顶到系统视图、于是 `quit` 变成「系统视图 → 用户视图」（报成功但去错地方）。
+ * 现在模型走 `change_view` 工具，本常量是该工具与错误文案的共同依据。
+ *
+ * ★ 刻意**不并入** `isReadOnlyCommand`：那个判据同时服务两处，并进去都会出事 ——
+ * ① `verify_expectation` 的校验命令（校验的副作用是去切视图，等于污染被观测的状态）；
+ * ② `run_show_command` 的并发资格（导航是有状态操作，后接的只读调用会被它挪动视图）。
+ */
+export const VIEW_NAV_COMMANDS: readonly string[] = ['quit', 'return']
+
+/** 是否视图导航命令（只认单独一行的导航命令；多行一律否） */
+export function isViewNavigationCommand(command: string): boolean {
+  const lines = splitCommandLines(command)
+  if (lines.length !== 1) return false
+  const first = canonicalizeCommand(lines[0]!).split(' ')[0] ?? ''
+  return VIEW_NAV_COMMANDS.includes(first)
+}

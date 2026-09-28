@@ -33,6 +33,9 @@ const DIFF_PREFIX: Record<DiffRow['kind'], string> = { same: '=', onlyA: '-', on
 /** 回放粒度：所有工具节点 */
 const PLAY_INTERVAL_MS = 1200
 
+/** N17：轨迹长列表首屏步数（其余按「显示更多」追加） */
+const TRACE_PAGE_SIZE = 120
+
 function fmtTime(at: number): string {
   const d = new Date(at)
   const p = (n: number): string => String(n).padStart(2, '0')
@@ -311,6 +314,20 @@ export function TracePanel(): ReactNode {
     [steps, onlyFailed]
   )
 
+  /**
+   * N17：轨迹长列表同样分页展开。
+   *
+   * 一次长实验动辄上百次工具调用，全量挂 DOM 的布局开销与消息流叠加后很明显。
+   * 与变更时间线同一口径：首屏 120 步，其余按需追加；**不重排下标**
+   * （`i` 恒为 `steps` 里的原始下标，回放游标与行点击依赖它）。
+   */
+  const [limit, setLimit] = useState(TRACE_PAGE_SIZE)
+  useEffect(() => {
+    setLimit(TRACE_PAGE_SIZE)
+  }, [onlyFailed])
+  const shownSteps = useMemo(() => visibleSteps.slice(0, limit), [visibleSteps, limit])
+  const hiddenSteps = visibleSteps.length - shownSteps.length
+
   const toggleBookmark = async (node: SessionNode): Promise<void> => {
     if (!activeRootId) return
     try {
@@ -499,39 +516,53 @@ export function TracePanel(): ReactNode {
                   <div className="empty-content">没有失败的步骤，取消「只看失败」可看全部。</div>
                 </div>
               ) : (
-                visibleSteps.map(({ n, i }) => {
-                  const tc = n.toolCall
-                  return (
-                    <div
-                      key={n.id}
-                      className={`trace-step${i === stepIndex ? ' active' : ''}`}
-                      onClick={() => {
-                        setPlaying(false)
-                        setStepIndex(i)
-                      }}
-                      title={tc?.summary ?? n.content}
-                    >
-                      <span className="trace-idx mono">{i + 1}</span>
-                      <span className="trace-time mono">{fmtTime(n.createdAt)}</span>
-                      <span className={`trace-state${tc?.ok === false ? ' fail' : tc?.ok ? ' ok' : ''}`}>
-                        {stepStatus(tc?.ok)}
-                      </span>
-                      <span className="trace-name mono">{tc?.name ?? n.content}</span>
-                      <span className="trace-ms mono">{tc?.ms !== undefined ? `${tc.ms}ms` : ''}</span>
-                      <span className="trace-summary">{tc?.summary ?? n.content}</span>
-                      <button
-                        className={`trace-bookmark${n.bookmarked ? ' on' : ''}`}
-                        title={n.bookmarked ? '取消书签' : '标为阶段完成点'}
-                        onClick={(e) => {
-                          e.stopPropagation()
-                          void toggleBookmark(n)
+                <>
+                  {shownSteps.map(({ n, i }) => {
+                    const tc = n.toolCall
+                    return (
+                      <div
+                        key={n.id}
+                        className={`trace-step${i === stepIndex ? ' active' : ''}`}
+                        onClick={() => {
+                          setPlaying(false)
+                          setStepIndex(i)
                         }}
+                        title={tc?.summary ?? n.content}
                       >
-                        {n.bookmarked ? '★' : '☆'}
+                        <span className="trace-idx mono">{i + 1}</span>
+                        <span className="trace-time mono">{fmtTime(n.createdAt)}</span>
+                        <span className={`trace-state${tc?.ok === false ? ' fail' : tc?.ok ? ' ok' : ''}`}>
+                          {stepStatus(tc?.ok)}
+                        </span>
+                        <span className="trace-name mono">{tc?.name ?? n.content}</span>
+                        <span className="trace-ms mono">{tc?.ms !== undefined ? `${tc.ms}ms` : ''}</span>
+                        <span className="trace-summary">{tc?.summary ?? n.content}</span>
+                        <button
+                          className={`trace-bookmark${n.bookmarked ? ' on' : ''}`}
+                          title={n.bookmarked ? '取消书签' : '标为阶段完成点'}
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            void toggleBookmark(n)
+                          }}
+                        >
+                          {n.bookmarked ? '★' : '☆'}
+                        </button>
+                      </div>
+                    )
+                  })}
+                  {/* N17：其余步骤按需展开（不改变任何回放语义，只是少挂 DOM） */}
+                  {hiddenSteps > 0 ? (
+                    <div style={{ display: 'flex', justifyContent: 'center', padding: '10px 0' }}>
+                      <button
+                        className="btn sm"
+                        onClick={() => setLimit((l) => l + TRACE_PAGE_SIZE)}
+                        title="继续往下显示步骤（不影响回放游标）"
+                      >
+                        显示更多（还有 {hiddenSteps} 步）
                       </button>
                     </div>
-                  )
-                })
+                  ) : null}
+                </>
               )}
             </div>
           ) : null}

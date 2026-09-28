@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import { sanitizeTodos, type TodoItem } from '@shared/interaction'
 import { atomicWriteJsonSync } from '../fs/atomic'
+import { quarantineFile } from '../fs/quarantine'
 
 /**
  * 任务清单存储（userData/todos.json），v2.7。
@@ -43,8 +44,13 @@ export class TodoStore {
         lists
       }
     } catch {
-      // 读坏就用空表，不阻塞启动（下一次写入覆盖）
+      // N22：留档 + 告警（清单无独立实体文件，无法从磁盘重建），再以空表兜底。
+      // 此前直接把空表写回去，原文件的损坏内容被永久覆盖。
+      const archived = quarantineFile(this.file)
       this.data = emptyData()
+      console.warn(
+        `[todos] 清单文件无法解析（文件损坏）${archived ? `，原文件已留档为 ${archived}` : ''}，已按空表处理：${this.file}`
+      )
     }
   }
 
@@ -61,20 +67,39 @@ export class TodoStore {
   set(ownerId: string, raw: unknown): TodoItem[] {
     if (!ownerId) return []
     const todos = sanitizeTodos(raw)
+    // N41：写盘失败必须回滚内存 —— 否则界面显示新清单、磁盘还是旧的，重启就回弹
+    // （JsonStore.commit / ChangeStore.add / GoalArchiveStore.replace 都做了回滚，此处对齐）
+    const beforeLists = { ...this.data.lists }
+    const beforeUpdatedAt = this.data.updatedAt
     if (todos.length === 0) delete this.data.lists[ownerId]
     else this.data.lists[ownerId] = todos
     this.evictOldOwners()
     this.data.updatedAt = Date.now()
-    this.persist()
+    try {
+      this.persist()
+    } catch (e) {
+      this.data.lists = beforeLists
+      this.data.updatedAt = beforeUpdatedAt
+      throw e
+    }
     return todos.map((t) => ({ ...t }))
   }
 
   /** 会话被删除/清理时连带清掉清单，避免索引里留孤儿 */
   remove(ownerId: string): void {
     if (!ownerId || !this.data.lists[ownerId]) return
+    // N41：与 set() 同款回滚
+    const beforeLists = { ...this.data.lists }
+    const beforeUpdatedAt = this.data.updatedAt
     delete this.data.lists[ownerId]
     this.data.updatedAt = Date.now()
-    this.persist()
+    try {
+      this.persist()
+    } catch (e) {
+      this.data.lists = beforeLists
+      this.data.updatedAt = beforeUpdatedAt
+      throw e
+    }
   }
 
   /**

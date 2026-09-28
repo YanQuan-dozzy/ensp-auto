@@ -1,6 +1,6 @@
 import type { Attachment } from './attachments'
 import type { QuestionAnswers, TodoItem } from './interaction'
-import type { AgentEvent, BranchComparison, ChangeRecord, ChangeResult, Device, DeviceId, DiagLevel, DiagReport, EnspLocatePayload, GateDecision, McpServerStatus, SessionNode, SessionNodeMeta, Settings, Skill, SkillSummary, TerminalBufferSegment, Topology, TopologyLink, TopologyNode, WiresharkAvailabilityPayload } from './types'
+import type { AgentEvent, BranchComparison, ChangeRecord, ChangeResult, Device, DeviceId, DiagLevel, DiagReport, Encoding, EnspLocatePayload, GateDecision, McpServerStatus, SessionNode, SessionNodeMeta, Settings, Skill, SkillSummary, TerminalBufferSegment, Topology, TopologyLink, TopologyNode, WiresharkAvailabilityPayload } from './types'
 
 /**
  * preload 暴露给渲染进程的 API 契约。
@@ -40,6 +40,13 @@ export interface TerminalWriteResult {
 
 export interface TerminalBufferPayload {
   segments: TerminalBufferSegment[]
+  /**
+   * 这些字节所属的回显编码（GBK / UTF-8）。
+   *
+   * 必须随快照回传：`segments` 承载的是**原始字节**，字节本身不带编码信息；
+   * 设备切到中文后回显是 GBK，渲染层按 UTF-8 解就是满屏乱码。
+   */
+  encoding: Encoding
   /** 快照水位：渲染层只回放 `seq > 该值` 的实时事件 */
   seq: number
 }
@@ -91,6 +98,8 @@ export interface TerminalDataPayload {
   fromAgent: boolean
   /** 该段在设备回放缓冲中的序号，用于与快照水位对齐去重 */
   seq: number
+  /** 该段字节所属的回显编码；渲染层按它解码后再交给 xterm */
+  encoding: Encoding
 }
 
 export interface TerminalClosedPayload {
@@ -213,11 +222,6 @@ export interface AppInfoPayload {
   attachmentsDir: string
   snapshotsDir: string
   topologyDir: string
-}
-
-export interface PickDirResult {
-  canceled: boolean
-  path: string | null
 }
 
 export interface ChangeUserDataArgs {

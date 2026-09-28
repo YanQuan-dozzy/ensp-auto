@@ -126,8 +126,11 @@ export function registerAppIpc(services: Services, getWindow: () => BrowserWindo
       properties: ['openDirectory', 'createDirectory'] as ('openDirectory' | 'createDirectory')[]
     }
     const result = await showOpenDialogSafe(win, opts)
-    if (result.canceled || result.filePaths.length === 0) return { canceled: true, path: null }
-    return { canceled: false, path: result.filePaths[0]! }
+    // 契约（N1）：`api.ts` 声明 `pickDirectory(): Promise<string | null>`，取消返回 null。
+    // 本处理器曾返回 `{ canceled, path }` 对象，而渲染层按字符串消费（对象恒为 truthy），
+    // 导致「更改数据主目录」与四个自定义目录功能全链路失效。返回形状必须与声明一致。
+    if (result.canceled || result.filePaths.length === 0) return null
+    return result.filePaths[0] ?? null
   })
 
   ipcMain.handle(

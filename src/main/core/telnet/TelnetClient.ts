@@ -10,8 +10,8 @@ import {
   PAGING_TAIL_RE,
   type TelnetOptions
 } from './patterns'
-import { cleanResponse, stripAnsi, stripIac } from './cleaner'
-import { decode, detectEncodingDetailed, tailSlice } from './encoding'
+import { cleanResponse, createIacStripper, stripAnsi, type IacStripper } from './cleaner'
+import { decode, detectEncodingDetailed, encode, tailSlice } from './encoding'
 import { detectError, hasWarning } from './errors'
 import { matchPromptTail, splitTrailingPrompt } from './prompt'
 
@@ -32,6 +32,13 @@ import { matchPromptTail, splitTrailingPrompt } from './prompt'
 
 export interface TelnetClientOptions extends Partial<TelnetOptions> {
   encoding?: 'auto' | Encoding
+  /**
+   * 出站编码（N10）。缺省 `utf8` —— 与历史的 `Buffer.from(str)` 逐字节一致，行为不变。
+   *
+   * 只有上层**显式声明**设备字符集时才会传 `gbk`：设备回显是 GBK 并不等于它接受 GBK 命令，
+   * 这条要先真机确认（CODE-REVIEW-2026-09-27 §7 #1），所以刻意不做自动切换。
+   */
+  outboundEncoding?: Encoding
 }
 
 export interface ConnectResult {
@@ -49,7 +56,6 @@ interface QueueItem {
   enqueuedAt: number
   timeoutMs: number
   resolve: (r: CommandResult) => void
-  reject: (e: Error) => void
   signal?: AbortSignal
 }
 
@@ -93,6 +99,10 @@ export class TelnetClient {
   private channel: ByteChannel | null = null
   private opts: TelnetOptions
   private encodingPref: 'auto' | Encoding
+  /** 出站编码（N10）：默认 utf8（与历史行为逐字节一致）；上层显式声明设备字符集时才切换 */
+  private outboundEncoding: Encoding
+  /** 有状态 IAC 剥离器（N28）：协商序列可能被 TCP 分片切开，需跨 chunk 承接 */
+  private readonly iacStripper: IacStripper = createIacStripper()
 
   private encoding: Encoding = 'utf8'
   private encodingLocked = false
@@ -152,6 +162,21 @@ export class TelnetClient {
   constructor(options: TelnetClientOptions = {}) {
     this.opts = { ...DEFAULT_TELNET_OPTIONS, ...options }
     this.encodingPref = options.encoding ?? 'auto'
+    this.outboundEncoding = options.outboundEncoding ?? 'utf8'
+    // 显式声明时立刻生效：终端在连接成功那一刻就要按它解码（ConnectResult.encoding
+    // 与界面状态栏都取 currentEncoding），不必等第一片回显到了才改口
+    if (this.encodingPref !== 'auto') this.encoding = this.encodingPref
+  }
+
+  /**
+   * 出站字节的唯一出口（N10）。
+   *
+   * 默认 utf8 与旧的 `Buffer.from(str)` 完全一致；显式声明 gbk 时才按反查表编码。
+   * 编码失败（GBK 下遇到无法映射的字符）**抛错**而不是替换成 `?`：
+   * 静默替换会让设备存下一串看不出问题的错误配置。
+   */
+  private outbound(text: string): Buffer {
+    return encode(text, this.outboundEncoding)
   }
 
   // ———————————————————————————— 对外接口 ————————————————————————————
@@ -172,6 +197,39 @@ export class TelnetClient {
   /** 挂起中的确认提示原文；无挂起时为空串 */
   get awaitingConfirmText(): string {
     return this.confirmPaused ? this.confirmPromptText : ''
+  }
+
+  /**
+   * 当前生效的回显编码。
+   *
+   * 这是**唯一事实源**：代理的业务解码、终端显示的解码、界面状态栏都取它。
+   * 过去终端那条线不取它（xterm 硬按 UTF-8 解），于是设备切中文后
+   * 只有代理看得见中文，屏幕上全是拉丁扩展字母乱码。
+   */
+  get currentEncoding(): Encoding {
+    return this.encoding
+  }
+
+  /**
+   * 运行时改「设备回显编码」偏好（用户在设置里切换时即时生效，不必重连）。
+   *
+   * - 显式 utf8/gbk：立刻按它解码并**锁定**（不再被自动探测覆盖）；
+   * - auto：解锁，交回自动探测（保留当前判定值，等新证据再改）。
+   *
+   * 出站编码与 clientOptions() 的口径保持一致：只有显式声明才跟随，
+   * auto 时回到默认 utf8（设备「回显是 GBK」不等于「接受 GBK 命令」）。
+   */
+  setEncodingPref(pref: 'auto' | Encoding): void {
+    if (pref === this.encodingPref) return
+    this.encodingPref = pref
+    if (pref === 'auto') {
+      this.encodingLocked = false
+      this.outboundEncoding = 'utf8'
+      return
+    }
+    this.encoding = pref
+    this.encodingLocked = true
+    this.outboundEncoding = pref
   }
 
   onRawData(cb: (chunk: Uint8Array) => void): () => void {
@@ -215,7 +273,7 @@ export class TelnetClient {
     this.nudgeTimer = setTimeout(() => {
       const handshakePending = this.active?.item.kind === 'handshake'
       if (!this.closed && handshakePending && this.channel && this.channel.writable) {
-        this.channel.write(Buffer.from('\r\n'))
+        this.channel.write(this.outbound('\r\n'))
       }
       this.nudgeTimer = null
     }, this.opts.connectNudgeMs)
@@ -317,7 +375,7 @@ export class TelnetClient {
       }
       if (this.interactiveLine) this.flushInteractiveBacklog()
       this.deviceHasUncommittedInput = true
-      this.channel?.write(Buffer.from(data))
+      this.channel?.write(this.outbound(data))
       return { accepted: true, queued: false }
     }
 
@@ -387,10 +445,12 @@ export class TelnetClient {
     if (this.active || this.queue.length || this.confirmPaused) return
     const backlog = this.interactiveLine
     this.interactiveLine = ''
-    // 补发的是普通字符 → 设备行缓冲从此有未提交内容；补发的是回车 → 正好提交掉
-    if (!/[\r\n]/.test(backlog)) this.deviceHasUncommittedInput = true
-    else this.deviceHasUncommittedInput = false
-    this.channel?.write(Buffer.from(backlog))
+    // 补发的是普通字符 → 设备行缓冲从此有未提交内容；补发的是回车 → 正好提交掉。
+    // N35：判据是「**以**换行结尾」而不是「**含**换行」—— 占用期先按 Enter 再打字会得到
+    // '\rdisp'，含换行但并未提交，旧判据会错置 false，此后一次粘贴型输入就会整行重发，
+    // 与设备行缓冲拼成 'dispdisplay ip int'。
+    this.deviceHasUncommittedInput = !/[\r\n]$/.test(backlog)
+    this.channel?.write(this.outbound(backlog))
   }
 
   close(): void {
@@ -410,7 +470,7 @@ export class TelnetClient {
     /** 插队：仅用于「对设备确认提示的显式应答」，见 exec() 的说明 */
     toFront = false
   ): Promise<CommandResult> {
-    return new Promise<CommandResult>((resolve, reject) => {
+    return new Promise<CommandResult>((resolve) => {
       const item: QueueItem = {
         id: randomUUID(),
         kind: partial.kind,
@@ -418,7 +478,6 @@ export class TelnetClient {
         enqueuedAt: Date.now(),
         timeoutMs: partial.timeoutMs,
         resolve,
-        reject,
         signal: partial.signal
       }
       if (toFront && !this.active) this.queue.unshift(item)
@@ -434,7 +493,7 @@ export class TelnetClient {
    * 第二行起 conn 已非空 → push 到队尾 —— 粘贴顺序与执行顺序被反转。
    * 这里一次性构造并整体前插/追加，且**每一行都占 MAX_QUEUE 预算**（与 exec() 同口径，
    * 交互通道不得绕过队列上限——D12 修法 3 要的不变量）。
-   * 交互项的结果无人消费（fire-and-forget），但 resolve/reject 必须挂接，
+   * 交互项的结果无人消费（fire-and-forget），但 `resolve` 必须挂接 ——
    * 否则 pump→resolveActive 结算时会因 undefined 崩溃。
    * 返回值忽略：交互通道不向调用方回传命令结果。
    */
@@ -447,10 +506,8 @@ export class TelnetClient {
     }
     const items: QueueItem[] = lines.map((command) => {
       let resolve: (r: CommandResult) => void = () => {}
-      let reject: (e: Error) => void = () => {}
-      new Promise<CommandResult>((res, rej) => {
+      new Promise<CommandResult>((res) => {
         resolve = res
-        reject = rej
       })
       return {
         id: randomUUID(),
@@ -458,8 +515,7 @@ export class TelnetClient {
         command,
         enqueuedAt: Date.now(),
         timeoutMs: this.opts.timeoutMs,
-        resolve,
-        reject
+        resolve
       }
     })
     if (toFront && !this.active) this.queue.unshift(...items)
@@ -507,7 +563,7 @@ export class TelnetClient {
         if (this.active === state) {
           this.confirmPaused = false
           try {
-            this.channel?.write(Buffer.from('\x03'))
+            this.channel?.write(this.outbound('\x03'))
           } catch {
             /* 尽力而为 */
           }
@@ -533,39 +589,56 @@ export class TelnetClient {
     // 其余项目（含空命令的 [Y/N] 回车应答）一律走 writeCommand ——
     // 空 command 会写出裸 \r\n（≈ 用户在设备提示上按了一次回车，D12）。
     // 只用 kind 分流而不是 `command 非空` 判断：否则「空命令应答」会被跳过永不下发。
-    if (item.kind !== 'handshake' && !this.writeCommand(item.command)) {
-      this.resolveActive({
-        errorCode: 'INVALID_INPUT',
-        error:
-          '命令包含换行符（\\r / \\n），已拒绝下发：设备会把一行之内的多段内容当成多条命令依次执行'
-      })
-      return
+    if (item.kind !== 'handshake') {
+      const w = this.writeCommand(item.command)
+      if (!w.ok) {
+        this.resolveActive({ errorCode: 'INVALID_INPUT', error: w.error })
+        return
+      }
     }
   }
 
   /**
    * 下发一条命令行。
    *
-   * 返回 false 表示载荷被拒（含 \r / \n）。这是「命令不得跨行」的最后一道防线：
-   * 上层（风险判定 / 白名单）已经会拦多行命令，这里兜住任何漏判的调用方。
+   * 返回 `ok:false` 表示载荷被拒（含 \r / \n，或出站编码失败）。
+   * 换行检查是「命令不得跨行」的最后一道防线：上层（风险判定 / 白名单）已经会拦多行命令，
+   * 这里兜住任何漏判的调用方。
    */
-  private writeCommand(command: string): boolean {
-    if (!this.channel) return false
-    if (/[\r\n]/.test(command)) return false
-    const payload = Buffer.from(`${command}\r\n`)
+  private writeCommand(command: string): { ok: true } | { ok: false; error: string } {
+    if (!this.channel) return { ok: false, error: '连接已关闭' }
+    if (/[\r\n]/.test(command)) {
+      return {
+        ok: false,
+        error:
+          '命令包含换行符（\\r / \\n），已拒绝下发：设备会把一行之内的多段内容当成多条命令依次执行'
+      }
+    }
+    let payload: Buffer
+    try {
+      payload = this.outbound(`${command}\r\n`)
+    } catch (e) {
+      // N10：出站编码失败（如声明了 GBK 却遇到无法映射的字符）必须可见，绝不静默替换
+      return { ok: false, error: `命令无法按 ${this.outboundEncoding} 编码：${e instanceof Error ? e.message : String(e)}` }
+    }
     if (this.opts.charDelayMs > 0) {
+      // N29：逐字节定时器绑定「本次下发所属的 active 状态」。旧实现只判 channel/closed，
+      // 于是命令超时或 Ctrl+C 中断后，旧 payload 的剩余字节会继续往设备灌，
+      // 与新命令（或 \x03）交错，拼出错乱的命令行。active 一换人/清空就立刻停。
+      const state = this.active
       let i = 0
       const tick = (): void => {
         if (!this.channel || this.closed || i >= payload.length) return
+        if (state !== null && this.active !== state) return
         this.channel.write(payload.subarray(i, i + 1))
         i++
         setTimeout(tick, this.opts.charDelayMs)
       }
       tick()
-      return true
+      return { ok: true }
     }
     this.channel.write(payload)
-    return true
+    return { ok: true }
   }
 
   /** 队列挂起期间，把已被中止（signal.aborted）的排队项结算掉，不留悬挂 Promise */
@@ -586,12 +659,14 @@ export class TelnetClient {
 
   private handleData(chunk: Buffer): void {
     if (this.closed) return
-    const clean = stripIac(chunk)
+    // N28：同一个剥离器实例跨 chunk 复用，协商序列被 TCP 分片切开时不会泄漏成正文
+    const clean = this.iacStripper.push(chunk)
 
-    // 交互通道始终拿到原始字节（只剥 IAC），保证终端显示与设备一致
-    for (const cb of this.rawSubs) cb(new Uint8Array(clean))
-
-    if (!this.active) return
+    if (!this.active) {
+      // 交互通道始终拿到原始字节（只剥 IAC），保证终端与代理看到同一条流
+      this.emitRaw(clean)
+      return
+    }
 
     this.active.lastDataAt = Date.now()
     this.append(clean)
@@ -612,6 +687,18 @@ export class TelnetClient {
 
     this.armQuietTimer()
     this.evaluate()
+    // ★ 广播必须排在编码判定**之后**：终端要按下面这个编码去解码显示，
+    // 而「触发判定的那一片」恰好就是第一段中文（`language-mode chinese` 的
+    // 「是否更改当前语言环境…[Y/N]」）所在的那一片 —— 先广播就会被按旧编码解，
+    // 屏幕上第一句中文永远乱码，直到下一次编码变更把整屏重画。
+    this.emitRaw(clean)
+  }
+
+  /** 把（已剥 IAC 的）原始字节广播给交互通道订阅者 */
+  private emitRaw(clean: Buffer): void {
+    if (!this.rawSubs.size) return
+    const bytes = new Uint8Array(clean)
+    for (const cb of this.rawSubs) cb(bytes)
   }
 
   private append(chunk: Buffer): void {
@@ -718,7 +805,7 @@ export class TelnetClient {
       if (state.advancedAtLen !== this.totalLen && state.hops < this.opts.maxPagingHops) {
         state.hops++
         state.advancedAtLen = this.totalLen
-        this.channel?.write(Buffer.from(PAGING_ADVANCE))
+        this.channel?.write(this.outbound(PAGING_ADVANCE))
         this.armQuietTimer()
       }
       return
@@ -888,6 +975,8 @@ export class TelnetClient {
 
     for (const cb of this.closeSubs) cb(reason)
     this.rawSubs.clear()
+    // N34-4：closeSubs 也要清 —— 只清 rawSubs 会让订阅者在连接已死后继续被持有
+    this.closeSubs.clear()
   }
 
   get reason(): string {

@@ -144,6 +144,29 @@ test('apply_config：危险命令整体拦截，不进入系统视图', async ()
   }
 })
 
+test('apply_config：expectation.command 命中危险清单 → BAD_PARAM 且不下发（N13）', async () => {
+  const { mock, deviceId, ctx, teardown } = await setup()
+  try {
+    const res = await applyConfig.handler(
+      {
+        deviceId,
+        commands: [`interface ${IFACE}`],
+        description: '带一条危险校验命令',
+        expectation: { command: 'reset saved-configuration', expect: 'x', mode: 'contains' }
+      },
+      ctx
+    )
+    assert.equal(res.ok, false)
+    assert.equal(res.error.code, 'BAD_PARAM')
+    assert.ok(
+      !mock.receivedCommands.includes('reset saved-configuration'),
+      '危险校验命令绝不能下发到设备（与 apply_config 的 commands 走同一道只读校验）'
+    )
+  } finally {
+    await teardown()
+  }
+})
+
 test('apply_config：中途失败停在失败点，后续命令不下发', async () => {
   const { mock, deviceId, changes, ctx, teardown } = await setup()
   try {
@@ -207,6 +230,108 @@ test('apply_config：指定的快照不存在 → NO_SNAPSHOT，不执行任何�
   }
 })
 
+test('apply_config：设备已停在系统视图 → 跳过 system-view 直接下发（修复“无法进入系统视图”）', async () => {
+  const { mock, session, deviceId, ctx, teardown } = await setup({
+    handlers: [{ match: /^sysname Core-SW$/i, respond: () => ({ text: '' }) }]
+  })
+  try {
+    // 上一段会话把设备留在了系统视图，连接后跟踪到的视图就是 system
+    await session.exec('system-view')
+    assert.equal(session.view, 'system')
+    mock.receivedCommands.length = 0
+
+    const res = await applyConfig.handler(
+      { deviceId, commands: ['sysname Core-SW'], description: '改宿主名' },
+      ctx
+    )
+    assert.ok(res.ok, JSON.stringify(res.error))
+    assert.ok(
+      !mock.receivedCommands.includes('system-view'),
+      '已在系统视图时不得再发 system-view（设备会回 Unrecognized command）'
+    )
+    assert.ok(mock.receivedCommands.includes('sysname Core-SW'))
+  } finally {
+    await teardown()
+  }
+})
+
+test('apply_config：设备停在接口视图 → 先 return 回用户视图再进系统视图', async () => {
+  const { mock, session, deviceId, ctx, teardown } = await setup({
+    handlers: [
+      { match: /^return$/i, respond: () => ({ text: '', prompt: '<Huawei>' }) },
+      { match: /^sysname Core-SW$/i, respond: () => ({ text: '' }) }
+    ]
+  })
+  try {
+    await session.exec('system-view')
+    await session.exec(`interface ${IFACE}`)
+    assert.equal(session.view, 'interface')
+    mock.receivedCommands.length = 0
+
+    const res = await applyConfig.handler(
+      { deviceId, commands: ['sysname Core-SW'], description: '改宿主名' },
+      ctx
+    )
+    assert.ok(res.ok, JSON.stringify(res.error))
+    const seq = mock.receivedCommands
+    const iReturn = seq.indexOf('return')
+    assert.ok(iReturn >= 0, '子视图应先 return 回用户视图')
+    assert.equal(seq[iReturn + 1], 'system-view', 'return 之后应进系统视图')
+    assert.ok(seq.indexOf('sysname Core-SW') > iReturn + 1)
+  } finally {
+    await teardown()
+  }
+})
+
+test('apply_config：视图跟踪滞后于设备 → system-view 报错时退回重进，不判失败', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensp-auto-viewstale-'))
+  try {
+    // 设备其实已在系统视图，但会话跟踪仍是 user（模拟用户在交互终端里手动切过视图）
+    let inSystem = true
+    const sent = []
+    const exec = async (cmd) => {
+      sent.push(cmd)
+      if (cmd === 'return') {
+        inSystem = false
+        return okCommand('', { prompt: '<Huawei>', view: 'user' })
+      }
+      if (cmd === 'system-view') {
+        if (inSystem) {
+          return {
+            ...okCommand('', { prompt: '[Huawei]', view: 'system' }),
+            ok: false,
+            errorCode: 'UNRECOGNIZED',
+            error: '命令不存在'
+          }
+        }
+        inSystem = true
+        return okCommand('', { prompt: '[Huawei]', view: 'system' })
+      }
+      return okCommand('')
+    }
+    const stub = { view: 'user', exec }
+    const ctx2 = {
+      sessions: { get: () => stub, require: () => stub },
+      settings: {},
+      snapshots: new SnapshotStore(path.join(dir, 's')),
+      changes: new ChangeStore(path.join(dir, 'c')),
+      requestGate: async () => true
+    }
+    const res = await applyConfig.handler(
+      { deviceId: '127.0.0.1:2008', commands: ['sysname X'], description: 'x' },
+      ctx2
+    )
+    assert.ok(res.ok, JSON.stringify(res.error))
+    assert.deepEqual(
+      sent.filter((c) => c !== 'display current-configuration'),
+      ['system-view', 'return', 'system-view', 'sysname X'],
+      '首次 system-view 报 Unrecognized 后应 return 重进，再下发'
+    )
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('verify_expectation：三种模式各判一遍', async () => {
   const { deviceId, ctx, teardown } = await setup()
   try {
@@ -247,6 +372,56 @@ test('verify_expectation：非法正则 → BAD_PARAM', async () => {
     )
     assert.equal(res.ok, false)
     assert.equal(res.error.code, 'BAD_PARAM')
+  } finally {
+    await teardown()
+  }
+})
+
+test('verify_expectation：危险命令被拒且不下发（N2，曾架空计划模式硬约束）', async () => {
+  const { mock, deviceId, ctx, teardown } = await setup()
+  try {
+    const res = await verifyExpectation.handler(
+      { deviceId, command: 'reset saved-configuration', expect: 'x', mode: 'contains' },
+      ctx
+    )
+    assert.equal(res.ok, false)
+    assert.equal(res.error.code, 'BAD_PARAM')
+    assert.ok(
+      !mock.receivedCommands.includes('reset saved-configuration'),
+      'verify_expectation 是 risk:read，绝不能让危险命令经它下发'
+    )
+  } finally {
+    await teardown()
+  }
+})
+
+test('verify_expectation：非只读命令被拒（校验命令必须只读）', async () => {
+  const { mock, deviceId, ctx, teardown } = await setup()
+  try {
+    const res = await verifyExpectation.handler(
+      { deviceId, command: 'system-view', expect: 'x', mode: 'contains' },
+      ctx
+    )
+    assert.equal(res.ok, false)
+    assert.equal(res.error.code, 'BAD_PARAM')
+    assert.ok(!mock.receivedCommands.includes('system-view'))
+  } finally {
+    await teardown()
+  }
+})
+
+test('N15 verify_expectation：嵌套量词正则 → BAD_PARAM 且立刻返回（不冻结主进程）', async () => {
+  const { deviceId, ctx, teardown } = await setup()
+  try {
+    const t0 = Date.now()
+    const res = await verifyExpectation.handler(
+      { deviceId, command: 'display ospf peer', expect: '(a+)+$', mode: 'regex' },
+      ctx
+    )
+    assert.equal(res.ok, false)
+    assert.equal(res.error.code, 'BAD_PARAM')
+    assert.match(String(res.error.message), /嵌套量词|表达式不可用/)
+    assert.ok(Date.now() - t0 < 5000, '必须在阈值内返回')
   } finally {
     await teardown()
   }
@@ -431,5 +606,82 @@ test('SnapshotStore：save 的 .txt 与索引原子一致，无孤儿文件（v1
     assert.deepEqual(leftovers, [])
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// —— v2.27：失败带诊断、成功带预检（把「失败信号」变成「修正线索」） ——
+
+test('apply_config：失败时带 diagnosis（错误码 → 根因/纠正/相关主题）', async () => {
+  const { deviceId, ctx, teardown } = await setup()
+  try {
+    const res = await applyConfig.handler(
+      {
+        deviceId,
+        commands: [`interface ${IFACE}`, 'made-up-command'],
+        description: '包含一条错误命令'
+      },
+      ctx
+    )
+    assert.equal(res.ok, false)
+    assert.equal(res.error.code, 'UNRECOGNIZED')
+    // 设备原文 + 诊断提示都要在 message 里（渲染层与 MCP 出口只看 message 也能拿到线索）
+    assert.ok(res.error.message.includes('诊断提示'), '失败信息必须附诊断提示')
+    assert.ok(res.error.message.includes('视图'), 'UNRECOGNIZED 的提示要点出「视图不对」这一主因')
+    assert.ok(res.data.diagnosis, '结构化诊断要一并回传')
+    assert.ok(res.data.diagnosis.causes.length > 0)
+    assert.ok(res.data.diagnosis.fixes.length > 0)
+    assert.ok(res.data.diagnosis.topics.includes('basics'))
+  } finally {
+    await teardown()
+  }
+})
+
+test('apply_config：成功也回带 preflight 预检结论（trunk 未放行属「下发成功但业务不通」）', async () => {
+  const { deviceId, ctx, teardown } = await setup({
+    handlers: [{ match: /^port link-type trunk$/i, respond: () => ({ text: '' }) }]
+  })
+  try {
+    const res = await applyConfig.handler(
+      {
+        deviceId,
+        commands: [`interface ${IFACE}`, 'port link-type trunk'],
+        description: '把上行口设为 trunk'
+      },
+      ctx
+    )
+    assert.equal(res.ok, true)
+    assert.ok(Array.isArray(res.data.preflight), '成功返回里要带预检结论')
+    const trunk = res.data.preflight.find((f) => f.rule === 'trunk-without-allow-pass')
+    assert.ok(trunk, 'trunk 未放行必须被预检点出来')
+    assert.equal(trunk.level, 'warn')
+  } finally {
+    await teardown()
+  }
+})
+
+test('apply_config：规范命令集不产生 preflight 噪声', async () => {
+  const { deviceId, ctx, teardown } = await setup({
+    handlers: [
+      { match: /^port link-type trunk$/i, respond: () => ({ text: '' }) },
+      { match: /^port trunk allow-pass vlan 10 20$/i, respond: () => ({ text: '' }) }
+    ]
+  })
+  try {
+    const res = await applyConfig.handler(
+      {
+        deviceId,
+        commands: [`interface ${IFACE}`, 'port link-type trunk', 'port trunk allow-pass vlan 10 20'],
+        description: '规范化 trunk 口'
+      },
+      ctx
+    )
+    assert.equal(res.ok, true)
+    assert.equal(
+      res.data.preflight,
+      undefined,
+      '不该有预检告警：' + JSON.stringify(res.data.preflight)
+    )
+  } finally {
+    await teardown()
   }
 })

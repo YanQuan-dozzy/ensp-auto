@@ -8,7 +8,8 @@ import {
   isNonEmptyString,
   sanitizeIndexItems
 } from './index-shape'
-import { atomicWriteJsonSync } from '../fs/atomic'
+import { atomicWriteFileSync, atomicWriteJsonSync } from '../fs/atomic'
+import { quarantineFile } from '../fs/quarantine'
 
 /**
  * 配置快照存储。
@@ -49,6 +50,14 @@ interface IndexFile {
 
 const MAX_PER_DEVICE = 50
 
+/** 从快照 id 前缀解析 createdAt（id 形如 `${createdAt.toString(36)}-${random}`） */
+function parseCreatedAtFromId(id: string): number | null {
+  const head = id.split('-')[0]
+  if (!head || !/^[0-9a-z]+$/.test(head)) return null
+  const n = parseInt(head, 36)
+  return Number.isFinite(n) && n > 0 ? n : null
+}
+
 /** 索引条目的形状判定：写盘字段缺一个就说明这条记录不可信，丢掉 */
 function isSnapshotMeta(v: unknown): v is SnapshotMeta {
   if (!v || typeof v !== 'object') return false
@@ -86,19 +95,85 @@ export class SnapshotStore {
     return path.join(this.baseDir, 'snapshots.json')
   }
 
+  /** 快照正文目录根（每设备一个子目录） */
+  private get dataRoot(): string {
+    return path.join(this.baseDir, 'snapshots')
+  }
+
   private dirOf(deviceId: DeviceId): string {
     // Windows 目录名不允许冒号：deviceId 形如 127.0.0.1:2008，必须转义
-    return path.join(this.baseDir, 'snapshots', deviceId.replace(/[^0-9a-zA-Z.-]/g, '_'))
+    return path.join(this.dataRoot, deviceId.replace(/[^0-9a-zA-Z.-]/g, '_'))
+  }
+
+  /**
+   * 从磁盘上的 .txt 正文重建索引（N22，仅索引损坏时走这里）。
+   *
+   * 可逆性依据：目录名是 deviceId 的转义形态（非 `[0-9a-zA-Z.-]` → `_`），而合法的
+   * deviceId 只有 `127.0.0.1:2008` / `ssh:host:port` 两种（`shared/transport.ts`），
+   * **不含下划线** → `_` 一律还原为 `:` 是无歧义的。
+   *
+   * 重建条目一律 `complete: false`：正文里没有任何「采集是否被截断」的信息，而把一份
+   * 可能被截断的快照标成完整会让它被当成回滚基线（违反 D3）。宁可要求重新采集。
+   */
+  private rebuildFromDisk(): SnapshotMeta[] {
+    const items: SnapshotMeta[] = []
+    let dirs: fs.Dirent[]
+    try {
+      dirs = fs.readdirSync(this.dataRoot, { withFileTypes: true })
+    } catch {
+      return items
+    }
+    for (const ent of dirs) {
+      if (!ent.isDirectory()) continue
+      const deviceId = ent.name.replace(/_/g, ':')
+      const dir = path.join(this.dataRoot, ent.name)
+      let files: string[]
+      try {
+        files = fs.readdirSync(dir).filter((f) => f.endsWith('.txt'))
+      } catch {
+        continue
+      }
+      for (const name of files) {
+        const id = name.slice(0, -'.txt'.length)
+        if (!/^[0-9a-z-]{6,64}$/.test(id)) continue
+        let config: string
+        let mtimeMs: number
+        try {
+          config = fs.readFileSync(path.join(dir, name), 'utf8')
+          mtimeMs = fs.statSync(path.join(dir, name)).mtimeMs
+        } catch {
+          continue
+        }
+        items.push({
+          id,
+          deviceId,
+          label: '索引损坏后恢复的快照',
+          sizeBytes: Buffer.byteLength(config, 'utf8'),
+          hashShort: createHash('sha256').update(config, 'utf8').digest('hex').slice(0, 12),
+          // id 前缀是 createdAt 的 base36；解析不出就退回文件 mtime
+          createdAt: parseCreatedAtFromId(id) ?? Math.floor(mtimeMs),
+          complete: false
+        })
+      }
+    }
+    items.sort((a, b) => b.createdAt - a.createdAt)
+    return items
   }
 
   private load(): void {
     this.loadWarnings = []
+    if (!fs.existsSync(this.indexFile)) return
     try {
-      if (!fs.existsSync(this.indexFile)) return
       const parsed = JSON.parse(fs.readFileSync(this.indexFile, 'utf8')) as Partial<IndexFile>
       // R22：形状校验。`parsed.items ?? []` 挡不住 {"items":"x"}，
       // 漏进去之后 list()/save() 里的 .filter/.unshift 会在别处抛 TypeError。
       const shaped = sanitizeIndexItems(parsed?.items, isSnapshotMeta)
+      if (shaped.notArray) {
+        // N22：整个 items 字段不可用 → 与「解析失败」同等处置（留档 + 重建）。
+        // 否则下一次任意写入就把空索引覆盖上去，磁盘上的正文就此无人引用。
+        this.recoverFromUnusableIndex('的 items 字段不是数组')
+        return
+      }
       // D3：旧索引（无 complete 字段）一律按「完整」处理，避免历史快照被整体废弃
       this.index = {
         version: 1,
@@ -110,10 +185,24 @@ export class SnapshotStore {
         console.warn(`[snapshots] ${warning}（${this.indexFile}）`)
       }
     } catch {
-      this.index = { version: 1, items: [] }
-      this.loadWarnings.push('快照索引无法解析（文件损坏），已按空列表处理')
-      console.warn(`[snapshots] 快照索引无法解析，已按空列表处理：${this.indexFile}`)
+      this.recoverFromUnusableIndex('无法解析（文件损坏）')
     }
+  }
+
+  /**
+   * N22：索引不可用（解析失败 / items 字段整体不可用）时的统一恢复 —— 留档 + 从正文重建。
+   * 绝不静默置空：置空后下一次写入即永久覆盖原索引，数据「假消失且不可恢复」。
+   */
+  private recoverFromUnusableIndex(reason: string): void {
+    const archived = quarantineFile(this.indexFile)
+    const rebuilt = this.rebuildFromDisk()
+    this.index = { version: 1, items: rebuilt }
+    const msg =
+      `快照索引${reason}${archived ? `，原文件已留档为 ${archived}` : ''}；` +
+      `已从磁盘上的 ${rebuilt.length} 份快照正文重建索引。` +
+      '重建条目一律标记为不完整（complete=false），可查看与 diff，但需重新采集才能作为回滚基线'
+    this.loadWarnings.push(msg)
+    console.warn(`[snapshots] ${msg}`)
   }
 
   private persist(): void {
@@ -138,7 +227,9 @@ export class SnapshotStore {
     const dir = this.dirOf(deviceId)
     fs.mkdirSync(dir, { recursive: true })
     const file = path.join(dir, `${id}.txt`)
-    fs.writeFileSync(file, config, 'utf8')
+    // N21：正文同样走原子写（+ fsync）。此前是裸 writeFileSync，索引已 complete:true
+    // 而正文可能是半截 —— 恰好绕过「不完整快照不得作回滚基线」的既有约束。
+    atomicWriteFileSync(file, config)
 
     const meta: SnapshotMeta = {
       id,
@@ -149,13 +240,17 @@ export class SnapshotStore {
       createdAt,
       complete: opts.complete !== false
     }
+    // N20：先记下旧索引，失败时才能完整恢复（与 ChangeStore.add 同口径）
+    const before = this.index.items.slice()
     this.index.items.unshift(meta)
-    this.prune(deviceId)
+    // 淘汰只改内存索引；正文文件等 persist 成功后再删 —— 否则 persist 抛错时
+    // 磁盘索引（旧的，仍在）里会引用到已被删掉的 .txt，形成「有 meta 无文件」的孤儿
+    const dropped = this.pruneInMemory(deviceId)
     try {
       this.persist()
     } catch (e) {
-      // v1.8：索引落盘失败 → 撤销内存条目 + 清理刚写的 .txt，避免留下孤儿文件
-      this.index.items = this.index.items.filter((i) => i.id !== id)
+      // v1.8：索引落盘失败 → 内存恢复成与磁盘一致，并清理刚落的新正文
+      this.index.items = before
       try {
         fs.rmSync(file, { force: true })
       } catch {
@@ -163,22 +258,34 @@ export class SnapshotStore {
       }
       throw e
     }
+    // persist 成功后，被淘汰的正文才真正删除（删失败只留无引用的孤儿文件，无害）
+    this.removeFiles(deviceId, dropped)
     return meta
   }
 
-  /** 每设备只保留最近 MAX_PER_DEVICE 份，避免无限增长 */
-  private prune(deviceId: DeviceId): void {
+  /**
+   * 每设备只保留最近 MAX_PER_DEVICE 份：**仅从内存索引移除**，返回被淘汰的 id。
+   * 正文删除由调用方在 persist 成功后执行（N20：顺序反了会造成索引/实体脱节）。
+   */
+  private pruneInMemory(deviceId: DeviceId): string[] {
     const mine = this.index.items.filter((i) => i.deviceId === deviceId)
-    if (mine.length <= MAX_PER_DEVICE) return
-    const drop = new Set(mine.slice(MAX_PER_DEVICE).map((i) => i.id))
-    for (const id of drop) {
+    if (mine.length <= MAX_PER_DEVICE) return []
+    const drop = mine.slice(MAX_PER_DEVICE).map((i) => i.id)
+    const dropSet = new Set(drop)
+    this.index.items = this.index.items.filter((i) => !dropSet.has(i.id))
+    return drop
+  }
+
+  private removeFiles(deviceId: DeviceId, ids: string[]): void {
+    if (ids.length === 0) return
+    const dir = this.dirOf(deviceId)
+    for (const id of ids) {
       try {
-        fs.rmSync(path.join(this.dirOf(deviceId), `${id}.txt`), { force: true })
+        fs.rmSync(path.join(dir, `${id}.txt`), { force: true })
       } catch {
         /* 忽略清理失败 */
       }
     }
-    this.index.items = this.index.items.filter((i) => !drop.has(i.id))
   }
 
   list(deviceId: DeviceId): SnapshotMeta[] {

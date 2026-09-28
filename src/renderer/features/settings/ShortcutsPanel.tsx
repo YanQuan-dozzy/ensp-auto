@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useApp } from '@/stores/app'
 import {
   DismissibleBanner,
@@ -28,6 +28,30 @@ export function ShortcutsPanel(): ReactNode {
   const [recordingId, setRecordingId] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
 
+  /**
+   * N71：反馈条定时器必须能撤销。
+   *
+   * 原先是一发裸定时器（到点把 notice 置空）—— 关掉设置页（组件卸载）后
+   * 定时器仍在跑，到点对一个已卸载组件 setState（React 18 起不再报警告，但仍是
+   * 无谓的副作用与泄漏）。这是渲染层**唯一**未清理的定时资源，其余 Interval /
+   * ResizeObserver / 事件监听都有 cleanup。
+   */
+  const noticeTimer = useRef<number | null>(null)
+  const flashNotice = (text: string, ms: number): void => {
+    if (noticeTimer.current !== null) window.clearTimeout(noticeTimer.current)
+    setNotice(text)
+    noticeTimer.current = window.setTimeout(() => {
+      noticeTimer.current = null
+      setNotice(null)
+    }, ms)
+  }
+  useEffect(
+    () => () => {
+      if (noticeTimer.current !== null) window.clearTimeout(noticeTimer.current)
+    },
+    []
+  )
+
   // 监听按键录制
   useEffect(() => {
     if (!recordingId) return
@@ -42,8 +66,7 @@ export function ShortcutsPanel(): ReactNode {
       // 按 Esc 取消录制
       if (e.key === 'Escape' && !e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey) {
         setRecordingId(null)
-        setNotice('已取消修改')
-        setTimeout(() => setNotice(null), 2000)
+        flashNotice('已取消修改', 2000)
         return
       }
 
@@ -65,8 +88,7 @@ export function ShortcutsPanel(): ReactNode {
 
       void updateSettings({ shortcuts: next })
       const targetItem = DEFAULT_SHORTCUTS.find((it) => it.id === recordingId)
-      setNotice(`已将「${targetItem?.name ?? recordingId}」修改为 ${formatKeys(keys)}`)
-      setTimeout(() => setNotice(null), 2500)
+      flashNotice(`已将「${targetItem?.name ?? recordingId}」修改为 ${formatKeys(keys)}`, 2500)
       setRecordingId(null)
     }
 
@@ -96,8 +118,7 @@ export function ShortcutsPanel(): ReactNode {
 
   const handleResetAll = async (): Promise<void> => {
     await updateSettings({ shortcuts: {} })
-    setNotice('已全部恢复默认按键绑定')
-    setTimeout(() => setNotice(null), 2500)
+    flashNotice('已全部恢复默认按键绑定', 2500)
   }
 
   const handleResetSingle = async (id: string): Promise<void> => {
@@ -105,8 +126,7 @@ export function ShortcutsPanel(): ReactNode {
     delete next[id]
     await updateSettings({ shortcuts: next })
     const targetItem = DEFAULT_SHORTCUTS.find((it) => it.id === id)
-    setNotice(`已恢复「${targetItem?.name ?? id}」为默认按键`)
-    setTimeout(() => setNotice(null), 2500)
+    flashNotice(`已恢复「${targetItem?.name ?? id}」为默认按键`, 2500)
   }
 
   return (

@@ -6,7 +6,7 @@
  * 每个 slice 都要 import 它 —— 那 app.ts 就没拆干净。
  * 这里放「无 store 依赖」的部分：UiMessage 类型、序号生成、错误文本、纯排序。
  */
-import type { Device, RiskLevel, SessionNode } from '@shared/types'
+import type { Device, RiskLevel, SessionNode, Settings } from '@shared/types'
 import type { QuestionItem } from '@shared/interaction'
 import { parseDeviceId } from '@shared/transport'
 import type { Attachment } from '@shared/attachments'
@@ -224,13 +224,41 @@ export function stripAttachmentNote(text: string): string {
   return (idx >= 0 ? text.slice(0, idx) : text).trim()
 }
 
-/** 内容是否指同一条消息：先精确比 trim，再退到前 40 字符前缀比（容忍尾部截断/注记差异） */
+/** 内容是否指同一条消息（**user 专用**）：先精确比 trim，再退到前 40 字符前缀比。
+ *  前缀兜底是为根节点留的：新会话的根节点只存指令前 60 字（`createRoot`），
+ *  长指令必然不是全等，但它确实就是这条指令。 */
 function sameContent(a: string, b: string): boolean {
   const ta = a.trim()
   const tb = b.trim()
   if (ta === tb) return true
   return ta.length >= 40 && tb.length >= 40 && ta.slice(0, 40) === tb.slice(0, 40)
 }
+
+/**
+ * 内容是否指同一条消息（**assistant 专用**）：只认逐字相同（忽略首尾空白）。
+ *
+ * 为什么不能用 user 那套前缀兜底：assistant 的落盘内容与界面文本**必然**是同一份
+ * （同一串 `text` 事件累加，落盘时只多一个 `trimEnd`），全文不等就是真不等。
+ * 而放宽成前缀会把「失败尝试的半截输出」误配到那条完整输出的节点上 ——
+ * 半截输出正是完整输出的前缀，一旦误配，游标被白白推走，真正的回答反而找不到节点。
+ */
+function sameTrimmedText(a: string, b: string): boolean {
+  return a.trim() === b.trim()
+}
+
+/**
+ * 同角色候选的**重新对齐窗口**。
+ *
+ * 界面消息与树节点之间允许存在少量同类多出：
+ * - 界面多出 assistant：失败尝试的半截输出（`react.runtime` 每次重试都换新累加器，
+ *   半截输出「只留在界面里」，不进树）、以及整段空白的壳（主进程 flushAssistant 会跳过
+ *   空白内容，界面却按 `text` 事件建了消息）；
+ * - 树多出同类节点：历史遗留（如界面只载入了子树）。
+ *
+ * 允许在窗口内向前找一条内容对得上的候选。窗口刻意很小 —— 它是「找回对齐」，
+ * 不是「模糊猜测」：找不回来就跳过这一条（宁可删不了，也不删错）。
+ */
+const RESYNC_WINDOW = 4
 
 /**
  * UI 消息 ↔ 会话树节点 的映射（v2.12，删除/重新生成用）。
@@ -240,21 +268,30 @@ function sameContent(a: string, b: string): boolean {
  * 渲染层则是工具消息先出现）—— 整体 zip 一旦错位，**后面全部映射跟着错**，
  * 而这里映射错的代价是删错分支。
  *
- * 所以按**角色分道、逐类计数**匹配：第 k 条 user 消息 ↔ 第 k 个 user 节点，
- * 第 k 条 assistant 消息 ↔ 第 k 个 assistant 节点（附内容校验），工具按 callId 精确配对。
- * 任何一类对不上就停在那一条（宁可「删不了」也不「删错」）。
+ * 所以按**角色分道**匹配：第 k 条 user 消息 ↔ 候选里第一条内容对得上的 user 节点，
+ * assistant 同理（内容必须逐字相同），工具按 callId 精确配对。
+ *
+ * v2.26 修的两个「整类映射集体报废」：
+ * ① **游标只在真的配上一条时才前进**。旧实现是「先取 candidates[k] 再 k+1，然后才
+ *    校验内容」，于是一条对不上的消息也会把游标推走 —— 之后同角色的每一条都错位一格，
+ *    内容校验跟着全灭。表现就是点「重新生成 ↺」永远只回一句
+ *    「无法定位该消息在会话树中的位置」（按钮看着像坏了）。
+ * ② **允许窗口内重新对齐**（见 `RESYNC_WINDOW`）。真正的触发源是「失败尝试的半截输出」：
+ *    `react.runtime` 每次重试都换新累加器（半截输出不进 transcript、只留在界面里），
+ *    于是界面比树多出一条 assistant —— 它不占游标，后面还能重新对上。
  *
  * @returns UiMessage.id → SessionNode.id 的映射
  */
 export function matchTreeNodes(messages: UiMessage[], nodes: SessionNode[]): Map<string, string> {
   const map = new Map<string, string>()
-  const counters = { user: 0, assistant: 0, thinking: 0, tool: 0 }
   const byRole = new Map<string, SessionNode[]>()
   for (const n of nodes) {
     const list = byRole.get(n.role) ?? []
     list.push(n)
     byRole.set(n.role, list)
   }
+  /** 每个角色的候选游标 —— 只在**真的配上一条**时前进（见函数注释 ①） */
+  const cursor = new Map<string, number>()
   const toolNodeByCallId = new Map<string, SessionNode>()
   for (const n of nodes) {
     if (n.role === 'tool' && n.toolCall?.callId) toolNodeByCallId.set(n.toolCall.callId, n)
@@ -269,18 +306,30 @@ export function matchTreeNodes(messages: UiMessage[], nodes: SessionNode[]): Map
       if (n) map.set(m.id, n.id)
       continue
     }
+    // 整段空白的 assistant 在树里必然不存在（主进程的 flushAssistant 跳过空白内容），
+    // 参与匹配只会白占游标 —— 直接跳过
+    if (m.kind === 'assistant' && m.text.trim() === '') continue
     const candidates = byRole.get(m.kind) ?? []
-    const k = counters[m.kind]
-    const n = candidates[k]
-    if (!n) continue
-    counters[m.kind] = k + 1
-    if (m.kind === 'user') {
-      // user 气泡可能带 📎 注记行，节点内容也可能带 —— 都剥掉再比
-      if (!sameContent(stripAttachmentNote(m.text), stripAttachmentNote(n.content))) continue
-    } else if (m.kind === 'assistant') {
-      if (!sameContent(m.text, n.content)) continue
+    const k = cursor.get(m.kind) ?? 0
+    let hit = -1
+    for (let j = 0; j <= RESYNC_WINDOW; j++) {
+      const n = candidates[k + j]
+      if (!n) break
+      const ok =
+        m.kind === 'thinking' // 思考段主进程与界面一一对应（空思考不会下发），不另做内容校验
+          ? true
+          : m.kind === 'user'
+            ? sameContent(stripAttachmentNote(m.text), stripAttachmentNote(n.content))
+            : sameTrimmedText(m.text, n.content)
+      if (ok) {
+        hit = k + j
+        break
+      }
     }
-    map.set(m.id, n.id)
+    // 树里确实没有对应节点（空壳 / 失败尝试的半截输出）→ 跳过这一条，**游标不动**
+    if (hit < 0) continue
+    cursor.set(m.kind, hit + 1)
+    map.set(m.id, candidates[hit]!.id)
   }
   return map
 }
@@ -305,4 +354,32 @@ export function applyTheme(theme: 'dark' | 'light'): void {
   document.documentElement.dataset.theme = theme
   // 这一行让原生滚动条与表单控件跟着切，否则浅色主题下滚动条还是黑的
   document.documentElement.style.colorScheme = theme
+}
+
+/**
+ * N64：把「设置保存的返回值」限制在**本次 patch 涉及的顶层字段**上。
+ *
+ * 主进程 `settings:set` 返回的是**整份** `Settings`，渲染层过去直接
+ * `set({ settings })` 整份覆盖。而多个入口会并发调用它（设置页多个开关即时生效、
+ * 写扫描范围、切模型档、面板拖拽结束），响应到达顺序与请求顺序不必一致 ——
+ * 后到者的整份快照会抹掉另一处刚刚写入的字段，表现就是「刚打开的开关自己弹回去」。
+ *
+ * 口径：**只信任自己改过的键**；其余键保留本地现值（要么没人动，要么由
+ * 另一次响应对它负责）。传 `patch` 为空对象时等价于「什么都不改」。
+ *
+ * 注意嵌套对象仍按**顶层键**整体替换（`patch.panels` / `patch.agent` / `patch.mcp`
+ * 调用方给的都是完整子对象），这与设置页的写入方式一致。
+ */
+export function mergeTouchedSettings(
+  current: Settings,
+  patch: Partial<Settings>,
+  returned: Settings
+): Settings {
+  const next: Settings = { ...current }
+  const target = next as unknown as Record<string, unknown>
+  const source = returned as unknown as Record<string, unknown>
+  for (const key of Object.keys(patch)) {
+    if (key in source) target[key] = source[key]
+  }
+  return next
 }

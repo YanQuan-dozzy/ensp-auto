@@ -31,6 +31,6 @@ tests/.build/
 # 本地临时验证日志（不入库）
 .tmp/
 
-# 由 tools/make-launcher.py 从 start.cmd + start-hidden.vbs 编出来的启动器二进制
-# （源码是那两份脚本，二进制不入库；构建方式见 tools/）
+# 由 tools/make-launcher.py 用 csc 编译 tools/launcher.cs 得到的启动器二进制
+# （源码是 launcher.cs，二进制不入库；构建方式见 tools/）
 start.exe

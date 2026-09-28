@@ -78,8 +78,10 @@ import {
   createMcpServer,
   DEFAULT_SETTINGS
 } from '../.build/harness.mjs'
+import { tmpDirFactory } from '../harness/tmp.mjs'
 
-const tmpRoot = () => fs.mkdtempSync(path.join(os.tmpdir(), 'ensp-v15-'))
+// N80：临时目录统一由文件级 after() 钩子清理（此前从不删）
+const tmpRoot = tmpDirFactory('ensp-v15-')
 
 function writeTmp(dir, name, content) {
   const p = path.join(dir, name)

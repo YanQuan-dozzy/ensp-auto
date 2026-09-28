@@ -12,46 +12,78 @@ import {
  * 注意：IAC 剥离在字节层完成（stripIac），其余在文本层。
  */
 
-/** 剥离 Telnet IAC 协商序列。这是字节层操作，必须在解码之前做 */
-export function stripIac(buf: Buffer): Buffer {
-  const out = Buffer.allocUnsafe(buf.length)
-  let n = 0
-  let i = 0
+/** 未完成协商序列的最大保留长度：正常协商只有几字节，超过说明对端在发垃圾，丢弃避免无界增长 */
+const MAX_PENDING_BYTES = 4096
 
-  while (i < buf.length) {
-    const b = buf[i]!
-    if (b !== IAC) {
-      out[n++] = b
-      i++
-      continue
-    }
-    // 到尾部只剩一个 IAC，说明序列被截断，丢弃
-    if (i + 1 >= buf.length) break
-    const cmd = buf[i + 1]!
+/** IAC 剥离器：`push` 可反复调用，跨 chunk 承接未完成的协商序列（N28） */
+export interface IacStripper {
+  push(chunk: Buffer): Buffer
+}
 
-    if (cmd === IAC) {
-      // 转义的 0xFF 本身
-      out[n++] = IAC
-      i += 2
-      continue
+/**
+ * 创建**有状态**的 IAC 剥离器（N28）。
+ *
+ * 为什么必须跨 chunk：TCP 不保证消息边界，`IAC WILL ECHO` 可能被切成 `[FF FB]` + `[01]` 两次 recv。
+ * 旧的逐 chunk 实现遇到尾部不完整序列直接丢弃，于是下一片里的 `0xFB 0x01` 被当成正文输出
+ * —— 表现为替换符 + `decodeIssues`，还可能干扰尾部提示符判定。
+ */
+export function createIacStripper(): IacStripper {
+  let pending: Buffer = Buffer.alloc(0)
+  return {
+    push(chunk: Buffer): Buffer {
+      const input = pending.length ? Buffer.concat([pending, chunk]) : chunk
+      const out = Buffer.allocUnsafe(input.length)
+      let n = 0
+      let i = 0
+
+      while (i < input.length) {
+        const b = input[i]!
+        if (b !== IAC) {
+          out[n++] = b
+          i++
+          continue
+        }
+        // 尾部只剩一个 IAC：序列不完整，等下一片再判（旧实现在这里直接丢弃）
+        if (i + 1 >= input.length) break
+        const cmd = input[i + 1]!
+
+        if (cmd === IAC) {
+          // 转义的 0xFF 本身
+          out[n++] = IAC
+          i += 2
+          continue
+        }
+        if (cmd === 0xfa) {
+          // IAC SB ... IAC SE，整段丢弃；SE 还没到就把整段留到下一片
+          let j = i + 2
+          while (j + 1 < input.length && !(input[j] === IAC && input[j + 1] === 0xf0)) j++
+          if (j + 1 >= input.length) break
+          i = j + 2
+          continue
+        }
+        if (cmd >= 0xfb && cmd <= 0xfe) {
+          // WILL / WONT / DO / DONT：IAC + 命令 + 选项，共 3 字节；选项字节没到则等下一片
+          if (i + 2 >= input.length) break
+          i += 3
+          continue
+        }
+        // 两字节命令
+        i += 2
+      }
+
+      const rest = input.subarray(i)
+      pending = rest.length > MAX_PENDING_BYTES ? Buffer.alloc(0) : Buffer.from(rest)
+      return out.subarray(0, n)
     }
-    if (cmd === 0xfa) {
-      // IAC SB ... IAC SE，整段丢弃
-      let j = i + 2
-      while (j + 1 < buf.length && !(buf[j] === IAC && buf[j + 1] === 0xf0)) j++
-      i = j + 1 < buf.length ? j + 2 : buf.length
-      continue
-    }
-    if (cmd >= 0xfb && cmd <= 0xfe) {
-      // WILL / WONT / DO / DONT：IAC + 命令 + 选项，共 3 字节
-      i += 3
-      continue
-    }
-    // 两字节命令
-    i += 2
   }
+}
 
-  return out.subarray(0, n)
+/**
+ * 一次性剥离 Telnet IAC 协商序列（无跨 chunk 状态）。
+ * 字节流场景（TelnetClient.handleData）请改用 `createIacStripper()` 复用同一实例。
+ */
+export function stripIac(buf: Buffer): Buffer {
+  return createIacStripper().push(buf)
 }
 
 /** 剥离 ANSI 转义序列 */

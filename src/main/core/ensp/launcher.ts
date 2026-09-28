@@ -64,7 +64,17 @@ export function parseExeFromRegOutput(raw: string): string | null {
   return bare?.[1]?.trim() ?? null
 }
 
-function queryReg(args: readonly string[]): string {
+/**
+ * 注册表查询执行器：默认同步调 `reg.exe`；测试可注入 fake 输出（N31）。
+ *
+ * 为什么必须可注入：`diagnose.test.mjs` 过去会走到真实的 `execFileSync('reg')`，
+ * 用例结果因此依赖宿主环境（能否执行 reg / 注册表内容 / 是否装了 eNSP）——
+ * 在无 reg 的环境里「绿灯」并不代表逻辑被验证过（沙箱里 reg 被安全策略拦截时，
+ * 异常被 queryReg 吞掉，用例照常通过）。
+ */
+export type RegRunner = (args: readonly string[]) => string
+
+const execReg: RegRunner = (args) => {
   try {
     return execFileSync('reg', args as string[], {
       encoding: 'utf8',
@@ -81,12 +91,12 @@ function queryReg(args: readonly string[]): string {
 }
 
 /** 读某个注册表键的默认值（REG_SZ），查不到返回空串 */
-function queryRegDefault(key: string): string {
-  const ve = queryReg(['query', key, '/ve'])
+function queryRegDefault(key: string, run: RegRunner): string {
+  const ve = run(['query', key, '/ve'])
   const v = /REG_SZ\s+(.+?)\s*$/m.exec(ve)?.[1]?.trim()
   if (v) return v
   // 有些键没有默认值，退化为读首个 REG_SZ
-  const any = queryReg(['query', key])
+  const any = run(['query', key])
   return /REG_SZ\s+(.+?)\s*$/m.exec(any)?.[1]?.trim() ?? ''
 }
 
@@ -94,20 +104,20 @@ function queryRegDefault(key: string): string {
  * 通过 .topo 文件关联反查 eNSP_Client.exe。
  * 非 Windows 或未安装 eNSP 时返回 null（调用方继续走常见路径候选）。
  */
-export function detectEnspFromRegistry(): string | null {
+export function detectEnspFromRegistry(run: RegRunner = execReg): string | null {
   if (process.platform !== 'win32') return null
 
   // 1) HKCR\.topo 的默认值 = ProgID
-  const progId = queryRegDefault('HKCR\\.topo')
+  const progId = queryRegDefault('HKCR\\.topo', run)
   if (progId && !progId.includes('\\')) {
-    const cmd = queryRegDefault(`HKCR\\${progId}\\shell\\open\\command`)
+    const cmd = queryRegDefault(`HKCR\\${progId}\\shell\\open\\command`, run)
     const exe = parseExeFromRegOutput(cmd)
     if (exe) return exe
   }
 
   // 2) 兜底：Applications 下的命令注册
   return parseExeFromRegOutput(
-    queryRegDefault('HKCR\\Applications\\eNSP_Client.exe\\shell\\open\\command')
+    queryRegDefault('HKCR\\Applications\\eNSP_Client.exe\\shell\\open\\command', run)
   )
 }
 
@@ -122,7 +132,7 @@ export interface EnspLocateResult {
  * 按优先级链定位 eNSP 客户端，并返回完整探测过程。
  * 这里刻意不抛错：定位失败是可预期的常态，由调用方决定怎么提示。
  */
-export function locateEnsp(configuredPath?: string): EnspLocateResult {
+export function locateEnsp(configuredPath?: string, run: RegRunner = execReg): EnspLocateResult {
   const candidates: EnspCandidate[] = []
   const seen = new Set<string>()
   const push = (p: string | null | undefined, source: EnspSource): void => {
@@ -136,7 +146,7 @@ export function locateEnsp(configuredPath?: string): EnspLocateResult {
 
   push(configuredPath, 'setting')
   push(ENSP_ENV_PATH, 'env')
-  push(detectEnspFromRegistry(), 'registry')
+  push(detectEnspFromRegistry(run), 'registry')
   for (const p of ENSP_COMMON_PATHS) push(p, 'common')
 
   const hit = candidates.find((c) => c.exists)
@@ -148,8 +158,8 @@ export type ResolveEnspResult =
   | { ok: false; error: string }
 
 /** 解析 eNSP 可执行文件绝对路径；configuredPath（来自设置）优先，否则走自动探测 */
-export function resolveEnspExe(configuredPath?: string): ResolveEnspResult {
-  const r = locateEnsp(configuredPath)
+export function resolveEnspExe(configuredPath?: string, run: RegRunner = execReg): ResolveEnspResult {
+  const r = locateEnsp(configuredPath, run)
   if (r.found) return { ok: true, exe: r.found, source: r.source }
   return {
     ok: false,

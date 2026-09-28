@@ -442,7 +442,7 @@ export const VRP_TOPICS: readonly VrpTopicEntry[] = [
       },
       {
         syntax: 'quit / return',
-        description: 'quit 退一层，return 直接回用户视图',
+        description: 'quit 退一层，return 直接回用户视图（应用内用 change_view 工具下发）',
         example: 'return'
       },
       {
@@ -464,7 +464,9 @@ export const VRP_TOPICS: readonly VrpTopicEntry[] = [
     pitfalls: [
       '配置改完不 save，设备重启全丢 —— 实验收尾统一 save_configuration',
       'save 停在 [Y/N] 上属于危险提示，不能自动答 y（走 answer_device_prompt）',
-      '用户视图敲配置命令会报错（Error: Unrecognized command），先 system-view'
+      '用户视图敲配置命令会报错（Error: Unrecognized command），先 system-view',
+      'quit / return 是视图切换命令，run_show_command 只收只读命令 —— 切视图用 change_view（target: user / system / interface）',
+      'return 在用户视图本身不被识别（会报 Unrecognized）；change_view 会先判断当前视图，不必自己探'
     ]
   },
   {
@@ -590,6 +592,449 @@ export const VRP_TOPICS: readonly VrpTopicEntry[] = [
       '拿 fe80:: 链路本地地址做静态路由下一跳时必须同时指定出接口，实验里直接用对端全局地址更省事',
       '本工作台的 verify_ping 只接受 IPv4 目标（IPv6 会被 BAD_PARAM 拒绝），IPv6 连通性改用 run_show_command 下发 ping ipv6'
     ]
+  },
+  {
+    id: 'l3_switch',
+    title: '三层交换与 VLAN 间路由',
+    aliases: [
+      '三层交换',
+      '三层交换机',
+      'vlanif',
+      '三层口',
+      'undo portswitch',
+      'portswitch',
+      'vlan间互通',
+      '网关接口',
+      'svi'
+    ],
+    summary:
+      'VLAN 间互通的两种落地方式：① 三层交换机用 Vlanif（逻辑网关，主流）；' +
+      '② 物理口 undo portswitch 变三层口直配 IP（点对点互联）。',
+    commands: [
+      {
+        syntax: 'interface Vlanif <vlan-id> → ip address <ip> <掩码>',
+        description:
+          'Vlanif 是 VLAN 的三层逻辑接口，作为该网段终端的网关。必须先 vlan batch 建 VLAN、' +
+          '该设备上至少有一个端口属于该 VLAN 且处于 up，Vlanif 才会 up',
+        example: 'vlan batch 10 → interface Vlanif 10 → ip address 192.168.10.1 24'
+      },
+      {
+        syntax: '接口视图：undo portswitch',
+        description:
+          '把二层以太口切换成三层路由口（之后才能在该物理口上 ip address）。' +
+          '切换要求接口下**只有属性配置**（shutdown / description），有 port link-type 之类业务配置要先清掉',
+        example: 'interface GigabitEthernet 0/0/1 → undo portswitch → ip address 10.0.1.1 24'
+      },
+      {
+        syntax: '系统视图：portswitch batch <接口范围>',
+        description: '批量二三层模式切换（接口多时用）',
+        example: 'portswitch batch GigabitEthernet 0/0/1 to 0/0/4'
+      },
+      {
+        syntax: 'display ip interface brief / display ip routing-table',
+        description: '查三层接口的状态与地址、以及直连路由是否生成（Vlanif up 才有直连路由）',
+        example: 'display ip interface brief'
+      }
+    ],
+    pitfalls: [
+      'Vlanif up 的三个条件：VLAN 已创建 + 该 VLAN 内有端口 up + 接口未被 shutdown —— 少一个就起不来（display ip interface brief 看物理/协议两列）',
+      'Vlanif 没配就 ping 不通同网段终端：三层交换机的「网关」就是这个 Vlanif 地址，终端网关要指它',
+      'undo portswitch 前接口上有业务配置（port link-type / port default vlan）会切不过去，必须先清配置',
+      '三层口与 Vlanif 不要在同一设备同一网段重复配地址（地址冲突）',
+      '交换机上配 `ip address` 直接写在二层口上会报错 —— 要么 undo portswitch，要么用 Vlanif'
+    ]
+  },
+  {
+    id: 'single_arm',
+    title: '单臂路由（子接口 VLAN 间互通）',
+    aliases: [
+      '单臂路由',
+      '子接口',
+      'subinterface',
+      'dot1q',
+      'dot1q termination vid',
+      '子接口终结',
+      '路由器子接口',
+      '802.1q'
+    ],
+    summary:
+      '路由器一个物理口接交换机 trunk，按 VLAN 建子接口：`interface g0/0/1.<vid>` → ' +
+      '`dot1q termination vid <vid>` → 配 IP（= 该 VLAN 的网关）→ `arp broadcast enable`。',
+    commands: [
+      {
+        syntax: 'interface <接口类型> <编号>.<子接口号>',
+        description: '创建子接口（子接口号习惯与 VLAN ID 一致，便于对照，但两者不必相同）',
+        example: 'interface GigabitEthernet 0/0/1.10'
+      },
+      {
+        syntax: 'dot1q termination vid <vlan-id>',
+        description:
+          '子接口终结指定 VLAN 的 tag（剥掉 tag 后做三层转发）。**一个子接口只能终结一个 VLAN**',
+        example: 'dot1q termination vid 10'
+      },
+      {
+        syntax: 'ip address <ip> <掩码>',
+        description: '子接口地址 = 对应 VLAN 内终端的默认网关',
+        example: 'ip address 192.168.10.1 24'
+      },
+      {
+        syntax: 'arp broadcast enable',
+        description:
+          '使能子接口的 ARP 广播 —— 华为缺省关闭，不配则子接口不发 ARP 广播，VLAN 间不通（单臂路由第一坑）',
+        example: 'arp broadcast enable'
+      },
+      {
+        syntax: 'display interface <子接口> / display ip interface brief',
+        description: '查子接口双 up 与地址',
+        example: 'display ip interface brief'
+      }
+    ],
+    pitfalls: [
+      '漏 arp broadcast enable：配置看起来全对，但 VLAN 间就是不通（华为子接口默认不发 ARP 广播）',
+      '漏 dot1q termination vid：子接口没收 tag 的能力，流量全部丢弃',
+      '交换机侧的级联口必须是 trunk 且 allow-pass 覆盖这些 VLAN，否则 tag 根本到不了路由器',
+      '同一物理口下的不同子接口不能终结同一个 VLAN ID（会报冲突）',
+      '子接口本身没有物理状态，父接口 down 时它跟着 down —— 先查父接口',
+      '终端网关要写子接口地址，不要写父物理口地址'
+    ]
+  },
+  {
+    id: 'stp',
+    title: 'STP / RSTP / MSTP 生成树',
+    aliases: [
+      'stp',
+      'rstp',
+      'mstp',
+      '生成树',
+      '生成树协议',
+      '环路',
+      '网络环路',
+      '根桥',
+      'region-configuration'
+    ],
+    summary:
+      '防二层环路。VRP 缺省就是 MSTP：可选 `stp mode` → 配 MST 域（域名 + 实例映射 VLAN）→' +
+      '`active region-configuration` 激活 → 指定根桥。',
+    commands: [
+      {
+        syntax: 'stp mode stp | rstp | mstp',
+        description: '生成树工作模式；设备缺省为 MSTP，实验里通常无需显式配置',
+        example: 'stp mode mstp'
+      },
+      {
+        syntax: 'stp enable / 接口视图：stp enable',
+        description: '全局/接口使能生成树（缺省全局与端口都使能）',
+        example: 'stp enable'
+      },
+      {
+        syntax: 'stp region-configuration → region-name <名> → instance <id> vlan <vlan列表> → active region-configuration',
+        description:
+          'MST 域：**域名 + VLAN 与实例的映射表 + 修订级别三者全同**才算同一域；' +
+          '改完必须 active region-configuration 才生效',
+        example: 'stp region-configuration → region-name RG1 → instance 1 vlan 10 to 20 → active region-configuration'
+      },
+      {
+        syntax: 'stp instance <id> root primary | root secondary',
+        description: '指定该实例的根桥/备份根桥（primary 把优先级压到 0，secondary 压到 4096）',
+        example: 'stp instance 1 root primary'
+      },
+      {
+        syntax: '接口视图：stp cost <值> / stp edged-port',
+        description: '改端口路径开销以影响选路；接终端的口设边缘端口（跳过监听学习，秒级收敛）',
+        example: 'stp edged-port'
+      },
+      {
+        syntax: 'display stp [instance <id>] [brief] / display stp region-configuration',
+        description: '查根桥、各端口角色（Root/Designated/Alternate）与域配置',
+        example: 'display stp brief'
+      }
+    ],
+    pitfalls: [
+      'MST 域三要素（域名 / VLAN 映射 / 修订级别）任一不同就各自成域、实例计算全乱 —— 全域必须逐字一致',
+      '改完 MST 域配置忘敲 active region-configuration，配置在但没生效（display stp region-configuration 里看 Active 状态）',
+      '接终端的口没设 stp edged-port，插拔网线会触发一次拓扑变更，全网震荡数秒',
+      '根桥要靠手动指定（或优先级），别指望默认选举 —— 默认比的是桥 MAC，结果不可预期',
+      'MSTP 下 `stp instance N root primary` 要在系统视图配，不是接口视图'
+    ]
+  },
+  {
+    id: 'vrrp',
+    title: 'VRRP 网关冗余',
+    aliases: [
+      'vrrp',
+      '虚拟路由冗余协议',
+      '网关冗余',
+      '双机热备',
+      'vrrp vrid',
+      'preempt',
+      '浮动网关'
+    ],
+    summary:
+      '两台（或多台）设备在同一网段做一台「虚拟路由器」：同一 vrid + 同一 virtual-ip，' +
+      '优先级高者为 Master。终端网关指向**虚拟 IP**。',
+    commands: [
+      {
+        syntax: '接口视图：vrrp vrid <1-255> virtual-ip <虚拟ip>',
+        description:
+          '创建备份组。**同组各设备的 vrid 与 virtual-ip 必须完全一致**；虚拟 IP 不能等于任何成员接口的实际地址',
+        example: 'vrrp vrid 1 virtual-ip 192.168.10.254'
+      },
+      {
+        syntax: 'vrrp vrid <id> priority <1-254>',
+        description: '优先级，越大越优先（缺省 100）；255 保留给 IP 地址拥有者，0 表示主动放弃 Master',
+        example: 'vrrp vrid 1 priority 120'
+      },
+      {
+        syntax: 'vrrp vrid <id> preempt-mode [timer delay <秒>]',
+        description: '抢占模式（缺省开启）；delay 用于等上层协议（OSPF 等）收敛后再抢占，避免来回抖动',
+        example: 'vrrp vrid 1 preempt-mode timer delay 20'
+      },
+      {
+        syntax: 'vrrp vrid <id> track interface <接口> [reduced <值>]',
+        description: '监视上行接口：上行断则自动降优先级（可配降多少），让备机抢占',
+        example: 'vrrp vrid 1 track interface GigabitEthernet 0/0/1 reduced 30'
+      },
+      {
+        syntax: 'display vrrp [brief | interface <接口>]',
+        description: '查组内状态（Master / Backup）、虚拟 IP、优先级与抢占配置',
+        example: 'display vrrp brief'
+      }
+    ],
+    pitfalls: [
+      '两台设备 vrid 或 virtual-ip 不一致 → 各自成为 Master，全网 IP 冲突（最典型的翻车）',
+      '虚拟 IP 写成某台成员的真实接口地址 → 冲突，直接报错或行为异常',
+      '两台优先级都保持默认 100 → 比接口 IP 大小定 Master，主备与预期相反',
+      '没配 track interface：上行断了 Master 还占着虚拟 IP，流量黑洞',
+      '终端网关必须指向虚拟 IP，指到某台真实地址就失去了冗余意义',
+      '备机不转发流量（Backup-forward 默认关闭），验证时要从终端侧断开主用链路看切换，别只看 display vrrp'
+    ]
+  },
+  {
+    id: 'dhcp_relay',
+    title: 'DHCP 中继（跨网段获取地址）',
+    aliases: [
+      'dhcp中继',
+      'dhcp relay',
+      'dhcp select relay',
+      '中继',
+      'relay',
+      'dhcp relay server-ip',
+      '跨网段获取ip'
+    ],
+    summary:
+      '客户端与 DHCP 服务器不同网段时，网关设备做中继：`dhcp enable` → 网关接口 ' +
+      '`dhcp select relay` → `dhcp relay server-ip <服务器地址>`。',
+    commands: [
+      {
+        syntax: 'dhcp enable',
+        description: '全局使能 DHCP（中继与服务器都依赖它，漏了后面全不生效）',
+        example: 'dhcp enable'
+      },
+      {
+        syntax: '接口视图（客户端侧网关）：dhcp select relay',
+        description: '该接口收到的 DHCP 请求走中继流程（代替 dhcp select global）',
+        example: 'interface Vlanif 10 → dhcp select relay'
+      },
+      {
+        syntax: '接口视图：dhcp relay server-ip <服务器ip>',
+        description: '指定所代理的 DHCP 服务器地址（可直接在接口上配，也可 dhcp server group 分组引用）',
+        example: 'dhcp relay server-ip 10.1.1.100'
+      },
+      {
+        syntax: 'dhcp server group <组名> → dhcp-server <ip>',
+        description: '服务器组：多个 DHCP 服务器时用，接口下引用组名（备用服务器场景）',
+        example: 'dhcp server group dhcpgroup → dhcp-server 10.1.1.100'
+      },
+      {
+        syntax: 'display dhcp relay interface <接口> / display dhcp relay all',
+        description: '查中继配置与已建立的绑定',
+        example: 'display dhcp relay interface Vlanif 10'
+      }
+    ],
+    pitfalls: [
+      '中继设备到 DHCP 服务器**路由不可达**是最常见的「配了却拿不到地址」——先 ping 通服务器',
+      '服务器地址池的 gateway-list 必须写**中继接口的地址**（不是服务器自己的地址），否则终端网关错',
+      '中继接口漏 dhcp select relay：报文不会转发，客户端一直等',
+      '忘 dhcp enable：接口下的中继命令配了也不生效',
+      '服务器侧地址池的 network 必须是客户端所在网段（中继不改网段，只做单播转发）',
+      '排障顺序：中继到服务器可达 → 接口 dhcp select relay → 服务器地址池网段/网关 → 客户端 IP/掩码'
+    ]
+  },
+  {
+    id: 'route_adv',
+    title: '路由引入（多协议互通）',
+    aliases: [
+      '路由引入',
+      '引入外部路由',
+      'import-route',
+      'importroute',
+      '路由重分发',
+      '路由重发布',
+      '协议互通',
+      '双协议'
+    ],
+    summary:
+      '在协议视图里 `import-route <来源协议> [进程号] [cost <值>]`，把别的协议/直连/静态路由灌进本协议。' +
+      '**单向引入只解决一个方向，两边都要配**；配 `filter-policy` 才能控制引入范围。',
+    commands: [
+      {
+        syntax: 'OSPF 视图：import-route direct | static | rip <进程号> [cost <值>]',
+        description: 'OSPF 里引入直连/静态/RIP 路由（default-route-advertise 单独负责默认路由）',
+        example: 'ospf 1 → import-route rip 1 → import-route direct'
+      },
+      {
+        syntax: 'RIP 视图：import-route direct | static | ospf <进程号> [cost <值>]',
+        description: 'RIP 引入其它路由；RIP 度量是跳数，cost 不给时用 default-cost（缺省 0）',
+        example: 'rip 1 → version 2 → import-route ospf 1'
+      },
+      {
+        syntax: 'RIP 视图：default-route originate',
+        description: '向邻居下发默认路由（RIP 的做法；OSPF 用 default-route-advertise）',
+        example: 'default-route originate'
+      },
+      {
+        syntax: 'filter-policy <acl号 | ip-prefix 名> export（发布）/ import（接收）',
+        description: '对引入/发布的路由做过滤。**ACL 里没被任何规则匹配到的路由不会被引入**（隐式拒绝）',
+        example: 'filter-policy 2000 export'
+      },
+      {
+        syntax: 'display ip routing-table protocol ospf | rip',
+        description: '按协议查路由，确认引入是否真的生效',
+        example: 'display ip routing-table protocol rip'
+      }
+    ],
+    pitfalls: [
+      '只在一个方向配了 import-route（单向引入）→ 去程通、回程断；互通必须两端都引入',
+      'OSPF 引入直连/静态用 import-route direct / static，不是 network 宣告（network 只宣告接口所在网段）',
+      '引入后路由存在但 ping 不通：查对端是否也有回程路由，以及是否被 filter-policy 挡了',
+      'filter-policy 引用的 ACL 若只有 permit 规则、没写兜底，未匹配的路由会被隐式拒绝 —— 看起来「引入了却没路由」',
+      '引入指标不当会导致次优路径或环路：引入时给 cost/tag 区分内外路由',
+      'RIP 引入外部路由的 cost 缺省是 0，容易让外部路由比内部更优，建议显式给 cost'
+    ]
+  },
+  {
+    id: 'device_mgmt',
+    title: '设备远程登录与用户管理',
+    aliases: [
+      'telnet',
+      'ssh',
+      'stelnet',
+      '远程登录',
+      '登录设备',
+      'aaa',
+      'local-user',
+      'user-interface',
+      'vty',
+      'privilege level',
+      '用户认证'
+    ],
+    summary:
+      'Telnet/SSH 服务器三步：`user-interface vty 0 4` 定协议与认证方式 → `aaa` 建本地用户并给级别 → ' +
+      '`telnet server enable` / `stelnet server enable`（SSH 还要生成密钥）。',
+    commands: [
+      {
+        syntax: 'user-interface vty 0 4 → authentication-mode aaa → protocol inbound telnet|ssh → user privilege level <0-15>',
+        description:
+          'VTY 用户界面：指定接入协议与认证方式。SSH 必须先配 aaa 认证方式；' +
+          '把 protocol inbound 设为 ssh 后设备会自动禁用 Telnet',
+        example: 'user-interface vty 0 4 → authentication-mode aaa → protocol inbound ssh → user privilege level 15'
+      },
+      {
+        syntax: 'aaa → local-user <用户名> password irreversible-cipher <明文/密文> → local-user <名> privilege level <0-15> → local-user <名> service-type telnet|ssh',
+        description:
+          '创建本地用户。privilege level 15 才是最高权限（能进 system-view、能 save）；' +
+          'service-type 要与接入协议对应（telnet / ssh，可同时给）',
+        example: 'aaa → local-user admin password irreversible-cipher Huawei@123 → local-user admin privilege level 15 → local-user admin service-type telnet ssh'
+      },
+      {
+        syntax: 'telnet server enable / stelnet server enable',
+        description: '分别使能 Telnet / STelnet(SSH) 服务器功能（缺省都未开启）',
+        example: 'stelnet server enable'
+      },
+      {
+        syntax: 'rsa local-key-pair create',
+        description: '生成 RSA 主机密钥对（SSH 加密交互的前提，必须在 SSH 用户配置前/中完成）',
+        example: 'rsa local-key-pair create'
+      },
+      {
+        syntax: 'ssh user <名> authentication-type password → ssh user <名> service-type stelnet',
+        description: '（密码认证方式）声明 SSH 用户的认证方式与可用服务',
+        example: 'ssh user admin authentication-type password → ssh user admin service-type stelnet'
+      },
+      {
+        syntax: 'display users / display ssh server status / display telnet server status',
+        description: '查在线用户与服务器状态',
+        example: 'display users'
+      }
+    ],
+    pitfalls: [
+      'privilege level 没给或给得太低（如 3）：能登录但进不了 system-view，表现为「命令都用不了」',
+      'service-type 与 protocol inbound 不匹配（用户只给 telnet，界面却限制 ssh）→ 登录被拒',
+      'SSH 忘 rsa local-key-pair create：stelnet server enable 后仍连不上',
+      'VTY 的 user privilege level 与 local-user 的 privilege level 会共同生效，取较低者；只改一处可能仍不够权限',
+      '部分版本要求指定服务器源接口/源地址（ssh server-source / telnet server-source），否则服务起不来',
+      '清掉 protocol inbound ssh 之外还要记得 aaa 认证方式 —— 只配一处的现象是「要密码但怎么输都不对」'
+    ]
+  },
+  {
+    id: 'error_ref',
+    title: 'VRP 报错速查（配置失败的共同根因）',
+    aliases: [
+      '报错',
+      '错误',
+      '错误信息',
+      '命令报错',
+      'unrecognized',
+      'wrong parameter',
+      'incomplete command',
+      'ambiguous',
+      'error',
+      '配置不生效',
+      '命令用不了'
+    ],
+    summary:
+      '设备报错都带 `found at "^" position`，**`^` 指向的就是出错字段**。先按错误码定性，' +
+      '再按「视图 → 拼写 → 参数形状（掩码/反掩码）→ 依赖对象是否存在」四步定位。',
+    commands: [
+      {
+        syntax: 'Error: Unrecognized command found at "^" position.',
+        description: '命令不存在 / 关键字不存在：视图不对、拼写错、或该版本不支持',
+        example: '用户视图敲 interface 会报此错 → 先 system-view 或用 change_view'
+      },
+      {
+        syntax: 'Error: Incomplete command found at "^" position.',
+        description: '命令不完整，缺必要参数',
+        example: '只写 ip address 就回车'
+      },
+      {
+        syntax: 'Error: Wrong parameter found at "^" position.',
+        description: '参数类型错或取值越界：掩码/反掩码写反、VLAN ID 越界、引用不存在的对象',
+        example: 'network 10.0.0.0 255.255.255.0（第二参数应为反掩码 0.0.0.255）'
+      },
+      {
+        syntax: 'Error: Too many parameters found at "^" position.',
+        description: '参数过多：两条命令写成一行',
+        example: 'vlan batch 10 vlan batch 20'
+      },
+      {
+        syntax: 'Error: Ambiguous command found at "^" position.',
+        description: '缩写有歧义，补全到唯一即可',
+        example: 'dis → display'
+      },
+      {
+        syntax: 'Info: The configuration is not saved.',
+        description: '配置没保存（不是失败）：收尾记得 save',
+        example: 'save（会停在 [Y/N]，应用内走 save_configuration）'
+      }
+    ],
+    pitfalls: [
+      '第一件事看 `^` 指的字段位置，它比整句报错信息有用得多',
+      '反向掩码/掩码写反是最高频的 Wrong parameter：OSPF/ACL 用反掩码，IP/静态路由/DHCP 用掩码',
+      '从 Word / 网页复制粘贴最容易带全角空格（U+3000），肉眼几乎看不出，设备必报错',
+      '「命令都对但就是不生效」多半是依赖没满足：VLAN 没建、接口 shutdown、只配了单向路由、漏 dhcp enable',
+      '别照着原样重试同一条命令 —— 先改一个变量（视图 / 参数形状 / 拼写）再试，否则只是浪费一次往返',
+      '拿不准语法时先 lookup_vrp_command 查证，再用 change_view 摆正视图，最后才下发'
+    ]
   }
 ]
 
@@ -601,37 +1046,94 @@ function normalizeTopic(s: string): string {
   return s.toLowerCase().replace(/[\s_\-]+/g, '')
 }
 
-/** 归一化后的别名集（含 id），预计算避免每次查询重复正则 */
-const INDEXED_TOPICS: Array<{ entry: VrpTopicEntry; keys: string[] }> = VRP_TOPICS.map((entry) => ({
-  entry,
-  keys: [normalizeTopic(entry.id), ...entry.aliases.map(normalizeTopic)]
-}))
+/** 正文检索的最小查询长度：太短的词（如 "ip"）会命中一大片，噪声大于价值 */
+const MIN_CONTENT_QUERY_LEN = 3
+
+/** 正文检索用的字段分隔符：不参与归一化，避免「跨字段拼出的假命中」 */
+const FIELD_SEP = '|'
+
+/** 归一化后的别名集（含 id）+ 正文索引，预计算避免每次查询重复正则 */
+const INDEXED_TOPICS: Array<{ entry: VrpTopicEntry; keys: string[]; haystack: string }> = VRP_TOPICS.map(
+  (entry) => ({
+    entry,
+    keys: [normalizeTopic(entry.id), ...entry.aliases.map(normalizeTopic)],
+    // 正文索引：标题/摘要/命令语法/说明/示例/易错点 —— 让「按命令关键字或报错现象」也能查到主题
+    // （例如 "allow-pass"、"反掩码"、"arp broadcast enable"）。
+    // 各字段先用 | 分隔再逐字段归一化，防止「上一个字段的尾 + 下一个字段的头」拼出假命中。
+    haystack: [
+      entry.title,
+      entry.summary,
+      ...entry.commands.flatMap((c) => [c.syntax, c.description, c.example ?? '']),
+      ...entry.pitfalls
+    ]
+      .map(normalizeTopic)
+      .join(FIELD_SEP)
+  })
+)
+
+/** 命中方式：精确（id/别名）> 子串别名 > 正文检索 */
+export type VrpMatchKind = 'exact' | 'alias' | 'content'
 
 export interface LookupOutcome {
   matched: boolean
   /** 命中的主题（matched=false 时为 undefined） */
   entry?: VrpTopicEntry
+  /**
+   * 命中方式。`content` 表示「按正文关键字命中」—— 主题不一定完全对题，
+   * 提示模型核对 summary 后再照抄命令（调用方据此加一句提醒）。
+   */
+  matchedBy?: VrpMatchKind
   /** 未命中时给模型看可用主题清单 */
   available?: Array<{ id: string; title: string; aliases: string[] }>
 }
 
 /**
- * 主题查询：精确命中（id/别名）→ 关键词包含（查询词是别名的子串，或别名是查询词的子串）。
- * 两级都失败时返回可用清单，让模型换个词重查，而不是空手而归。
+ * 主题查询，三级降级：
+ * 1. **精确**：id 或别名归一化后全等（`stp` / `Static-Route` / `静态路由`）。
+ * 2. **子串 / 正文**（合并取最优）：查询词与别名互为子串，**或**查询词出现在标题/摘要/
+ *    命令语法/示例/易错点正文里。两者按「匹配到的文本长度」比大小，长者为胜 ——
+ *    这一步同时治两个病：
+ *      - 「三层交换」同时包含 vlan 的别名「交换」和 l3_switch 的别名「三层交换」，
+ *        按数组顺序会命中 vlan（错的那一个），按长度才能命中更具体的 l3_switch；
+ *      - 「arp broadcast enable」这种**整句命令**，只在 single_arm 的正文里出现，
+ *        却会被 troubleshoot 的短别名「arp」抢先 —— 正文命中得分是整句长度，自然胜出。
+ *    同分时保留更靠前的主题（既有主题优先级不被新主题抢走）、别名命中优先于正文命中
+ *    （别名是人工维护的强信号，正文命中只是线索）。
+ *
+ * 三级都失败时返回可用清单，让模型换个词重查，而不是空手而归。
  */
 export function lookupVrpTopic(rawTopic: string): LookupOutcome {
   const q = normalizeTopic(rawTopic)
   if (!q) return { matched: false, available: listTopics() }
+
   // 1) 精确
   for (const { entry, keys } of INDEXED_TOPICS) {
-    if (keys.includes(q)) return { matched: true, entry }
+    if (keys.includes(q)) return { matched: true, entry, matchedBy: 'exact' }
   }
-  // 2) 包含（查询词较长时匹配别名子串；别名较长时匹配查询词子串）
+
+  // 2) 别名子串 + 正文检索，取匹配长度最大者
+  const candidates: Array<{ entry: VrpTopicEntry; score: number; kind: VrpMatchKind }> = []
   for (const { entry, keys } of INDEXED_TOPICS) {
-    if (keys.some((k) => k.length > 0 && (q.includes(k) || k.includes(q)))) {
-      return { matched: true, entry }
+    for (const k of keys) {
+      if (!k) continue
+      // 查询词包含更长的别名 = 命中更具体（「三层交换」命中「三层交换」而非「交换」）
+      // 反之别名比查询词长时，能确定的信息量就是查询词本身（「dhcp」命中「dhcp中继」）
+      const score = q.includes(k) ? k.length : k.includes(q) ? q.length : 0
+      if (score > 0) candidates.push({ entry, score, kind: 'alias' })
     }
   }
+  if (q.length >= MIN_CONTENT_QUERY_LEN) {
+    for (const { entry, haystack } of INDEXED_TOPICS) {
+      if (haystack.includes(q)) candidates.push({ entry, score: q.length, kind: 'content' })
+    }
+  }
+  // 数组顺序 = 主题顺序，别名候选在前；`>` 保证同分时保留先入者（既有主题优先、别名优先）
+  let best: (typeof candidates)[number] | undefined
+  for (const c of candidates) {
+    if (!best || c.score > best.score) best = c
+  }
+  if (best) return { matched: true, entry: best.entry, matchedBy: best.kind }
+
   return { matched: false, available: listTopics() }
 }
 

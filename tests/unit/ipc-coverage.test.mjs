@@ -1,7 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import fs from 'node:fs'
-import path from 'node:path'
+import { ipcSourceFiles, readHandledKeys, readInvokeKeys } from '../harness/ipc-scan.mjs'
 
 /**
  * IPC 通道覆盖率（T5.1 的守卫）。
@@ -12,58 +11,28 @@ import path from 'node:path'
  *
  * 这里改从**源码**做静态对账：`shared/channels.ts` 的 INVOKE 每一项，
  * 都必须能在 `src/main/ipc/**` 里找到对应的 `ipcMain.handle(INVOKE.x)`。
+ *
+ * N82/N83：扫描正则与路径推导已抽到 `tests/harness/ipc-scan.mjs`，与 channel-parity 共用。
  */
-
-const ROOT = 'src'
-const CHANNELS = path.join(ROOT, 'shared', 'channels.ts')
-const IPC_DIR = path.join(ROOT, 'main', 'ipc')
-
-function readInvokeKeys() {
-  const s = fs.readFileSync(CHANNELS, 'utf8')
-  const block = s.match(/export const INVOKE = \{([\s\S]*?)\n\} as const/)
-  assert.ok(block, '没能解析 INVOKE 定义（channels.ts 结构变了？）')
-  const keys = [...block[1].matchAll(/^\s*([A-Za-z0-9_]+)\s*:/gm)].map((m) => m[1])
-  assert.ok(keys.length > 50, `INVOKE 通道数异常：${keys.length}`)
-  return keys
-}
-
-function readHandledKeys() {
-  const handled = new Set()
-  const files = fs
-    .readdirSync(IPC_DIR)
-    .filter((f) => f.endsWith('.ts'))
-    .map((f) => path.join(IPC_DIR, f))
-  for (const f of files) {
-    const s = fs.readFileSync(f, 'utf8')
-    // 允许换行，也允许注释夹在中间（主进程里写了不少解释性注释）
-    for (const m of s.matchAll(/ipcMain\.handle\((?:[\s\S]{0,500}?)INVOKE\.([A-Za-z0-9_]+)/g)) {
-      handled.add(m[1])
-    }
-  }
-  return handled
-}
 
 test('T5.1 每个 INVOKE 通道都有对应的 ipcMain.handle（拆分时漏搬会被这里抓住）', () => {
   const wanted = readInvokeKeys()
   const handled = readHandledKeys()
 
-  const missing = wanted.filter((k) => !handled.has(k))
+  const missing = [...wanted].filter((k) => !handled.has(k))
   assert.deepEqual(missing, [], `以下通道没有处理器：${missing.join(', ')}`)
 })
 
 test('T5.1 没有为已不存在的通道注册处理器（反向对账）', () => {
-  const wanted = new Set(readInvokeKeys())
-  const handled = [...readHandledKeys()]
-  const extra = handled.filter((k) => !wanted.has(k))
+  const wanted = readInvokeKeys()
+  const extra = [...readHandledKeys()].filter((k) => !wanted.has(k))
   assert.deepEqual(extra, [], `以下处理器指向了不存在的通道：${extra.join(', ')}`)
 })
 
 test('T5.1 IPC 路由层单文件不超过 300 行', () => {
-  const files = fs.readdirSync(IPC_DIR).filter((f) => f.endsWith('.ts'))
-  const tooBig = []
-  for (const f of files) {
-    const n = fs.readFileSync(path.join(IPC_DIR, f), 'utf8').split('\n').length
-    if (n > 300) tooBig.push(`${f}(${n} 行)`)
-  }
+  const tooBig = ipcSourceFiles()
+    .map(({ name, source }) => ({ name, lines: source.split('\n').length }))
+    .filter((f) => f.lines > 300)
+    .map((f) => `${f.name}(${f.lines} 行)`)
   assert.deepEqual(tooBig, [], `需要继续拆分：${tooBig.join(', ')}`)
 })

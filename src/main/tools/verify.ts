@@ -3,6 +3,8 @@ import { maxParallelOf, runGroupedBounded } from '@shared/concurrency'
 import { fail, failFromCommand, ok, Type, type ToolSpec } from './registry'
 import {
   hasDhcpConfig,
+  isIpv4Address,
+  isTolerablePingFailure,
   networkPrefix,
   parseArpTable,
   parseDhcpPools,
@@ -26,8 +28,6 @@ import {
  *
  * 全部 risk=read（只执行只读命令），可被代理与 MCP 安全调用；解析器纯函数可单测。
  */
-
-const IPV4_RE = /^(?:\d{1,3}\.){3}\d{1,3}$/
 
 export const verifyPing: ToolSpec<{ from: string; target: string }> = {
   name: 'verify_ping',
@@ -54,7 +54,7 @@ export const verifyPing: ToolSpec<{ from: string; target: string }> = {
     if (!session) {
       return fail('NOT_CONNECTED', `设备未连接：${args.from}`, { ms: Date.now() - t0 })
     }
-    if (!IPV4_RE.test(args.target)) {
+    if (!isIpv4Address(args.target)) {
       return fail('BAD_PARAM', `目标不是合法 IPv4：${args.target}`, { ms: Date.now() - t0 })
     }
 
@@ -63,7 +63,8 @@ export const verifyPing: ToolSpec<{ from: string; target: string }> = {
       ...(ctx.signal ? { signal: ctx.signal } : {})
     })
     const meta = { ms: Date.now() - t0, deviceId: args.from, settled: r.settled }
-    if (!r.ok && !r.clean.includes('packet')) {
+    // N26：ping 不通时命令可能整体不算 ok，但回显里有统计行 —— 判据与 check_experiment 同一份
+    if (!r.ok && !isTolerablePingFailure(r)) {
       return failFromCommand(r, 'FAILED', meta)
     }
 

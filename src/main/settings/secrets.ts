@@ -2,6 +2,14 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { app, safeStorage } from 'electron'
 import { atomicWriteJsonSync } from '../core/fs/atomic'
+import { quarantineFile } from '../core/fs/quarantine'
+import {
+  normalizeKeyEntries,
+  packSecret,
+  unpackSecret,
+  type KeyEntry,
+  type SecretCrypto
+} from './secretCodec'
 
 /**
  * 模型 API 密钥的保管（v1.5：按档案分档）。
@@ -21,12 +29,8 @@ import { atomicWriteJsonSync } from '../core/fs/atomic'
  *   这样「降级回旧版本」也不会丢密钥。
  */
 
-export interface KeyEntry {
-  /** safe = safeStorage 加密；plain = 系统不支持加密时的降级（仍标出来，避免误以为已加密） */
-  enc: 'safe' | 'plain'
-  /** base64 */
-  data: string
-}
+/** KeyEntry 的唯一定义已移到 secretCodec（不依赖 electron，可进测试包）；此处 re-export 保持调用点不变 */
+export type { KeyEntry } from './secretCodec'
 
 interface KeyFile {
   version: 1
@@ -57,21 +61,11 @@ function readKeys(): KeyFile {
       return cache
     }
     const parsed = JSON.parse(fs.readFileSync(keysFile(), 'utf8')) as Partial<KeyFile>
-    const keys: Record<string, KeyEntry> = {}
-    for (const [id, entry] of Object.entries(parsed.keys ?? {})) {
-      if (!entry || typeof entry !== 'object') continue
-      const e = entry as Partial<KeyEntry>
-      if (typeof e.data !== 'string' || !e.data) continue
-      keys[id] = { enc: e.enc === 'plain' ? 'plain' : 'safe', data: e.data }
-    }
-    cache = { version: 1, keys }
+    cache = { version: 1, keys: normalizeKeyEntries(parsed.keys) }
   } catch {
     // 读坏了不能直接覆盖：留一份坏文件供排查，然后从空开始（密钥可重填，历史不可再生）
-    try {
-      fs.renameSync(keysFile(), `${keysFile()}.bad-${Date.now()}`)
-    } catch {
-      /* 忽略 */
-    }
+    // N22 口径统一：走 core/fs/quarantine 的 .bad-<ts> 留档
+    quarantineFile(keysFile())
     cache = structuredClone(EMPTY)
   }
   return cache
@@ -83,24 +77,21 @@ function persist(next: KeyFile): void {
   cache = next
 }
 
+/** 真实加密适配器：把 electron 的 safeStorage 挡在 secretCodec 之外（后者要能进测试包） */
+const safeCrypto: SecretCrypto = {
+  available: () => safeStorage.isEncryptionAvailable(),
+  encrypt: (plain: string) => safeStorage.encryptString(plain).toString('base64'),
+  decrypt: (b64: string) => safeStorage.decryptString(Buffer.from(b64, 'base64'))
+}
+
 /** 加密单条字符串为 KeyEntry（safeStorage 可用则加密，否则降级 base64 并标注 plain）。供 sshSecrets 复用 */
 export function encrypt(plain: string): KeyEntry {
-  if (safeStorage.isEncryptionAvailable()) {
-    return { enc: 'safe', data: safeStorage.encryptString(plain).toString('base64') }
-  }
-  return { enc: 'plain', data: Buffer.from(plain, 'utf8').toString('base64') }
+  return packSecret(plain, safeCrypto)
 }
 
 /** 解密密文。换机器/换用户后解不开返回 null（与 readKeys 的口径一致：视为未配置，不崩溃）。供 sshSecrets 复用 */
 export function decrypt(entry: KeyEntry): string | null {
-  try {
-    const buf = Buffer.from(entry.data, 'base64')
-    if (entry.enc === 'plain') return buf.toString('utf8')
-    return safeStorage.decryptString(buf)
-  } catch {
-    // 换机器 / 换用户后旧密文解不开：视为未配置，而不是崩溃
-    return null
-  }
+  return unpackSecret(entry, safeCrypto)
 }
 
 export function hasApiKey(profileId?: string): boolean {

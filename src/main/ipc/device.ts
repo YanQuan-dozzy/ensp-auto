@@ -157,9 +157,10 @@ export function registerDeviceIpc(services: Services, emit: EmitFn): void {
    * 连接握手期间的 banner / 提示符 / 探针输出就永远看不到。
    */
   ipcMain.handle(INVOKE.terminalBuffer, async (_e, args: { deviceId?: string }) => {
-    const segments = services.sessions.terminalBuffer(requireDeviceId(args?.deviceId))
-    const last = segments[segments.length - 1]
-    return { segments, seq: last ? last.seq : 0 }
+    const snap = services.sessions.terminalBuffer(requireDeviceId(args?.deviceId))
+    const last = snap.segments[snap.segments.length - 1]
+    // encoding 必须随快照回传：这些是**原始字节**，不带上编码渲染层就没法解成文本
+    return { segments: snap.segments, encoding: snap.encoding, seq: last ? last.seq : 0 }
   })
 
   ipcMain.handle(INVOKE.terminalClear, async (_e, args: { deviceId?: string }) => {

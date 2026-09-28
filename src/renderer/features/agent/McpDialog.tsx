@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { useApp } from '@/stores/app'
 import { newMcpServerId } from '@shared/profiles'
 import type { McpServerConfig, McpServerStatus } from '@shared/types'
+import { useEscLayer } from '@/features/shortcuts/useEscLayer'
 import { Row, Section } from '@/components/settings-kit'
 import {
   Switch,
@@ -70,20 +71,22 @@ export function McpDialog({ onClose }: { onClose: () => void }): ReactNode {
   /** 最新服务器列表快照：commit 类操作一律从 getState 读，避免连点时的 lost-update */
   const latestServers = (): McpServerConfig[] => useApp.getState().settings.mcp.servers
 
-  // v1.8：onClose 是父组件内联箭头函数，每次 render 都是新引用 —— 用 ref 存最新回调，
-  // 让 Esc 的监听 effect 不随每次渲染反复 remove/add
-  const onCloseRef = useRef(onClose)
-  onCloseRef.current = onClose
-
+  // 挂载时拉一次服务器状态（原实现与 Esc 监听写在同一个 effect 里，
+  // dependency 含 importOpen → 每次开/关手动配置弹窗都白拉一次）
   useEffect(() => {
     void useApp.getState().loadMcpServers()
-    const onKey = (e: KeyboardEvent): void => {
-      // 手动配置弹窗开着时 Esc 归它 —— 否则一次按键会连着关掉两层
-      if (e.key === 'Escape' && !importOpen) onCloseRef.current()
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [importOpen])
+  }, [])
+
+  /**
+   * N66：Esc 归**最内层**浮层（`useEscLayer` = 捕获阶段处理 + 认领一层）。
+   *
+   * 两层意义：
+   * ① 手动配置子弹窗开着时本层让行（原逻辑已有）；
+   * ② 认领后 App 的全局捕获监听会 `escLayerOpen()` 早退 —— 否则从设置页打开 MCP
+   *    管理后按一次 Esc 会把整套设置一起关掉（App 的监听先注册、在捕获阶段，
+   *    `stopPropagation` 拦不住它）。
+   */
+  useEscLayer(onClose, !importOpen)
 
   /** 写服务器列表（主进程会按新列表重连，幂等） */
   const commit = async (next: McpServerConfig[], tip: string): Promise<void> => {

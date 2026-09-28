@@ -192,6 +192,12 @@ export class Services {
       this.snapshots.setBaseDir(this.snapshotsDir)
       this.changes.setBaseDir(this.snapshotsDir)
     }
+    // 回显编码改了 → 即时应用到活动会话（不必重连）。
+    // 只在下次连接时生效的话，用户改完盯着终端看「怎么还是乱码」，
+    // 这条设置就等于坏掉了 —— 而它正是排查中文乱码时要来回试的一项。
+    if (before.deviceEncoding !== after.deviceEncoding) {
+      this.sessions.applyEncodingPref(after.deviceEncoding)
+    }
     // D9：任何来源的设置变更都广播给渲染层。
     // 旧实现只有「渲染层自己发起 updateSettings 的返回值」这一条刷新路径，
     // 主进程直改设置的路径（Wireshark 挂载 / 数据目录切换）在界面上不可见，

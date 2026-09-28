@@ -1,6 +1,9 @@
 import { Type } from './registry'
 import { fail, ok, type ToolContext, type ToolSpec } from './registry'
+import { isReadOnlyCommand } from '@shared/risk'
 import {
+  isIpv4Address,
+  isTolerablePingFailure,
   networkPrefix,
   parseArpTable,
   parseDhcpPools,
@@ -78,8 +81,11 @@ export interface CheckOutcome {
  */
 export function commandsForCheck(c: AcceptanceCheck): string[] {
   switch (c.kind) {
-    case 'ping':
-      return c.target?.trim() ? [`ping -c 3 ${c.target.trim()}`] : []
+    case 'ping': {
+      const target = c.target?.trim() ?? ''
+      // N12：target 会被拼进命令，只接受严格 IPv4（不是合法地址就不生成命令）
+      return isIpv4Address(target) ? [`ping -c 3 ${target}`] : []
+    }
     case 'interface':
       return ['display interface brief']
     case 'ospf':
@@ -94,11 +100,44 @@ export function commandsForCheck(c: AcceptanceCheck): string[] {
       return ['display nat outbound', 'display nat server']
     case 'eth_trunk':
       return [c.trunkId ? `display eth-trunk ${c.trunkId}` : 'display eth-trunk']
-    case 'config':
-      return c.contains?.trim()
-        ? [`display current-configuration | include ${c.contains.trim()}`]
+    case 'config': {
+      const needle = c.contains?.trim() ?? ''
+      // N12：contains 会被拼进 `| include <词>`，含换行/分隔符一律不生成命令
+      return needle && !INCLUDE_FILTER_FORBIDDEN_RE.test(needle)
+        ? [`display current-configuration | include ${needle}`]
         : []
+    }
   }
+}
+
+/** config 检查的过滤词里禁止出现的字符（会破坏 `| include <词>` 的单命令结构） */
+const INCLUDE_FILTER_FORBIDDEN_RE = /[\r\n|;&]/
+
+/**
+ * N12：验收项的安全校验 —— 命令是**由参数拼出来**的，所以必须在执行前校验。
+ *
+ * 返回 null = 合法；否则返回给模型的失败原因（handler 会整体返回 BAD_PARAM）。
+ *
+ * 两道：
+ * 1. 逐个 kind 校验被插值的参数（ping 的 target / config 的 contains）；
+ * 2. 兜底：无论哪种 kind，凡 `commandsForCheck` 拼出来的命令都必须通过 `isReadOnlyCommand`
+ *    —— 将来新增「把参数拼进命令」的 kind 时，即使忘了第 1 条也不会漏。
+ */
+export function checkInputError(c: AcceptanceCheck): string | null {
+  if (c.kind === 'ping') {
+    const t = (c.target ?? '').trim()
+    if (t && !isIpv4Address(t)) return `ping 的 target 必须是合法 IPv4 地址：${t}`
+  }
+  if (c.kind === 'config') {
+    const s = (c.contains ?? '').trim()
+    if (s && INCLUDE_FILTER_FORBIDDEN_RE.test(s)) {
+      return `config 的 contains 不得包含换行或命令分隔符（| ; &）：${s}`
+    }
+  }
+  for (const cmd of commandsForCheck(c)) {
+    if (!isReadOnlyCommand(cmd)) return `验收命令必须是只读命令：${cmd}`
+  }
+  return null
 }
 
 /** 验收项的一行目标描述（清单缺 label 时的兜底） */
@@ -355,8 +394,8 @@ async function runCheck(c: AcceptanceCheck, ctx: ToolContext): Promise<CheckItem
       timeoutMs: 15000,
       ...(ctx.signal ? { signal: ctx.signal } : {})
     })
-    // ping 不可达时命令可能整体不算 ok，但回显里有统计行 —— 与 verify_ping 同一口径
-    const tolerable = c.kind === 'ping' && r.clean.includes('packet')
+    // ping 不可达时命令可能整体不算 ok，但回显里有统计行 —— 与 verify_ping 共用同一份判据（N26）
+    const tolerable = c.kind === 'ping' && isTolerablePingFailure(r)
     if (!r.ok && !tolerable) {
       return { ...base, ok: false, status: 'error', evidence: '', reason: `命令失败：${cmd} —— ${r.error ?? '未知错误'}` }
     }
@@ -459,6 +498,21 @@ export const checkExperiment: ToolSpec<{ checks: AcceptanceCheck[] }> = {
     const checks = args?.checks ?? []
     if (!Array.isArray(checks) || checks.length === 0) {
       return fail('BAD_PARAM', 'checks 不能为空：请给出至少一项验收目标', { ms: Date.now() - t0 })
+    }
+
+    // N12：命令是由参数拼出来的 —— 在碰设备之前先把非法参数整体拒绝（BAD_PARAM），
+    // 绝不让「拼进命令的模型输入」走到 session.exec。checks 可能来自外部 MCP 调用，
+    // 故先挡掉非对象条目（否则后面的字段访问会直接抛）。
+    for (const c of checks) {
+      if (!c || typeof c !== 'object') {
+        return fail('BAD_PARAM', 'checks 里存在非法条目（应为对象）', { ms: Date.now() - t0 })
+      }
+      const inputError = checkInputError(c)
+      if (inputError) {
+        return fail('BAD_PARAM', `验收项参数非法（${c.deviceId} / ${c.kind}）：${inputError}`, {
+          ms: Date.now() - t0
+        })
+      }
     }
 
     const items: CheckItemResult[] = []

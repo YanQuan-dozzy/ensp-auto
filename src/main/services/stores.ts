@@ -131,8 +131,9 @@ export function createStores(opts: CreateStoresOptions): StoreBundle {
   const todos = new TodoStore(path.join(userDataDir, 'todos.json'))
   const sessions = new SessionManager(store, {
     getSettings: () => store.getSettings(),
-    onRaw: (deviceId, chunk, fromAgent, seq) => {
-      emit(EVENT.terminalData, { deviceId, chunk, fromAgent, seq })
+    onRaw: (deviceId, chunk, fromAgent, seq, encoding) => {
+      // 带上该段所属的回显编码：终端要按它把原始字节解成文本（GBK 中文不再乱码）
+      emit(EVENT.terminalData, { deviceId, chunk, fromAgent, seq, encoding })
     },
     onClosed: (deviceId, reason) => {
       emit(EVENT.terminalClosed, { deviceId, reason })

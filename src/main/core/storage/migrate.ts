@@ -65,9 +65,18 @@ export interface MigrateOptions {
 /** 让出一次事件循环，让主进程继续处理 IPC / 界面事件 */
 const yieldToLoop = (): Promise<void> => new Promise((r) => setImmediate(r))
 
-/** 异步枚举待拷贝文件（相对路径），跳过排除项与目标目录自身 */
-async function collectFiles(srcDir: string, destDir: string): Promise<string[]> {
-  const out: string[] = []
+/**
+ * 异步枚举待拷贝文件（相对路径），跳过排除项与目标目录自身。
+ *
+ * `skipped` 收非常规项（符号链接 / FIFO / socket 等）：它们不会被复制，
+ * 但必须回传给调用方 —— 见 MigrateResult 里「跳过项必须回传」的纪律（N43）。
+ */
+async function collectFiles(
+  srcDir: string,
+  destDir: string
+): Promise<{ rels: string[]; skipped: string[] }> {
+  const rels: string[] = []
+  const skipped: string[] = []
 
   const walk = async (current: string): Promise<void> => {
     let entries: fs.Dirent[]
@@ -80,16 +89,24 @@ async function collectFiles(srcDir: string, destDir: string): Promise<string[]> 
       if (EXCLUDED_NAMES.has(ent.name)) continue
       const full = path.join(current, ent.name)
       if (path.resolve(full) === destDir) continue
-      if (ent.isDirectory()) {
+      if (ent.isSymbolicLink()) {
+        // N43：软链一律不跟随。旧实现只处理 isDirectory/isFile，软链被**静默**跳过
+        //（既不复制也不回传）→ 用户看到「迁移完成但少了几个文件」。而且一旦跟随目录软链，
+        // 成环时还会无限递归。这里计入 skipped → 由上层并入 failed。
+        skipped.push(path.relative(srcDir, full))
+      } else if (ent.isDirectory()) {
         await walk(full)
       } else if (ent.isFile()) {
-        out.push(path.relative(srcDir, full))
+        rels.push(path.relative(srcDir, full))
+      } else {
+        // FIFO / socket 等非常规项：同样不复制，但同样要回传
+        skipped.push(path.relative(srcDir, full))
       }
     }
   }
 
   await walk(srcDir)
-  return out
+  return { rels, skipped }
 }
 
 export async function migrateDirectory(
@@ -108,7 +125,9 @@ export async function migrateDirectory(
 
   await fs.promises.mkdir(resolvedDest, { recursive: true })
 
-  const rels = await collectFiles(resolvedSrc, resolvedDest)
+  const { rels, skipped } = await collectFiles(resolvedSrc, resolvedDest)
+  // N43：非常规项（软链等）不复制，但要出现在结果里，界面才能如实告诉用户「哪些没迁」
+  failed.push(...skipped)
   const total = rels.length
   const yieldEvery = Math.max(1, opts.yieldEvery ?? 25)
 

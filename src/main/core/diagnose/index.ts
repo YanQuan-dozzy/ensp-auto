@@ -32,11 +32,19 @@ export interface DiagDeps {
   fetchImpl?: typeof fetch
 }
 
-/** 探测 127.0.0.1:port 是否可绑定。已运行的服务会占住端口，因此只在未运行时用 */
-function probePort(port: number): Promise<{ bindable: boolean; code: string }> {
+/**
+ * 探测 127.0.0.1:port 是否可绑定。已运行的服务会占住端口，因此只在未运行时用。
+ * 导出供测试（N31）：`runDiagnostics` 的宿主依赖面越小，体检结论越可信。
+ */
+export function probePort(port: number): Promise<{ bindable: boolean; code: string }> {
   return new Promise((resolve) => {
     const srv = net.createServer()
+    let settled = false
+    let timer: NodeJS.Timeout | null = null
     const done = (bindable: boolean, code: string): void => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
       try {
         srv.close()
       } catch {
@@ -44,6 +52,10 @@ function probePort(port: number): Promise<{ bindable: boolean; code: string }> {
       }
       resolve({ bindable, code })
     }
+    // N37：极端环境下 listen 可能既不 error 也不 listening（Promise 永不 settle），
+    // 那样 runDiagnostics 的 Promise.all 会永久挂住、设置页体检一直 loading。
+    // 补一个兜底超时：宁可报 TIMEOUT，也不要挂死。
+    timer = setTimeout(() => done(false, 'TIMEOUT'), PROBE_TIMEOUT_MS)
     srv.once('error', (e: NodeJS.ErrnoException) => done(false, e.code ?? 'UNKNOWN'))
     srv.once('listening', () => done(true, ''))
     try {

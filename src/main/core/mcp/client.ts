@@ -116,7 +116,25 @@ interface Connection {
 export interface McpClientManagerOptions {
   /** 状态变化回调（主进程广播给渲染层） */
   onChange?: (statuses: McpServerStatus[]) => void
+  /**
+   * 连接超时毫秒数；缺省 `CONNECT_TIMEOUT_MS`。
+   * 存在的唯一理由是**可测性**：用例需要注入极短超时来验证「超时不泄漏子进程」（N14）。
+   */
+  connectTimeoutMs?: number
 }
+
+/** `client.connect()` 的入参类型（避免深引 SDK 的 transport.js 路径） */
+type McpTransport = Parameters<Client['connect']>[0]
+
+/**
+ * stdio 命令里禁止出现的字符（N50）。
+ *
+ * StdioClientTransport 用 `spawn(command, args, { shell: false })` 起进程，本身不做 shell
+ * 解析；这里拒绝分隔符 / 重定向符属于**纵深防御**：一旦将来有人打开 shell（或上游换实现），
+ * 注入就成立了。刻意**不**拒绝 `$` `(` `)` `{` `}` —— 它们在
+ * `C:\Program Files (x86)\…` 这类合法路径里真实存在，误杀代价高于收益。
+ */
+const SHELL_METACHARS_RE = /[\r\n;|&`<>]/
 
 export function signatureOf(cfg: McpServerConfig): string {
   return [cfg.transport, cfg.url, cfg.command, cfg.args.join('\u0000')].join('|')
@@ -195,6 +213,8 @@ export class McpClientManager {
       try {
         const conn = await this.connect(cfg, Date.now() - t0)
         this.conns.set(cfg.id, conn)
+        // N49：连接建立后再订阅生命周期（此时 conns 已就位，onGone 才能判定「仍是当前连接」）
+        this.attachLifecycle(cfg, conn.client)
         this.statuses.set(
           cfg.id,
           statusOf(cfg, { connected: true, tools: conn.tools, latencyMs: conn.latencyMs })
@@ -247,21 +267,20 @@ export class McpClientManager {
       { name: 'ensp-auto', version: '1.5.0' },
       { capabilities: {} }
     )
+    const transport = this.buildTransport(cfg)
 
-    if (cfg.transport === 'http') {
-      const url = cfg.url.trim()
-      if (!/^https?:\/\//i.test(url)) throw new Error('HTTP 传输需要以 http:// 或 https:// 开头的地址')
-      const transport = new StreamableHTTPClientTransport(new URL(url))
-      await withTimeout(client.connect(transport), CONNECT_TIMEOUT_MS, '连接 MCP 服务器')
-    } else {
-      const command = cfg.command.trim()
-      if (!command) throw new Error('stdio 传输需要填写可执行命令')
-      const transport = new StdioClientTransport({
-        command,
-        args: [...cfg.args],
-        stderr: 'ignore'
-      })
-      await withTimeout(client.connect(transport), CONNECT_TIMEOUT_MS, '启动 MCP 进程')
+    try {
+      await withTimeout(
+        client.connect(transport),
+        this.opts.connectTimeoutMs ?? CONNECT_TIMEOUT_MS,
+        cfg.transport === 'http' ? '连接 MCP 服务器' : '启动 MCP 进程'
+      )
+    } catch (e) {
+      // N14：connect 期间 stdio 传输已经 spawn 了子进程（http 也已建立半截连接）——
+      // 超时/失败时若不显式 close，子进程就成为孤儿；而 sync 在启动、改配置时都会触发，
+      // 服务器一卡死就每次泄漏一个。listTools 的失败分支早已这么做，这里补齐。
+      await client.close().catch(() => undefined)
+      throw e
     }
 
     let tools: McpToolInfo[] = []
@@ -289,6 +308,59 @@ export class McpClientManager {
       rawSchemas,
       latencyMs: Date.now() - t0
     }
+  }
+
+  /** 依据配置建传输层（http / stdio）。命令约束与 stderr 收集见 N50。 */
+  private buildTransport(cfg: McpServerConfig): McpTransport {
+    if (cfg.transport === 'http') {
+      const url = cfg.url.trim()
+      if (!/^https?:\/\//i.test(url)) throw new Error('HTTP 传输需要以 http:// 或 https:// 开头的地址')
+      return new StreamableHTTPClientTransport(new URL(url))
+    }
+
+    const command = cfg.command.trim()
+    if (!command) throw new Error('stdio 传输需要填写可执行命令')
+    if (SHELL_METACHARS_RE.test(command)) {
+      throw new Error('stdio 命令不得包含 shell 分隔符 / 重定向符（; | & ` < > 或换行）')
+    }
+    const transport = new StdioClientTransport({
+      command,
+      args: [...cfg.args],
+      // N50：不再 'ignore' —— 子进程启动失败 / 崩溃的唯一线索都在 stderr，
+      // 丢掉它用户只看到「连接失败」而查不到原因
+      stderr: 'pipe'
+    })
+    // pipe 模式下 stderr 立即可用（SDK 先建好 PassThrough），start 之前挂监听才不会丢早期输出；
+    // 顺带必须有消费者，否则 stderr 管道写满会阻塞子进程
+    transport.stderr?.on('data', (chunk: unknown) => {
+      const text = String(chunk).trim()
+      if (text) console.warn(`[mcp:${cfg.name}] ${text}`)
+    })
+    return transport
+  }
+
+  /**
+   * N49：订阅连接生命周期。
+   *
+   * 子进程崩溃 / 连接被远端关闭后，旧实现的 `statuses` 仍停在 `connected: true` ——
+   * 界面长期显示「已连接」但工具实际不可用，用户只能手动改配置才触发重连。
+   * 这里把「断开」如实反映到状态里并清掉连接（下次 sync 会重建）。
+   */
+  private attachLifecycle(cfg: McpServerConfig, client: Client): void {
+    const onGone = (reason: string): void => {
+      // 配置变更会换新 client：只有「当前仍在用的这条连接」才处理，
+      // 否则会把刚建立的新连接误标成断开
+      const cur = this.conns.get(cfg.id)
+      if (!cur || cur.client !== client) return
+      this.conns.delete(cfg.id)
+      this.statuses.set(
+        cfg.id,
+        statusOf(cfg, { connected: false, tools: [], error: `MCP 服务器连接已断开：${reason}` })
+      )
+      this.opts.onChange?.(this.list())
+    }
+    client.onclose = () => onGone('进程退出或连接被关闭')
+    client.onerror = (e) => onGone(e instanceof Error ? e.message : String(e))
   }
 
   private async closeOne(id: string): Promise<void> {

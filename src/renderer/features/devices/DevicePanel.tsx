@@ -76,7 +76,15 @@ export function DevicePanel(): ReactNode {
   const doScan = (): void => {
     const s = Number.parseInt(start, 10) || 2000
     const e = Number.parseInt(end, 10) || 2050
-    void updateSettings({ scanStart: s, scanEnd: e }).then(() => useApp.getState().scan())
+    // N65：原来只有 .then —— 保存扫描范围失败会变成未处理 rejection，
+    // 且失败后仍然会启动一次「用旧范围」的扫描，用户完全看不出区别
+    void updateSettings({ scanStart: s, scanEnd: e })
+      .then(() => useApp.getState().scan())
+      .catch((err: unknown) => {
+        useApp
+          .getState()
+          .noteSystemMessage(`保存扫描范围失败，已取消本次扫描：${err instanceof Error ? err.message : String(err)}`, 'error')
+      })
   }
 
   // v1.8：Escape 取消重命名时，input 卸载会先派发 blur → onBlur 又把 draft 提交，

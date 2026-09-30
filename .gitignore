@@ -4,13 +4,11 @@ dist/
 release/
 .npm-cache/
 
-# 内部工具目录与特殊文档（不入库）
-
-
+# 本机 / 构建辅助文件（不入库）
 .npmrc
 electron-win32.zip
 
-# 公开文档待审查后另行推送
+# 本机文档（不随仓库发布）
 docs/
 
 *.log
@@ -35,7 +33,7 @@ tests/.build/
 # （源码是 launcher.cs，二进制不入库；构建方式见 tools/）
 start.exe
 
-# git filter-branch 的工作目录（中断后可能残留，绝非源码；重建历史时由 git 自管）
+# git 历史重写可能残留的工作目录（绝非源码，由 git 自管）
 .git-rewrite/
 
 # Electron 运行时重定向到工作区的控制台日志（渲染进程 CSP 告警等）

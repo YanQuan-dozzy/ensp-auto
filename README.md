@@ -34,14 +34,15 @@
 双击 start.cmd        # 或终端执行 .\start.ps1
 ```
 
-手动方式：
+从源码运行：
 
 ```bash
 npm install          # 安装依赖
-npm run dev          # 开发模式
-npm run verify       # 类型检查 + 生产构建
-npm test             # 全部测试（不需要 Electron、不需要 eNSP）
+npm run dev          # 开发模式（HMR）
+npm run build        # 重新打包，产出 out/
 ```
+
+打包后退出已在运行的实例，再用 `start.cmd` 启动（它加载的是 `out/` 产物，所以改完源码要先重新打包）。
 
 国内网络下 Electron 二进制需显式指定镜像：
 
@@ -89,26 +90,6 @@ $env:ELECTRON_MIRROR="https://npmmirror.com/mirrors/electron/"; npm install
 | Schema | TypeBox（一份 schema 同时喂 LLM 与 MCP） |
 | 打包 | electron-builder → 单 exe 便携版 |
 
-## 测试与验证
-
-| 命令 | 结论 |
-|---|---|
-| `npm run typecheck` | 通过（node / web / tests 三套 tsconfig 均无错误） |
-| `npm run build` | 通过 |
-| `npm test` | 全绿：单元、通信层集成（Mock VRP / Mock SSH）、配置链路、拓扑解析、会话树、MCP 端到端、工程文件解析、任务计划、验证解析、实验模板、落盘与安全管道 |
-
-用例数不写死在这里（历史上写死过一次，很快就过期了）：跑 `npm test` 看末尾的 `# pass`，
-或 `ls tests/unit/*.test.mjs | wc -l` 看用例文件数。
-注意 `tsconfig.tests.json` 也是门禁的一部分 —— 它专门覆盖 `tests/harness/**`，
-否则「删了源码模块却漏改 harness」这类问题只能等 `npm test` 才炸。
-
-## 已知限制
-
-- **eNSP 真机联调待做**：通信层行为由 Mock VRP / Mock SSH 设备覆盖（分页 / 编码 / 兜底 / 并发 / 断线），但真机提示符与错误文案的形态仍需按真机实测校准一次，差异回写 `patterns.ts`
-- **真实模型调用待配 Key 验证**：各 provider 已接入并通过类型检查 / 构建 / 事件翻译单测，流式工具调用尚未用真实 API Key 端到端跑过；认证缺失、模型名不在目录等失败分支已在代码中显式处理
-- **检查点恢复**：崩溃 / 退出后启动时会提示「继续上次任务」（v2.8 已交付）；续跑不自动重发原指令，而是让模型读历史轨迹判断进度后接着做，以免对 `undo` 不友好的命令造成重复配置。会话树仍可用「从这里继续」手动重放
-- **会话标题**：AI 起名默认关闭（设置 → 模型 → 会话标题），开启后每轮任务收尾多花一次很小的模型请求
-
 ## 安全红线
 
 本项目**只**操作本机 eNSP 虚拟设备，明确不做以下事情：
@@ -118,9 +99,3 @@ $env:ELECTRON_MIRROR="https://npmmirror.com/mirrors/electron/"; npm install
 - 不在未经确认的情况下批量下发配置
 - 不在未做快照的情况下修改设备配置
 - 不持久化明文设备密码
-
-## 开发约定
-
-- 所有源文件使用 UTF-8 编码
-- 交付节奏：抽象接口 → real/mock 双实现 → bridge/preload 封装 → 测试 → 文档更新
-- LLM 解密与设备密码等敏感信息仅存于本机 `userData` 下（`secrets.ts`），不入库、不上传

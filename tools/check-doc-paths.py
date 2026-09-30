@@ -16,6 +16,8 @@
   注意：**必须含 `/`**才会被抽取 —— 「只写文件名」是靠 PATH_RE 匹配到 `a/b/name.ts`
   之后再退回 basename 比对实现的，而不是逐个裸文件名去扫（那样会把正文里的泛指词
   也当路径，噪声大到没法用）。
+- **点开头的目录（`.vscode/`、`.idea/` 等）会被正确保留**：只剥掉 `.` 之外的包裹符号，
+  否则前导点被吃掉会变成 `vscode/xxx`，永远定位不到（2026-09-30 修）。
 """
 from __future__ import print_function
 
@@ -76,11 +78,14 @@ def main():
             continue
         text = io.open(doc, encoding='utf-8').read()
         for m in PATH_RE.finditer(text):
-            raw = m.group(0).strip('`(),.:;')
+            # 只剥包裹符号（反引号 / 括号 / 句读），**不能连 `.` 一起剥**：
+            # 那会把 `.vscode/settings.json` 的前导点吃掉，变成定位不到的 `vscode/...`
+            raw = m.group(0).strip('`(),:;').rstrip('.')
             if is_allowed(raw):
                 continue
             total += 1
-            rel = raw.lstrip('./')
+            rel = raw[2:] if raw.startswith('./') else raw
+            rel = rel.lstrip('/')
             if os.path.exists(rel):
                 continue
             if os.path.basename(rel) in names:

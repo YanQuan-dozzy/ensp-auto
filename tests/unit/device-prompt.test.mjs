@@ -190,3 +190,40 @@ test('D2：应答后又出现新提示 → INCOMPLETE 且带 nextPrompt', async 
   assert.equal(res.error.code, 'INCOMPLETE')
   assert.equal(res.data.nextPrompt, 'Confirm again? [Y/N]:')
 })
+
+// ————————————————— v2.30：确认提示的形态不止 [Y/N]（AR 路由器实测） —————————————————
+
+test('D2+（v2.30）：路由器式 (y/n)[n] 提示也能挂起 —— 旧正则漏判会假成功', async () => {
+  const { session, deviceId, ctx, changes, teardown } = await setup({
+    handlers: [
+      confirmHandler(
+        /^delete flash:\/vrpcfg\.zip$/i,
+        'The saved configuration will be erased. Continue? (y/n)[n]:'
+      ),
+      { match: /^y$/i, respond: () => ({ text: 'Delete file successfully.' }) }
+    ]
+  })
+  try {
+    /*
+     * 实测来源：AR2200 上 reset saved-configuration 的二次确认写作 (y/n)[n]。
+     * 旧 CONFIRM_RE 只认 [Y/N] → 既不挂起也不判「回到提示符」→ 静默收尾、ok=true，
+     * 工具报「下发成功」而配置一个字没清（实验日志里的 AR3）。这里锁住新行为。
+     */
+    const res = await applyConfig.handler(
+      { deviceId, commands: ['delete flash:/vrpcfg.zip'], description: '清理旧配置备份' },
+      ctx
+    )
+    assert.equal(res.ok, false)
+    assert.equal(res.error.code, 'INCOMPLETE')
+    assert.equal(session.isAwaitingConfirm, true, '必须挂起等待显式应答')
+    assert.match(session.awaitingConfirmText, /\(y\/n\)/, '提示原文要能被带回给应答工具')
+    assert.ok(!changedOk(changes), '绝不能在未应答时记录成功')
+  } finally {
+    await teardown()
+  }
+})
+
+/** 变更记录里是否有「成功」——用于断言假成功不会落库 */
+function changedOk(changes) {
+  return changes.recent(10).some((c) => c.result === 'ok')
+}

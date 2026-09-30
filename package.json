@@ -1,6 +1,6 @@
 {
   "name": "ensp-auto",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "description": "eNSP 网络实验的 AI 代理工作台",

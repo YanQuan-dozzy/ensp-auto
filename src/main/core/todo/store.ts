@@ -55,7 +55,12 @@ export class TodoStore {
   }
 
   private persist(): void {
-    atomicWriteJsonSync(this.file, this.data)
+    // D4（PERF-MEM-REVIEW-2026-09-29 §4.2）：清单关掉 fsync。
+    // 清单是**派生数据** —— 它的全部内容来自模型本轮的 `todo_update`，
+    // 丢了最多是这一轮的进度提示重来一次（模型会重新规划），没有任何别处
+    // 依赖它。而写盘节奏跟着模型往返走（一次长实验几十次），每次一个
+    // `fsyncSync` 都在同步阻塞主进程。
+    atomicWriteJsonSync(this.file, this.data, { fsync: false })
   }
 
   get(ownerId: string): TodoItem[] {

@@ -4,7 +4,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mergeLayers } from '../.build/harness.mjs'
+import { mergeLayers, emptyTopology } from '../.build/harness.mjs'
 
 const file = {
   nodes: [
@@ -262,4 +262,93 @@ test('mergeLayers：墓碑压制 file/discovered 同端点链路——文件重�
     }
   )
   assert.equal(t.links.length, 0)
+})
+
+// —— 多线并接（同一对设备多条物理连线）：链路身份 = 设备对 + lineKey ——
+
+/** 核心层双归：Core1↔Core2 并接两条线（各自端口、各自线标识） */
+const twoLines = () => ({
+  nodes: [],
+  links: [
+    { id: 'f#0', from: 'C1', to: 'C2', label: 'GE0/0/1 ↔ GE0/0/1', lineKey: 'GE0/0/1->GE0/0/1', source: 'file' },
+    { id: 'f#1', from: 'C1', to: 'C2', label: 'GE0/0/2 ↔ GE0/0/2', lineKey: 'GE0/0/2->GE0/0/2', source: 'file' }
+  ],
+  updatedAt: 1
+})
+
+test('mergeLayers：同设备对并接多条线各自成条（不再被合并成一根线）', () => {
+  const t = mergeLayers(twoLines(), emptyTopology(), { nodes: [], links: [] })
+  assert.equal(t.links.length, 2)
+  assert.deepEqual(
+    t.links.map((l) => l.label).sort(),
+    ['GE0/0/1 ↔ GE0/0/1', 'GE0/0/2 ↔ GE0/0/2']
+  )
+  assert.equal(new Set(t.links.map((l) => l.id)).size, 2)
+})
+
+test('mergeLayers：discovered 与 file 的同一条线（同端口对）去重，file 权威', () => {
+  const discovered = {
+    nodes: [],
+    links: [
+      { id: 'd#0', from: 'C1', to: 'C2', label: 'LLDP', lineKey: 'GE0/0/1->GE0/0/1', source: 'discovered' },
+      { id: 'd#1', from: 'C1', to: 'C2', label: 'LLDP2', lineKey: 'GE0/0/2->GE0/0/2', source: 'discovered' },
+      { id: 'd#2', from: 'C1', to: 'C2', label: 'LLDP3', lineKey: 'GE0/0/3->GE0/0/3', source: 'discovered' }
+    ],
+    updatedAt: 1
+  }
+  const t = mergeLayers(twoLines(), discovered, { nodes: [], links: [] })
+  assert.equal(t.links.length, 3) // 前两条与 file 同一条线（file 权威），第三条补缺
+  assert.equal(t.links.filter((l) => l.source === 'file').length, 2)
+  assert.equal(t.links.filter((l) => l.source === 'discovered').length, 1)
+})
+
+test('mergeLayers：按条删除只删命中的那条线（同设备对另一条保留）', () => {
+  const t = mergeLayers(twoLines(), emptyTopology(), {
+    nodes: [],
+    links: [
+      {
+        from: 'C1',
+        to: 'C2',
+        label: 'GE0/0/1 ↔ GE0/0/1',
+        lineKey: 'GE0/0/1->GE0/0/1',
+        deleted: true,
+        source: 'manual'
+      }
+    ]
+  })
+  assert.equal(t.links.length, 1)
+  assert.equal(t.links[0].lineKey, 'GE0/0/2->GE0/0/2')
+})
+
+test('mergeLayers：不带 lineKey 的历史墓碑按设备对生效（整对断开）', () => {
+  const t = mergeLayers(twoLines(), emptyTopology(), {
+    nodes: [],
+    links: [{ from: 'C1', to: 'C2', deleted: true, source: 'manual' }]
+  })
+  assert.equal(t.links.length, 0)
+})
+
+test('mergeLayers：标注偏移按线落库——只影响命中那条线，另一条保持 file 原样', () => {
+  const t = mergeLayers(twoLines(), emptyTopology(), {
+    nodes: [],
+    links: [
+      {
+        id: 'f#1',
+        from: 'C1',
+        to: 'C2',
+        label: 'GE0/0/2 ↔ GE0/0/2',
+        lineKey: 'GE0/0/2->GE0/0/2',
+        source: 'manual',
+        portOffsets: { from: [{ x: 12, y: -20 }] }
+      }
+    ]
+  })
+  assert.equal(t.links.length, 2)
+  const hit = t.links.find((l) => l.lineKey === 'GE0/0/2->GE0/0/2')
+  assert.deepEqual(hit.portOffsets, { from: [{ x: 12, y: -20 }] })
+  assert.equal(hit.source, 'manual')
+  assert.equal(hit.label, 'GE0/0/2 ↔ GE0/0/2')
+  const other = t.links.find((l) => l.lineKey === 'GE0/0/1->GE0/0/1')
+  assert.equal(other.portOffsets, undefined)
+  assert.equal(other.source, 'file')
 })

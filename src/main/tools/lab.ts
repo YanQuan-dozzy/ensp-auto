@@ -3,6 +3,7 @@ import path from 'node:path'
 import { buildLabGuide } from '../core/lab/guide'
 import { fail, ok, Type, type ToolSpec } from './registry'
 import { safeFileName } from '@shared/naming'
+import { linkPairKey } from '@shared/topology-link'
 
 /**
  * 备课文档导出（v1.8 / 参照 ensp-skills 的 ensp-lab-authoring Phase 5「产出教程」）。
@@ -77,7 +78,16 @@ export const exportLabGuide: ToolSpec<{
         }
       })
 
-    const links = topo.links.map((l) => ({ from: l.from, to: l.to }))
+    // 同设备对并接多条链路在 mermaid 里只画一条（多条会重复渲染同一根边，图反而更糊）
+    const pairSeen = new Set<string>()
+    const links = topo.links
+      .filter((l) => {
+        const key = linkPairKey(l.from, l.to)
+        if (pairSeen.has(key)) return false
+        pairSeen.add(key)
+        return true
+      })
+      .map((l) => ({ from: l.from, to: l.to }))
     const body = buildLabGuide({
       title: args.title.trim(),
       ...(args.objective ? { objective: args.objective } : {}),

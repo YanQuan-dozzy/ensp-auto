@@ -5,11 +5,15 @@ import path from 'node:path'
 /**
  * 拓扑文件发现（v1.2，参照 ensp-mcp find_topology_files）。
  *
- * 在用户常用目录（桌面 / 文档 / 下载）或指定目录下递归寻找 *.topo，返回结构化候选列表，
- * 供 UI 快捷导入与 AI 代理自选拓扑。只读文件元数据（mtime），不读文件内容。
+ * 在用户常用目录（桌面 / 文档 / 下载）或指定目录下递归寻找工程文件（*.topo 与
+ * eNSP 实验包 *.paper），返回结构化候选列表，供 UI 快捷导入与 AI 代理自选拓扑。
+ * 只读文件元数据（mtime），不读文件内容。
  *
  * 排序：活动拓扑 > 目录同名（<dir>.topo）> 最近修改 > 路径字典序；结果截断到 maxResults。
  */
+
+/** 认作拓扑工程的扩展名：明文工程 .topo、实验包 .paper */
+const TOPOLOGY_EXTS = ['.topo', '.paper']
 
 export interface TopoFileCandidate {
   path: string
@@ -111,7 +115,7 @@ export function findTopologyFiles(opts?: FindTopologyOptions): FindTopologyResul
       try {
         if (ent.isDirectory()) {
           if (!SKIP_DIRS.has(ent.name.toLowerCase())) walk(full, depth + 1)
-        } else if (ent.isFile() && ent.name.toLowerCase().endsWith('.topo')) {
+        } else if (ent.isFile() && TOPOLOGY_EXTS.some((x) => ent.name.toLowerCase().endsWith(x))) {
           const resolved = path.resolve(full)
           if (candidatePaths.has(resolved)) continue
           candidatePaths.add(resolved)

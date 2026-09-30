@@ -17,6 +17,7 @@
 
 import { hostInNetwork, interlinkPair, loopbackIp } from './ipPlan'
 import type { Topology, TopologyNode, TopologyLink } from '@shared/types'
+import { linkPairKey } from '@shared/topology-link'
 
 export type TaskKind =
   | 'pc_connectivity'
@@ -221,11 +222,22 @@ export function buildExperimentPlan(
   // —— 3) 互联网段：拓扑链路两端都是已编号设备才规划 ——
   const interlinks: PlannedLink[] = []
   const adjacency = new Map<string, Map<string, { port?: string }>>()
+  /**
+   * 同一对设备并接多条链路时**只规划一条**互联网段。
+   *
+   * 为什么必须拦：拓扑层现在按「条」出链路（多线并接会出多条），而互联网段是按设备编号
+   * 对 (`10.0.<lo><hi>.0/24`) 算的 —— 同一个设备对算两次会得到重复网段与重复 IP，
+   * 下发时变成「同一网段配两遍」。冗余链路在 eNSP 实验里是备份关系，不是两个网段。
+   */
+  const plannedPairs = new Set<string>()
   for (const l of topology.links) {
     if (l.deleted) continue
     const na = numOf.get(l.from)
     const nb = numOf.get(l.to)
     if (!na || !nb) continue
+    const pairKey = linkPairKey(l.from, l.to)
+    if (plannedPairs.has(pairKey)) continue
+    plannedPairs.add(pairKey)
     const ports = parseLinkPorts(l.label)
     // 邻接表（静态路由 BFS 用）；同一对设备多条链路只记首条端口
     if (!adjacency.has(l.from)) adjacency.set(l.from, new Map())

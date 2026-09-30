@@ -97,7 +97,7 @@ export function DiagPanel(): ReactNode {
     try {
       const picked = await window.api.ensp.pickExe()
       if (!picked?.exePath) return
-      await updateSettings({ ensp: { exePath: picked.exePath } })
+      await updateSettings({ ensp: { ...useApp.getState().settings.ensp, exePath: picked.exePath } })
       await run()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))

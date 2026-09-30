@@ -16,6 +16,7 @@ import {
   parseDeviceInterfaces,
   resolveInterfaceName,
   importTopologyFile,
+  isDashedLineType,
   MAX_TOPO_FILE_BYTES
 } from '../.build/harness.mjs'
 
@@ -126,8 +127,8 @@ const XML_REAL = `<?xml version="1.0" encoding="UNICODE"?>
 test('parseTopoXml：真机新版格式（<dev> + <line> + 自闭合 interfacePair + cx/cy）', () => {
   const { topology, report } = parseTopoXml(XML_REAL)
   assert.equal(report.devices, 5)
-  // Core1↔Core2 两条 interfacePair 去重为 1 条链路
-  assert.equal(report.links, 4)
+  // 每个 interfacePair 各自成一条链路（多线并接不再合并成一根线）
+  assert.equal(report.links, 5)
   assert.equal(report.warnings.length, 0)
 
   const core1 = topology.nodes.find((n) => n.name === 'Core1')
@@ -138,8 +139,16 @@ test('parseTopoXml：真机新版格式（<dev> + <line> + 自闭合 interfacePa
   // 无 com_port（=0）的 PC 不打 deviceId
   assert.equal(topology.nodes.find((n) => n.name === 'PC1').deviceId, undefined)
 
-  assert.ok(topology.links.some((l) => l.from === 'Core1' && l.to === 'Core2'))
-  assert.equal(topology.links.filter((l) => l.from === 'Core1' && l.to === 'Core2').length, 1)
+  // Core1↔Core2 两条 interfacePair → 两条独立链路，各自带自己的接口标注与线标识
+  const core12 = topology.links.filter((l) => l.from === 'Core1' && l.to === 'Core2')
+  assert.equal(core12.length, 2)
+  assert.deepEqual(
+    core12.map((l) => l.label).sort(),
+    ['GE0/0/1 ↔ GE0/0/1', 'GE0/0/2 ↔ GE0/0/2']
+  )
+  assert.equal(new Set(core12.map((l) => l.lineKey)).size, 2, '同设备对内的两条线必须有各自的 lineKey')
+  assert.equal(new Set(core12.map((l) => l.id)).size, 2, '链路 id 必须唯一（React Flow 边 id 直接用它）')
+  assert.ok(core12.every((l) => l.lineType === 'Copper'))
   // interfacePair 只有 lineName，绝不能把它当端点
   assert.ok(!topology.links.some((l) => l.from === 'Copper' || l.to === 'Copper'))
 })
@@ -290,7 +299,7 @@ test('parseTopoXml：成对 <dev> 内部接口表 + line srcIndex/tarIndex → �
   assert.equal(link.label, 'GE0/0/1 ↔ GE0/0/10') // R1 srcIndex=1 → GE0/0/1；SW1 tarIndex=9 → GE0/0/10
 })
 
-test('parseTopoXml：同端点对多条 interfacePair → label 全部合并不截断（并联链路标注）', () => {
+test('parseTopoXml：同端点对多条 interfacePair → 各自成一条链路（多线并接不再合并）', () => {
   const xml = `<topo>
   <devices>
     <dev name="C1" model="S5700"><slot number="s"><interface interfacename="GE" count="24"/></slot></dev>
@@ -305,9 +314,38 @@ test('parseTopoXml：同端点对多条 interfacePair → label 全部合并不�
   </lines>
 </topo>`
   const { topology, report } = parseTopoXml(xml)
-  assert.equal(report.links, 1) // 同端点对去重为 1 条
-  const link = topology.links[0]
-  assert.equal(link.label, 'GE0/0/1 ↔ GE0/0/1 / GE0/0/2 ↔ GE0/0/2 / GE0/0/3 ↔ GE0/0/3') // 三对全保留，交换机从 1 起
+  assert.equal(report.links, 3) // 三对 interfacePair → 三条链路
+  assert.deepEqual(
+    topology.links.map((l) => l.label),
+    ['GE0/0/1 ↔ GE0/0/1', 'GE0/0/2 ↔ GE0/0/2', 'GE0/0/3 ↔ GE0/0/3'] // 交换机 1-based，逐条独立标注
+  )
+  assert.deepEqual(
+    topology.links.map((l) => l.lineKey),
+    ['GE0/0/1->GE0/0/1', 'GE0/0/2->GE0/0/2', 'GE0/0/3->GE0/0/3']
+  )
+  assert.equal(new Set(topology.links.map((l) => l.id)).size, 3)
+})
+
+test('parseTopoXml：Serial 链路类型被解析并归一到 eNSP 写法（渲染层据此走虚线）', () => {
+  const xml = `<topo>
+  <devices>
+    <dev name="R1" model="AR2220"><slot><interface interfacename="Serial" count="2"/></slot></dev>
+    <dev name="R2" model="AR2220"><slot><interface interfacename="Serial" count="2"/></slot></dev>
+  </devices>
+  <lines>
+    <line srcDeviceID="R1" destDeviceID="R2">
+      <interfacePair lineName="serial" srcIndex="0" tarIndex="0"/>
+    </line>
+    <line srcDeviceID="R1" destDeviceID="R2">
+      <interfacePair lineName="Serial" srcIndex="1" tarIndex="1"/>
+    </line>
+  </lines>
+</topo>`
+  const { topology } = parseTopoXml(xml)
+  assert.equal(topology.links.length, 2)
+  assert.ok(topology.links.every((l) => l.lineType === 'Serial'), 'lineName 归一为 Serial（大小写容错）')
+  assert.ok(topology.links.every((l) => isDashedLineType(l.lineType)), 'Serial 族 → 虚线绘制')
+  assert.ok(topology.links.every((l) => l.label.startsWith('Serial')), '串口标注保留 Serial 全名')
 })
 
 test('parseTopoXml：旧版 interfacePair 自带 name 端点 + srcIndex/tarIndex → label', () => {

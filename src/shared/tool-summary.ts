@@ -87,6 +87,8 @@ const TOOL_CATEGORY: Record<string, ToolCategory> = {
   save_config_snapshot: 'edit',
   save_topo_file: 'edit',
   save_configuration: 'edit',
+  // v2.30：清空启动配置同样是「改配置」（下发一条破坏性命令）
+  reset_saved_configuration: 'edit',
   rename_device: 'edit',
   refresh_topology: 'edit',
   answer_device_prompt: 'edit',

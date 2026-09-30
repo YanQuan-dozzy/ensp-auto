@@ -11,8 +11,10 @@ import { Chip, Switch } from '@/components/ui'
  * 并且**把后果写在开关旁边**。本项目的安全模型是「只读自由执行 / 变更留痕可回滚 /
  * 破坏性操作人工闸门」，这里的两个开关各自松动其中一环：
  *
- * - 关掉「危险操作确认」= 闸门不再弹出。危险工具仍会被命令级清单拦一层
- *   （classifyDanger），但那层只管设备命令，管不了工具语义；
+ * - 关掉「危险操作确认」= 闸门不再弹出，**命令级危险清单（classifyDanger）同步放行**
+ *   （v2.28 修：此前只松了工具级闸门，清单仍硬拦 reboot / reset saved-configuration，
+ *   于是「关了开关还拦着」—— 与界面文案再次不一致）。多行命令是唯一例外，
+ *   它是判定的前提而不是分类，关开关也拦（见 shared/gate-policy.ts#planCommandGate）；
  * - 打开「外部工具一律确认」= 逐台服务器的「信任」失效，全部回到人工确认。
  *
  * 两者都是即时生效（settings:set 每次落盘），所以不设「保存」按钮 ——
@@ -29,7 +31,7 @@ export function PermissionPanel(): ReactNode {
       <Section label="设备操作">
         <Row
           title="危险操作需人工确认"
-          desc="重启设备、清空配置、恢复出厂、保存当前配置这类不可撤销的操作，执行前弹确认框。确认框里会给出将要下发的命令与后果说明。"
+          desc="重启设备、清空配置、恢复出厂、保存当前配置这类不可撤销的操作，执行前弹确认框；同时启用命令级危险清单（reboot / reset saved-configuration / save 等）。关闭后两层一起放行：不再弹确认框，清单也不再拦截。"
           control={
             <Switch
               checked={settings.permission.confirmDanger}
@@ -43,7 +45,9 @@ export function PermissionPanel(): ReactNode {
         />
         {!settings.permission.confirmDanger ? (
           <div className="banner danger">
-            已关闭确认框：代理可以直接执行重启、清空配置、恢复出厂等破坏性操作，且没有回滚手段。
+            已关闭确认框：代理可以直接执行重启、清空配置、恢复出厂等破坏性操作，命令级危险清单
+            同步放行，且没有回滚手段。唯一例外是多行命令（\r / \n 分隔）：
+            设备会逐行执行、单条判定管不住第二行，因此该形态始终拦截。
             这一项只建议在做一次性实验、并且设备可以随时重装时打开。
           </div>
         ) : (
@@ -53,7 +57,7 @@ export function PermissionPanel(): ReactNode {
         )}
         <Row
           title="被拦截的命令"
-          desc="除上面的开关外，命令级危险清单始终生效：命中即拦截并写入变更记录，不依赖提示词（提示词能被模型绕过，清单不能）。"
+          desc="上面的开关打开时（默认），命令级危险清单生效：命中即拦截并写入变更记录，不依赖提示词（提示词能被模型绕过，清单不能）。关闭开关后本清单放行，仅多行命令例外。"
           stacked
           control={
             <details className="cand-details">

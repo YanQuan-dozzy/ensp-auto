@@ -3,6 +3,7 @@ import path from 'node:path'
 import type { Device } from '@shared/types'
 import { deriveTopology, type TopologyProbe } from '../core/topology/fromNeighbors'
 import { readTopoFile, MAX_TOPO_FILE_BYTES } from '../core/topology/fromProjectFile'
+import { readPaperFile } from '../core/topology/fromPaper'
 import { findTopologyFiles, type FindTopologyResult } from '../core/topology/findFiles'
 import { writeTopoFile } from '../core/topology/toProjectFile'
 import { launchTopologyFile, resolveEnspExe } from '../core/ensp/launcher'
@@ -104,7 +105,7 @@ export const findTopologyFilesTool: ToolSpec<{
 }> = {
   name: 'find_topology_files',
   description:
-    '在本机查找 eNSP 工程文件（.topo）：若配置了拓扑工程目录则首选该目录，缺省亦扫描桌面/文档/下载，也可指定 directory 扫描特定路径。' +
+    '在本机查找 eNSP 工程文件（.topo）与实验包（.paper）：若配置了拓扑工程目录则首选该目录，缺省亦扫描桌面/文档/下载，也可指定 directory 扫描特定路径。' +
     '返回结构化候选列表（路径、来源、修改时间、是否当前活动拓扑）。' +
     '仅在用户明确要求查找/查看拓扑文件或协助定位时使用，严禁自主盲目自动导入！',
   risk: 'read',
@@ -151,19 +152,21 @@ export const findTopologyFilesTool: ToolSpec<{
 }
 
 /**
- * 工程文件解析（F-5.2，来源一）：导入 eNSP .topo 作为拓扑第一来源。
- * 白名单：仅 .topo 扩展、resolve 后不逃逸出任意目录、文件存在。
+ * 工程文件解析（F-5.2，来源一）：导入 eNSP .topo 工程或 .paper 实验包作为拓扑第一来源。
+ * 白名单：仅 .topo / .paper 扩展、resolve 后不逃逸出任意目录、文件存在。
+ * .paper 取包内 .topo 成员解析（实验说明与设备配置暂不消费）。
  */
 export const importTopologyFile: ToolSpec<{ path: string }> = {
   name: 'import_topology_file',
   description:
-    '导入并替换当前拓扑画布为指定的 eNSP 工程文件（.topo）：设备（name/model/坐标/com_port）与接口链路。' +
+    '导入并替换当前拓扑画布为指定的 eNSP 工程文件（.topo）或实验包（.paper）：设备（name/model/坐标/com_port）与接口链路。' +
+    '.paper 为 eNSP 实验包，自动取其中的 .topo 成员解析。' +
     '会更新当前拓扑并隔离重置上一工程数据。' +
     '仅在用户明确指定路径或明确指示导入时调用，严禁未经用户许可擅自导入任何文件！',
   risk: 'write',
   scope: 'local',
   schema: Type.Object(
-    { path: Type.String({ description: '.topo 文件的绝对路径' }) },
+    { path: Type.String({ description: '.topo 或 .paper 文件的绝对路径' }) },
     { additionalProperties: false }
   ),
   summarize: (args, result) => {
@@ -174,8 +177,9 @@ export const importTopologyFile: ToolSpec<{ path: string }> = {
     const t0 = Date.now()
     const filePath = args.path?.trim() ?? ''
     // —— 白名单校验（防目录穿越/伪造扩展）——
-    if (path.extname(filePath).toLowerCase() !== '.topo') {
-      return fail('BAD_PARAM', '只支持 .topo 文件', { ms: Date.now() - t0 })
+    const ext = path.extname(filePath).toLowerCase()
+    if (ext !== '.topo' && ext !== '.paper') {
+      return fail('BAD_PARAM', '只支持 .topo / .paper 文件', { ms: Date.now() - t0 })
     }
     const resolved = path.resolve(filePath)
     // v1.8：path.resolve 已把 `..` 归一化，旧检查恒为 false（徒增安心感）。
@@ -183,18 +187,19 @@ export const importTopologyFile: ToolSpec<{ path: string }> = {
     if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
       return fail('BAD_PARAM', `文件不存在：${resolved}`, { ms: Date.now() - t0 })
     }
-    // v2.13：.topo 是明文 XML 或小体积 gzip，超大文件只可能是误选/攻击载荷；
+    // v2.13：工程文件是明文 XML / 小体积 gzip / 实验包，超大文件只可能是误选/攻击载荷；
     // 不加这道门就是整份 readFileSync + 可能的 gunzip，主进程会被直接撑爆
     if (fs.statSync(resolved).size > MAX_TOPO_FILE_BYTES) {
-      return fail('BAD_PARAM', `工程文件超过 ${MAX_TOPO_FILE_BYTES / 1024 / 1024} MB 上限，请确认选对了 .topo 文件`, {
+      return fail('BAD_PARAM', `工程文件超过 ${MAX_TOPO_FILE_BYTES / 1024 / 1024} MB 上限，请确认选对了 .topo / .paper 文件`, {
         ms: Date.now() - t0
       })
     }
 
     try {
-      const { topology, report } = readTopoFile(resolved)
+      const { topology, report } =
+        ext === '.paper' ? readPaperFile(resolved) : readTopoFile(resolved)
       if (report.devices === 0) {
-        return fail('UNKNOWN', `未能从 .topo 中识别设备（${report.warnings[0] ?? '格式未知'}）`, { ms: Date.now() - t0 })
+        return fail('UNKNOWN', `未能从 ${ext} 中识别设备（${report.warnings[0] ?? '格式未知'}）`, { ms: Date.now() - t0 })
       }
       ctx.topology.setFile(topology, resolved)
       return ok({ topology, report, path: resolved }, { ms: Date.now() - t0 })

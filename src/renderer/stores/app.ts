@@ -39,6 +39,8 @@ export const useApp = create<AppState>((set, get) => ({
   activeTab: 'terminal',
 
   messages: [],
+  // R3：流式中的 assistant 正文不进 messages（见 appState.streamingText）
+  streamingText: null,
   agentRunning: false,
   agentRuntime: 'react',
   gate: null,
@@ -68,6 +70,7 @@ export const useApp = create<AppState>((set, get) => ({
 
   topology: { nodes: [], links: [], updatedAt: 0 },
   topologyRefreshing: false,
+  topoLoading: null,
   // F11 回放：由「轨迹」标签页写入，拓扑画布只读消费
   topoHighlightDeviceId: null,
 

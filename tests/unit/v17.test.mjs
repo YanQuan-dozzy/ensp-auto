@@ -342,21 +342,25 @@ test('默认设置：重试默认开、压缩默认开且预算合理', () => {
   assert.equal(DEFAULT_SETTINGS.retry.enabled, true)
   assert.equal(DEFAULT_SETTINGS.retry.maxRetries, 2)
   assert.equal(DEFAULT_SETTINGS.compaction.enabled, true)
-  // v2.9：轮数与窗口上调后，字符预算必须同量级（20 万字符 ≈ 6.3 万 token，
-  // 只有 256k 窗口的 24% —— 会让 token 判据永远轮不到触发，窗口白抬）
-  assert.equal(DEFAULT_SETTINGS.compaction.transcriptMaxChars, 800_000)
+  // v2.28：字符预算是**与窗口无关的绝对上限**，不能跟着 contextWindow 走 ——
+  // 实测：窗口填 512k 时 token 判据要等 384k tokens，80 万字符的字符判据也够不到，
+  // 一次 33 轮的任务两条判据全都没触发，累计输入 174 万 tokens。
+  assert.equal(DEFAULT_SETTINGS.compaction.transcriptMaxChars, 200_000)
+  assert.equal(DEFAULT_SETTINGS.compaction.toolResultMaxChars, 8_000)
   assert.equal(DEFAULT_SETTINGS.compaction.keepRounds, 8)
   assert.ok(DEFAULT_SETTINGS.compaction.toolResultMaxChars < DEFAULT_SETTINGS.compaction.transcriptMaxChars)
 })
 
-test('v2.9 upgradeCompactionDefaults：只抬停在旧默认值上的两项，用户调过的不动', () => {
-  const old = { ...DEFAULT_COMPACTION, transcriptMaxChars: 200_000, keepRounds: 4 }
+test('upgradeCompactionDefaults：只抬停在旧出厂值上的三项，用户调过的不动', () => {
+  // v2.9 的出厂值：80 万字符 + 单条 1.2 万 + 保留 4 轮
+  const old = { ...DEFAULT_COMPACTION, transcriptMaxChars: 800_000, toolResultMaxChars: 12_000, keepRounds: 4 }
   const up = upgradeCompactionDefaults(old)
-  assert.equal(up.transcriptMaxChars, 800_000)
+  assert.equal(up.transcriptMaxChars, 200_000)
+  assert.equal(up.toolResultMaxChars, 8_000)
   assert.equal(up.keepRounds, 8)
 
-  // 用户特意调小的预算必须原样保留（想早点压缩、省 token 是合理需求）
-  const tuned = { ...DEFAULT_COMPACTION, transcriptMaxChars: 120_000, keepRounds: 2 }
+  // 用户特意调过的预算必须原样保留（想早点压缩省 token、想让单条回显更完整，都是合理需求）
+  const tuned = { ...DEFAULT_COMPACTION, transcriptMaxChars: 120_000, toolResultMaxChars: 20_000, keepRounds: 2 }
   assert.equal(upgradeCompactionDefaults(tuned), tuned)
 
   // 已经是新值时不动（幂等，返回原对象）

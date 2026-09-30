@@ -26,7 +26,7 @@ import type {
   TopoImportPayload
 } from '@shared/api'
 import type { Attachment } from '@shared/attachments'
-import type { ConnectAllProgress, GateView, MainTab, QuestionView, UiMessage } from './storeUtil'
+import type { ConnectAllProgress, GateView, MainTab, QuestionView, TopoLoadProgress, UiMessage } from './storeUtil'
 import type { QuestionAnswers, TodoItem } from '@shared/interaction'
 
 export interface AppState {
@@ -50,6 +50,24 @@ export interface AppState {
   activeTab: MainTab
 
   messages: UiMessage[]
+  /**
+   * R3（PERF-MEM-REVIEW-2026-09-29 §三）：**正在流式输出的那条** assistant 正文。
+   *
+   * 为什么它不在 `messages` 里：
+   * ① `messages` 每来一个 delta 就换引用，于是 `AgentPanel` 的渲染管线
+   *    （`dropEmptyMessages` → `hoistTrailingThinking` → `groupMessages` → `splitTurns`）
+   *    每个 token 重跑一遍 —— 200 条消息的会话就是每 token 4 趟 O(n) 遍历
+   *    + 约 200 个对象/数组分配，50 token/s 即 4 万次遍历/秒；
+   * ② 更要命的是 `messages` 一换引用，历史轮的 `FinalResponseView` 虽然靠
+   *    memo 跳过了 React 工作，可 `MarkdownView` 的 `text` 正是这条正在增长的
+   *    字符串 —— `react-markdown` 对一篇持续变长的文档**全量重新解析**，
+   *    成本 O(len²)（R1）。
+   *
+   * 提成独立字段后，`messages` 在**整段流式输出期间保持同一引用** ⇒ 上面的
+   * 四趟遍历全被 useMemo 命中、`MarkdownView` 的 memo 也自然命中。
+   * 段落被「收束」（下一个非 text 事件 / `done`）时才并进 `messages`。
+   */
+  streamingText: string | null
   agentRunning: boolean
   agentRuntime: 'react' | 'mock'
   gate: GateView | null
@@ -109,6 +127,11 @@ export interface AppState {
 
   topology: Topology
   topologyRefreshing: boolean
+  /**
+   * 拓扑导入/加载进度（v2.29）：大工程导入时画布要跑布局 + 走线，几十毫秒到几百毫秒
+   * 的同步计算会让界面「僵住」，用户会以为卡死。null = 当前没有加载在跑。
+   */
+  topoLoading: TopoLoadProgress | null
   /** F11 回放：高亮当前步骤操作的设备；null = 不高亮 */
   topoHighlightDeviceId: string | null
 
@@ -132,7 +155,18 @@ export interface AppState {
 
   clearTopology: () => Promise<void>
   refreshTopology: () => Promise<void>
+  /** v2.29：写入/推进拓扑加载进度（null = 收尾，进度条消失） */
+  setTopoLoading: (p: TopoLoadProgress | null) => void
   saveManualTopology: (input: { nodes: TopologyNode[]; links: TopologyLink[] }) => Promise<void>
+  /**
+   * v2.31：把全部设备坐标恢复成 eNSP 工程里的原始摆布（`srcX`/`srcY`）。
+   *
+   * 为什么需要：手动层（`source: 'manual'`）一旦被自适应布局/拖动写过坐标，就会**永久覆盖**
+   * 工程文件里的摆放 —— 关掉「导入后自动重排」开关只防新的覆盖，防不了已经写进磁盘的旧坐标。
+   * 于是历史上被重排过的工程，重新导入看到的仍是算法布局，用户会以为「开关没生效」。
+   * 这个动作把手动层里的坐标改回源坐标（等价于撤销坐标覆盖），让画布回到工程原样。
+   */
+  restoreSourceLayout: () => Promise<void>
   /** v0.6 F-5.6：删除节点/链路（主进程打墓碑，跨刷新持久生效） */
   removeTopology: (input: { nodeIds?: string[]; linkKeys?: string[] }) => Promise<void>
   /** v1.0 前置：弹窗选择 .topo 导入（F-5.2）；返回 null 表示用户取消或失败 */

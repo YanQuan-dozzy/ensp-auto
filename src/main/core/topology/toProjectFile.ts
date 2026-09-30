@@ -170,7 +170,7 @@ export function topologyToXml(topo: Topology, opts?: TopoWriteOptions): { xml: s
     const tarIndex = takeIndex(l.to)
     out.push(
       `        <line srcDeviceID="${srcId}" destDeviceID="${dstId}">` +
-        `<interfacePair lineName="Copper" srcIndex="${srcIndex}" srcBoundRectIsMoved="1" tarIndex="${tarIndex}" tarBoundRectIsMoved="1" /></line>`
+        `<interfacePair lineName="${escapeXml(l.lineType ?? 'Copper')}" srcIndex="${srcIndex}" srcBoundRectIsMoved="1" tarIndex="${tarIndex}" tarBoundRectIsMoved="1" /></line>`
     )
   }
   out.push('    </lines>')

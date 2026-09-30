@@ -6,7 +6,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { Edge, Node, OnSelectionChangeParams } from '@xyflow/react'
 import type { TopologyLink, TopologyNode, TopologyRole } from '@shared/types'
-import { linkKeyStr, type MenuState, type TopoNodeData } from './TopoRender'
+import { alignNodeSizes, centerToTopLeft, topLeftToCenter } from './layoutGrid'
+import { linkKeyStr, type MenuState, type TopoEdgeData, type TopoNodeData } from './TopoRender'
 
 export interface UseTopoEditingArgs {
   /** store 里的合并拓扑（实采 + 手动） */
@@ -47,6 +48,32 @@ export interface TopoEditingApi {
   onNodeClick: (e: React.MouseEvent, node: Node) => void
   closeDetail: () => void
 }
+
+/**
+ * 画布坐标（React Flow 的**左上角**）→ store 坐标（**设备框中心**）。
+ *
+ * 为什么必须换算：store 与布局内核统一用中心口径（背景方格的十字交点要压在设备中心），
+ * 而 React Flow 只认左上角。不换算的后果是「改一次名 / 拖一次设备，设备就整体挪半个框」。
+ *
+ * 尺寸取**偶数口径**（`alignNodeSizes`）与画布渲染同源 —— 换角色后尺寸会变，
+ * `roleOverride` 让调用方按新角色取尺寸，避免用旧尺寸换算又偏一次。
+ */
+function centerOf(
+  id: string,
+  topLeft: { x: number; y: number },
+  nodes: TopologyNode[],
+  roleOverride?: TopologyRole
+): { x: number; y: number } {
+  const node = nodes.find((n) => n.id === id)
+  const sizes = alignNodeSizes(
+    roleOverride && node ? [{ ...node, id: `${id}`, role: roleOverride }] : node ? [node] : []
+  )
+  const size = sizes.get(id) ?? { w: 130, h: 52 }
+  return topLeftToCenter(topLeft, size)
+}
+
+/** 仅用于类型自检：确认 centerToTopLeft 与 centerOf 互为逆运算（编译期即可发现漂移） */
+export const __centerHelpers = { centerToTopLeft, centerOf }
 
 export function useTopoEditing(args: UseTopoEditingArgs): TopoEditingApi {
   const { topology, flowNodes, flowEdges, manualNodes, manualLinks, saveManual, removeTopology, endDrag, canvasRef } =
@@ -102,7 +129,8 @@ export function useTopoEditing(args: UseTopoEditingArgs): TopoEditingApi {
       name: trimmed,
       role: node.role,
       ...(node.model ? { model: node.model } : {}),
-      ...(cur ? { x: cur.x, y: cur.y } : {}),
+      // 画布坐标（左上角）→ store 坐标（中心）：不换算会把设备整体挪半个框
+      ...(cur ? centerOf(id, cur, topologyNodes) : {}),
       source: 'manual'
     }
     const others = mNodes.filter((n) => n.id !== id)
@@ -123,7 +151,8 @@ export function useTopoEditing(args: UseTopoEditingArgs): TopoEditingApi {
         name: node.name,
         role,
         ...(node.model ? { model: node.model } : {}),
-        ...(cur ? { x: cur.x, y: cur.y } : {}),
+        // 画布坐标（左上角）→ store 坐标（中心）；角色变了尺寸可能变，用**新角色**的尺寸
+        ...(cur ? centerOf(id, cur, topology.nodes, role) : {}),
         source: 'manual'
       }
       const others = manualNodes.filter((n) => n.id !== id)
@@ -144,10 +173,14 @@ export function useTopoEditing(args: UseTopoEditingArgs): TopoEditingApi {
 
   const deleteEdges = useCallback(
     (edgeIds: string[]) => {
+      // 删除粒度 = **一条线**（`data.identity` = 设备对 + 线标识）：同设备对并接的其它线
+      // 不该被连坐删掉。旧边（手拖出来还未经过 store 重建的）没有 identity 时退回设备对。
       const keys = edgeIds
         .map((eid) => {
           const e = flowEdges.find((x) => x.id === eid)
-          return e ? linkKeyStr(e.source, e.target) : null
+          if (!e) return null
+          const identity = (e.data as TopoEdgeData | undefined)?.identity
+          return identity ?? linkKeyStr(e.source, e.target)
         })
         .filter((k): k is string => !!k)
       if (keys.length === 0) return
@@ -158,6 +191,7 @@ export function useTopoEditing(args: UseTopoEditingArgs): TopoEditingApi {
     [flowEdges, removeTopology]
   )
 
+  /** 断开一台设备的**全部**连线：按设备对粒度（同对多条线一起断开） */
   const disconnectNode = useCallback(
     (id: string) => {
       const keys = topology.links
@@ -165,7 +199,7 @@ export function useTopoEditing(args: UseTopoEditingArgs): TopoEditingApi {
         .map((l) => linkKeyStr(l.from, l.to))
       setMenu(null)
       if (keys.length === 0) return
-      void removeTopology({ linkKeys: keys })
+      void removeTopology({ linkKeys: [...new Set(keys)] })
     },
     [topology.links, removeTopology]
   )
@@ -182,13 +216,13 @@ export function useTopoEditing(args: UseTopoEditingArgs): TopoEditingApi {
         name: d.label,
         role: d.role,
         ...(typeof d.model === 'string' && d.model ? { model: d.model } : {}),
-        x: node.position.x,
-        y: node.position.y,
+        // 画布左上角 → store 中心口径（见 centerOf 注释）
+        ...centerOf(node.id, node.position, topology.nodes),
         source: 'manual'
       }
       void saveManual({ nodes: [...others, moved], links: manualLinks })
     },
-    [manualNodes, manualLinks, saveManual, endDrag]
+    [manualNodes, manualLinks, saveManual, endDrag, topology.nodes]
   )
 
   /** 右键菜单定位：菜单弹在画布内（贴边时收回，不溢出） */

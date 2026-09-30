@@ -335,7 +335,7 @@ export function McpDialog({ onClose }: { onClose: () => void }): ReactNode {
                               <span className="mono">
                                 mcp__{cfg.name}__{t.name}
                               </span>
-                              {t.description ? ` — ${t.description}` : ''}
+                              {t.description ? ` : ${t.description}` : ''}
                             </div>
                           ))}
                         </div>

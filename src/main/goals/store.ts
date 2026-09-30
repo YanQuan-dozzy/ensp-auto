@@ -56,7 +56,9 @@ export class GoalArchiveStore {
 
   /** 原子写（统一口径：唯一临时名 + rename + 失败清理） */
   private persist(): void {
-    atomicWriteJsonSync(this.file, this.data)
+    // D4：关掉 fsync —— 这份存档是**派生数据**（用户在界面随手存的一句话目标），
+    // 没有别处依赖它；而写盘频率跟着会话数增长，是长期跑着的那条路径。
+    atomicWriteJsonSync(this.file, this.data, { fsync: false })
   }
 
   list(): GoalArchivePayload {

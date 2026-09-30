@@ -160,6 +160,16 @@ export const EVENT = {
   terminalClear: 'terminal:cleared',
   agentEvent: 'agent:event',
   topologyUpdated: 'topology:updated',
+  /**
+   * 渲染层发起拓扑导入时的「进度条起点」信号（v2.31）。
+   *
+   * 为什么需要它：`topology:import-file` 是「弹文件选择框 → 用户挑文件 → 解析」一路串行，
+   * 渲染层 `invoke` 之后拿不到任何中间状态 —— 若在 invoke 之前就点亮进度条，弹框期间
+   * （用户还在翻目录）进度条会一直亮着说「正在解析」，是谎报；若等 invoke 返回再点亮，
+   * 解析已经结束了，条一闪而过。故主进程在**真正开始解析**的那一刻推一条这个事件，
+   * 渲染层据此置位，进度条的起点就精确落在「选完文件」上。
+   */
+  topologyImportStarted: 'topology:import-started',
   sessionListUpdated: 'session:list-updated',
   skillsUpdated: 'skills:updated',
   mcpStatus: 'mcp:status',

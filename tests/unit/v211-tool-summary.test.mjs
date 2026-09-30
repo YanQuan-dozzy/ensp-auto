@@ -110,7 +110,7 @@ const ALL_TOOL_NAMES = [
   'get_device_context', 'get_topology', 'import_topology_file', 'list_devices',
   'list_lab_templates', 'list_sessions', 'list_snapshots', 'lookup_vrp_command',
   'plan_experiment', 'read_attachment', 'read_image', 'refresh_topology', 'register_device',
-  'rename_device', 'restore_snapshot', 'rollback_task', 'run_lab_template',
+  'rename_device', 'reset_saved_configuration', 'restore_snapshot', 'rollback_task', 'run_lab_template',
   'run_show_command', 'save_config_snapshot', 'save_configuration', 'save_topo_file',
   'scan_devices', 'ssh_connect', 'ssh_list', 'todo_write',
   'unregister_device', 'verify_arp', 'verify_connectivity', 'verify_dhcp',
@@ -118,14 +118,14 @@ const ALL_TOOL_NAMES = [
   'verify_route'
 ]
 
-test('覆盖面：全部 51 个工具都已登记类别（无漏网）', () => {
+test('覆盖面：全部 52 个工具都已登记类别（无漏网）', () => {
   const unregistered = ALL_TOOL_NAMES.filter((n) => !isRegisteredTool(n))
   assert.deepEqual(unregistered, [], `以下工具未登记类别：${unregistered.join(', ')}`)
 })
 
-test('覆盖面：清单本身无重复且数量为 51', () => {
-  assert.equal(ALL_TOOL_NAMES.length, 51)
-  assert.equal(new Set(ALL_TOOL_NAMES).size, 51)
+test('覆盖面：清单本身无重复且数量为 52', () => {
+  assert.equal(ALL_TOOL_NAMES.length, 52)
+  assert.equal(new Set(ALL_TOOL_NAMES).size, 52)
 })
 
 test('覆盖面：清单与 TOOLS 注册表双向对账（防清单自身漏登记）', () => {

@@ -10,7 +10,8 @@ import {
   applyConfig,
   verifyExpectation,
   restoreSnapshot,
-  saveConfiguration
+  saveConfiguration,
+  resetSavedConfiguration
 } from '../.build/harness.mjs'
 import { MockVrp } from '../mock-device/MockVrp.mjs'
 
@@ -38,7 +39,7 @@ function configHandlers(extra = []) {
   ]
 }
 
-async function setup({ handlers = [], mockOpts = {}, gate = true } = {}) {
+async function setup({ handlers = [], mockOpts = {}, gate = true, confirmDanger = true } = {}) {
   const mock = new MockVrp({ ...mockOpts, handlers: configHandlers(handlers) })
   const port = await mock.listen()
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensp-auto-it-'))
@@ -60,6 +61,8 @@ async function setup({ handlers = [], mockOpts = {}, gate = true } = {}) {
       }
     },
     settings: {},
+    // v2.28：命令级清单放行资格由出口显式给出（缺省 false = 保守拦截）
+    commandGateRelease: confirmDanger === false,
     snapshots,
     changes,
     requestGate: async (req) => {
@@ -681,6 +684,173 @@ test('apply_config：规范命令集不产生 preflight 噪声', async () => {
       undefined,
       '不该有预检告警：' + JSON.stringify(res.data.preflight)
     )
+  } finally {
+    await teardown()
+  }
+})
+
+// ————————————————— v2.30：用户视图命令 / 目标视图 / 假成功安全网 / 清空启动配置 ————————————————
+
+/** 只回确认提示、不给提示符 —— 真实设备此时确实不发提示符 */
+const confirmHandler = (match, promptText) => ({
+  match,
+  respond: () => ({ text: promptText, noPrompt: true })
+})
+
+test('apply_config view:user：先 return 回用户视图，不再被顶到系统视图（实测翻车点的正解）', async () => {
+  // confirmDanger:false = 用户已关掉「危险操作需人工确认」，与实测场景一致（否则危险命令会被闸门拦在视图问题之前）
+  const { mock, session, deviceId, ctx, teardown } = await setup({
+    confirmDanger: false,
+    handlers: [
+      { match: /^return$/i, respond: () => ({ text: '', prompt: '<Huawei>' }) },
+      confirmHandler(
+        /^reset saved-configuration$/i,
+        'The configuration will be erased to reconfigure. Continue? [Y/N]:'
+      )
+    ]
+  })
+  try {
+    // 上一段会话把设备留在系统视图
+    await session.exec('system-view')
+    assert.equal(session.view, 'system')
+    mock.receivedCommands.length = 0
+
+    const res = await applyConfig.handler(
+      {
+        deviceId,
+        commands: ['reset saved-configuration'],
+        description: '清空启动配置',
+        view: 'user'
+      },
+      ctx
+    )
+    const seq = mock.receivedCommands
+    assert.ok(!seq.includes('system-view'), 'view:user 时不得再进系统视图')
+    assert.equal(seq[seq.indexOf('return') + 1], 'reset saved-configuration')
+    // 命令确实到了设备并停在确认提示（与真实设备一致）
+    assert.equal(res.ok, false)
+    assert.equal(res.error.code, 'INCOMPLETE')
+    assert.equal(session.isAwaitingConfirm, true)
+  } finally {
+    await teardown()
+  }
+})
+
+test('apply_config 默认视图：用户视图命令失败时点破真正原因（不再是通用 Unrecognized 提示）', async () => {
+  // confirmDanger:false = 用户已关掉「危险操作需人工确认」，与实测场景一致（命令被放行后才会撞上视图问题）
+  const { mock, deviceId, ctx, teardown } = await setup({ confirmDanger: false })
+  try {
+    const res = await applyConfig.handler(
+      { deviceId, commands: ['reset saved-configuration'], description: '清空启动配置' },
+      ctx
+    )
+    assert.equal(res.ok, false)
+    assert.equal(res.error.code, 'UNRECOGNIZED')
+    assert.ok(mock.receivedCommands.includes('system-view'), '默认视图下确实会先进系统视图')
+    assert.match(res.error.message, /用户视图命令/, '失败文案必须点破「这是用户视图命令」')
+    assert.match(res.error.message, /view:'user'/, '并给出可照做的参数写法')
+    const rule = (res.data.preflight ?? []).find((f) => f.rule === 'user-view-command-in-system-view')
+    assert.ok(rule, '结构化预检里也要有这条（模型先看预检就能少走一遍弯路）')
+  } finally {
+    await teardown()
+  }
+})
+
+test('apply_config：回显收尾却没有提示符 → UNSETTLED，绝不报成功（AR3 假成功的出口）', async () => {
+  const { mock, deviceId, changes, ctx, teardown } = await setup({
+    handlers: [
+      // 有回显、以换行收尾，但设备一个提示符都不发
+      { match: /^sysname Silent$/i, respond: () => ({ text: 'Info: saving to flash...', noPrompt: true }) },
+      { match: /^next-command$/i, respond: () => ({ text: 'should never run' }) }
+    ]
+  })
+  try {
+    const res = await applyConfig.handler(
+      { deviceId, commands: ['sysname Silent', 'next-command'], description: '触发无提示符收尾' },
+      ctx
+    )
+    assert.equal(res.ok, false)
+    assert.equal(res.error.code, 'UNSETTLED')
+    assert.deepEqual(res.data.applied, [], '出问题的命令不算已下发')
+    assert.equal(res.data.unsettled.command, 'sysname Silent')
+    assert.ok(!mock.receivedCommands.includes('next-command'), '状态未知时绝不能继续下发')
+    assert.ok(res.data.diagnosis, '带结构化诊断，便于模型取证')
+    assert.equal(changes.latest(deviceId).result, 'failed')
+  } finally {
+    await teardown()
+  }
+})
+
+test('apply_config：提示符没被宿主名锁定（ip pool 视图）也不算状态未知（防误报）', async () => {
+  const { deviceId, ctx, teardown } = await setup({
+    handlers: [{ match: /^ip pool vlan10$/i, respond: () => ({ text: '', prompt: '[Huawei-ip-pool-vlan10]' }) }]
+  })
+  try {
+    /*
+     * `[Huawei-ip-pool-vlan10]` 会被拆成 host=`Huawei-ip-pool`，与锁定的宿主名不符 →
+     * 通信层不认它是提示符（settled=quiet、prompt=''），但设备其实是正常的。
+     * 安全网必须靠「尾部形状」把它与「停在未识别提示上」区分开，否则 DHCP 这类视图会误报。
+     */
+    const res = await applyConfig.handler(
+      { deviceId, commands: ['ip pool vlan10'], description: '建地址池' },
+      ctx
+    )
+    assert.ok(res.ok, JSON.stringify(res.error))
+    assert.deepEqual(res.data.applied, ['ip pool vlan10'])
+  } finally {
+    await teardown()
+  }
+})
+
+test('reset_saved_configuration：用户视图 + 自动代答 [Y/N] + 落变更记录（danger）', async () => {
+  const { mock, session, deviceId, changes, ctx, teardown } = await setup({
+    handlers: [
+      { match: /^return$/i, respond: () => ({ text: '', prompt: '<Huawei>' }) },
+      confirmHandler(
+        /^reset saved-configuration$/i,
+        'The configuration will be erased to reconfigure. Continue? [Y/N]:'
+      ),
+      { match: /^y$/i, respond: () => ({ text: 'Succeeded in clearing the configuration.' }) }
+    ]
+  })
+  try {
+    assert.equal(resetSavedConfiguration.risk, 'danger', '清空启动配置必须过人工闸门')
+    await session.exec('system-view')
+    mock.receivedCommands.length = 0
+
+    const res = await resetSavedConfiguration.handler(
+      { deviceId, reason: '实验前清空设备配置' },
+      ctx
+    )
+    assert.ok(res.ok, JSON.stringify(res.error))
+    assert.equal(res.data.cleared, true)
+    assert.equal(res.data.answered, true, '获批后应代答它自己触发的那次提示')
+    const seq = mock.receivedCommands
+    assert.ok(!seq.includes('system-view'), '这条命令只认用户视图，不得先顶到系统视图')
+    assert.equal(seq[seq.indexOf('return') + 1], 'reset saved-configuration')
+    assert.ok(seq.includes('y'))
+
+    const change = changes.latest(deviceId)
+    assert.equal(change.result, 'ok')
+    assert.deepEqual(change.commands, ['reset saved-configuration'])
+    assert.equal(change.description, '实验前清空设备配置')
+  } finally {
+    await teardown()
+  }
+})
+
+test('reset_saved_configuration：设备不弹确认时照样成功，且不额外下发 y', async () => {
+  const { mock, deviceId, ctx, teardown } = await setup({
+    handlers: [
+      { match: /^return$/i, respond: () => ({ text: '', prompt: '<Huawei>' }) },
+      { match: /^reset saved-configuration$/i, respond: () => ({ text: 'Succeeded in clearing.' }) }
+    ]
+  })
+  try {
+    const res = await resetSavedConfiguration.handler({ deviceId, reason: '清空' }, ctx)
+    assert.ok(res.ok, JSON.stringify(res.error))
+    assert.equal(res.data.answered, false)
+    assert.ok(!mock.receivedCommands.includes('y'), '没有提示就绝不下发 y')
   } finally {
     await teardown()
   }

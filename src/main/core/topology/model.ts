@@ -5,6 +5,7 @@ import type {
   TopologyRole,
   TopologySource
 } from '@shared/types'
+import { linkIdentity, linkPairKey } from '@shared/topology-link'
 
 /**
  * 拓扑领域模型（v0.3 / F-5.x）。
@@ -32,8 +33,9 @@ export function guessRole(name: string, model?: string): TopologyRole {
   return 'unknown'
 }
 
+/** 无向**设备对** key（≠ 一条线：两台设备之间可以并接多条，见 @shared/topology-link） */
 export function linkKey(a: string, b: string): string {
-  return a < b ? `${a}|${b}` : `${b}|${a}`
+  return linkPairKey(a, b)
 }
 
 /**
@@ -110,48 +112,133 @@ export function mergeLayers(
   applyLayer(discovered.nodes, 'discovered', false)
   applyLayer(manual.nodes, 'manual', true)
 
-  const byKey = new Map<string, TopologyLink>()
-  const putLink = (l: TopologyLink): void => {
-    const key = linkKey(l.from, l.to)
-    const prevLink = byKey.get(key)
-    if (!prevLink) {
-      byKey.set(key, { ...l, id: l.id || `l-${key}` })
+  /**
+   * —— 链路合并：身份分两级（这是「两台设备多条并接」修复的核心）——
+   *
+   * - **按条**：链路带 `lineKey`（工程文件、LLDP 实采、画布上手拖的线都有）→ 按
+   *   「设备对 + 线标识」各自成条。同一个设备对有几条线就出几条，互不覆盖 ——
+   *   修复前按设备对去重，并联的第二条线会被吞掉（画布上只有一根线）。
+   * - **按设备对**：链路没有 `lineKey`（旧版本持久化的条目）→ 保持历史语义：同设备对
+   *   去重、手动条目覆盖 file/discovered、墓碑压掉整对。旧数据因此无需迁移，
+   *   也不会因为「身份变了」而多出幽灵线或让已删除的链路复活。
+   */
+  const lines = new Map<string, TopologyLink>()
+  /** 设备对 → 该设备对下已登记的条目 key（保序，供「按设备对」的旧语义条目落位） */
+  const linesOfPair = new Map<string, string[]>()
+  const indexLine = (key: string, pair: string): void => {
+    const list = linesOfPair.get(pair)
+    if (list) {
+      if (!list.includes(key)) list.push(key)
       return
     }
-    const prevDeleted = !!prevLink.deleted
+    linesOfPair.set(pair, [key])
+  }
+  const putLine = (l: TopologyLink, pair: string): void => {
+    const key = linkIdentity(l)
+    const prev = lines.get(key)
+    if (!prev) {
+      lines.set(key, { ...l, id: l.id || `l-${key}` })
+      indexLine(key, pair)
+      return
+    }
+    const prevDeleted = !!prev.deleted
     const nextDeleted = !!l.deleted
-    const prevManual = prevLink.source === 'manual'
+    const prevManual = prev.source === 'manual'
     const nextManual = l.source === 'manual'
     // 1) 手动层内部墓碑/活条目并存：活条目优先（重连复活语义，并兼容旧持久化数据的两种顺序）
     if (prevManual && nextManual && prevDeleted !== nextDeleted) {
-      if (!nextDeleted) byKey.set(key, { ...l, id: l.id || prevLink.id, deleted: false })
+      if (!nextDeleted) lines.set(key, { ...l, id: l.id || prev.id, deleted: false })
       return
     }
-    // 2) 删除墓碑压制其它层（file/discovered）的同端点活条目：跨层删除跨刷新持久生效；
-    //    重新导入文件也只代表「物理链路存在」，不自动复活用户显式删除的链路
-    if (prevManual && prevDeleted) return
-    if (nextManual && nextDeleted) {
-      byKey.set(key, { ...l, id: l.id || prevLink.id })
-      return
-    }
+    // 2) 手动条目覆盖：label/lineType 只有显式给了才覆盖（旧行为：不带 label 的覆盖条目
+    //    不得把 file 的接口标注冲掉），其余字段（portOffsets）以手动层为准
     if (nextManual) {
-      // 手动链路的 label/端口永远覆盖
-      byKey.set(key, { ...prevLink, ...l, deleted: l.deleted, source: 'manual', id: prevLink.id || l.id })
+      lines.set(key, {
+        ...prev,
+        ...l,
+        deleted: l.deleted,
+        source: 'manual',
+        id: prev.id || l.id,
+        lineKey: prev.lineKey ?? l.lineKey,
+        label: l.label ?? prev.label,
+        lineType: l.lineType ?? prev.lineType
+      })
       return
     }
-    if (prevLink.source === 'file') return // file 权威：同端点不再被 discovered 覆盖
-    byKey.set(key, { ...prevLink, ...l, id: prevLink.id || l.id })
+    // 3) 手动层已就位（含墓碑）→ file/discovered 不得覆盖；file 权威，discovered 仅补缺
+    if (prevManual || prev.source === 'file') return
+    lines.set(key, { ...prev, ...l, id: prev.id || l.id })
   }
 
-  for (const l of [...(file?.links ?? []), ...discovered.links, ...manual.links]) {
-    putLink(l)
+  /** 「按设备对」的旧语义条目（无 lineKey）：同设备对只留一条，file 权威 */
+  const putPairLine = (l: TopologyLink, pair: string): void => {
+    const key = `${pair}|`
+    const prev = lines.get(key)
+    if (!prev) {
+      lines.set(key, { ...l, id: l.id || `l-${key}` })
+      indexLine(key, pair)
+      return
+    }
+    if (prev.source === 'file' || prev.deleted || prev.source === 'manual') return
+    lines.set(key, { ...prev, ...l, id: prev.id || l.id })
+  }
+
+  // 第一层/第二层：file 最权威，discovered 补缺 —— 均按「条」登记
+  for (const l of [...(file?.links ?? []), ...discovered.links]) {
+    const pair = linkPairKey(l.from, l.to)
+    if (l.lineKey) putLine(l, pair)
+    else putPairLine(l, pair) // 旧持久化数据里的条目（无 lineKey）
+  }
+
+  // 第三层：手动层
+  // 3a) 带 lineKey 的条目 → 按条合并（标注偏移就落在这一支：身份与目标线一致才算同一条线）
+  for (const l of manual.links) {
+    if (!l.lineKey) continue
+    putLine(l, linkPairKey(l.from, l.to))
+  }
+  // 3b) 不带 lineKey 的历史条目 → 按设备对：活条目覆盖该设备对的**首条**线（旧行为里
+  //     一个设备对只有一条线，故等价），墓碑压掉该设备对的**全部**线（整对断开语义）
+  const pairTombstones = new Set<string>()
+  const pairLive = new Map<string, TopologyLink>()
+  for (const l of manual.links) {
+    if (l.lineKey) continue
+    const pair = linkPairKey(l.from, l.to)
+    if (l.deleted) pairTombstones.add(pair)
+    else pairLive.set(pair, l)
+  }
+  for (const [pair, entry] of pairLive) {
+    pairTombstones.delete(pair) // 活条目复活同设备对的墓碑（重连语义）
+    const first = linesOfPair.get(pair)?.[0]
+    if (!first) {
+      const key = `${pair}|`
+      lines.set(key, { ...entry, id: entry.id || `l-${key}` })
+      indexLine(key, pair)
+      continue
+    }
+    const prev = lines.get(first)!
+    lines.set(first, {
+      ...prev,
+      ...entry,
+      deleted: false,
+      source: 'manual',
+      id: prev.id || entry.id,
+      lineKey: prev.lineKey ?? entry.lineKey,
+      label: entry.label ?? prev.label,
+      lineType: entry.lineType ?? prev.lineType
+    })
+  }
+  for (const pair of pairTombstones) {
+    for (const key of linesOfPair.get(pair) ?? []) {
+      const prev = lines.get(key)
+      if (prev && !prev.deleted) lines.set(key, { ...prev, deleted: true, source: 'manual' })
+    }
   }
 
   // 删除墓碑（v0.6 F-5.6）：manual 层的 deleted 标记过滤对应节点/链路，跨刷新与跨层生效。
   // 注意：链路不做「端点节点存在性」过滤——旧行为允许 deviceId 对齐/占位邻居等
   // 端点不在当前节点集内的链路保留，渲染层会用 roleOf 自行过滤。
   const liveNodes = [...nodeById.values()].filter((n) => !n.deleted)
-  const liveLinks = [...byKey.values()].filter((l) => !l.deleted)
+  const liveLinks = [...lines.values()].filter((l) => !l.deleted)
 
   return { nodes: liveNodes, links: liveLinks, updatedAt: Date.now() }
 }

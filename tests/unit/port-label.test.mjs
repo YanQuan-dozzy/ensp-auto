@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { splitPortLabel, shortIf } from '../.build/harness.mjs'
+import { splitPortLabel, shortIf, toFlowNodes } from '../.build/harness.mjs'
 
 // —— 接口标注拆分（每端独立显示，参照 ensp- 参考实现的 srcIf / dstIf 分端展示）——
 
@@ -51,4 +51,42 @@ test('shortIf：多对合并 label 中的每个接口名都会被简写', () => 
     { from: ports.from.map(shortIf), to: ports.to.map(shortIf) },
     { from: ['GE0/0/1', 'GE0/0/3'], to: ['Eth0/0/2', 'Eth0/0/4'] }
   )
+})
+
+// —— toFlowNodes 拓扑节点转换与高亮 ——
+
+test('toFlowNodes：无 highlightDeviceId 时所有节点 highlight 缺省', () => {
+  const nodes = [
+    { id: '127.0.0.1:2000', name: 'AR1', role: 'router', deviceId: '127.0.0.1:2000' },
+    { id: '127.0.0.1:2001', name: 'LSW1', role: 'switch', deviceId: '127.0.0.1:2001' }
+  ]
+  const flowNodes = toFlowNodes(nodes)
+  assert.equal(flowNodes[0].data.highlight, undefined)
+  assert.equal(flowNodes[1].data.highlight, undefined)
+})
+
+test('toFlowNodes：依据 deviceId、id 或 name（忽略大小写）准确定位并点亮高亮节点', () => {
+  const nodes = [
+    { id: '127.0.0.1:2000', name: 'AR1', role: 'router', deviceId: '127.0.0.1:2000' },
+    { id: 'dev-sw', name: 'LSW1', role: 'switch', deviceId: '127.0.0.1:2001' },
+    { id: 'neighbor:FW1', name: 'FW1', role: 'firewall' }
+  ]
+
+  // 按 deviceId 匹配
+  const byDevId = toFlowNodes(nodes, '127.0.0.1:2000')
+  assert.equal(byDevId[0].data.highlight, true)
+  assert.equal(byDevId[1].data.highlight, undefined)
+  assert.equal(byDevId[2].data.highlight, undefined)
+
+  // 按 node id 匹配
+  const byNodeId = toFlowNodes(nodes, 'dev-sw')
+  assert.equal(byNodeId[0].data.highlight, undefined)
+  assert.equal(byNodeId[1].data.highlight, true)
+  assert.equal(byNodeId[2].data.highlight, undefined)
+
+  // 按 name 忽略大小写匹配
+  const byName = toFlowNodes(nodes, 'fw1')
+  assert.equal(byName[0].data.highlight, undefined)
+  assert.equal(byName[1].data.highlight, undefined)
+  assert.equal(byName[2].data.highlight, true)
 })

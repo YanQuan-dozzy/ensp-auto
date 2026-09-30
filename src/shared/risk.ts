@@ -99,6 +99,15 @@ export interface DangerVerdict {
   reason?: string
   /** 后果说明，用于闸门弹窗展示 */
   consequence?: string
+  /**
+   * 该判定是否来自「多行命令」这条规则。
+   *
+   * 存在的意义：多行判定不是「危险分类」而是**分类的前提** —— 设备会逐行执行，
+   * 单条判定管不住第二行。所以「关掉确认框即放行危险命令」这条策略**放不了**它
+   * （见 shared/gate-policy.ts#planCommandGate）。调用方需要能区分这两种命中，
+   * 而不是只看 `dangerous`。
+   */
+  multiLine?: boolean
 }
 
 const CONSEQUENCES: Record<string, string> = {
@@ -130,6 +139,7 @@ export function classifyDanger(command: string): DangerVerdict {
   if (lines.length > 1) {
     return {
       dangerous: true,
+      multiLine: true,
       reason: `命令包含 ${lines.length} 行（\\r / \\n 分隔），设备会逐行依次执行`,
       consequence: `多行命令绕过了单条命令的判定，第二行起的内容未经审查。逐行内容：${lines
         .slice(1)
@@ -208,4 +218,34 @@ export function isViewNavigationCommand(command: string): boolean {
   if (lines.length !== 1) return false
   const first = canonicalizeCommand(lines[0]!).split(' ')[0] ?? ''
   return VIEW_NAV_COMMANDS.includes(first)
+}
+
+/**
+ * 必须在**用户视图**执行的 VRP 命令（v2.30）。
+ *
+ * 为什么需要这份清单：`apply_config` 会先把设备带到系统视图再逐条下发，而下面这些命令
+ * 只认用户视图 —— 在系统视图下发必然回 `Unrecognized command`。实测（2026-09-30）模型在
+ * 「清空 15 台配置」时对此毫无预期：先空跑 15 次 `UNRECOGNIZED`，再花多次调用试出
+ * 「前面加一条 `return`」的绕法，还要手动应答 `[Y/N]`。工具侧据此：
+ * - 预检直接点破「这条命令要在用户视图下发，请给 apply_config 传 view:'user'」；
+ * - 失败诊断在 `UNRECOGNIZED` 的常规根因之外，优先点出「这是用户视图命令」。
+ *
+ * 收词原则：只收**命令字**（去掉参数），判定用「整串 === 命令字 或 startsWith(命令字 + ' ')」。
+ * 刻意不收 `system-view` / `quit` / `return`（视图导航有自己的工具与护栏）；
+ * 也不收 `save` —— 它走预检的 save-in-apply 规则并已有专属工具 save_configuration。
+ */
+export const USER_VIEW_COMMANDS: readonly string[] = [
+  'reset saved-configuration',
+  'reset current-configuration',
+  'reboot'
+]
+
+/** 是否必须在用户视图执行的命令（只认单独一行；多行一律否） */
+export function isUserViewCommand(command: string): boolean {
+  const lines = splitCommandLines(command)
+  if (lines.length !== 1) return false
+  const c = canonicalizeCommand(lines[0]!)
+  return USER_VIEW_COMMANDS.some(
+    (item) => c === item || c.startsWith(item + ' ')
+  )
 }

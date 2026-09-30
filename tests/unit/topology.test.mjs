@@ -14,7 +14,11 @@ import {
   guessRole,
   emptyTopology,
   toMcpTools,
-  TOOLS
+  TOOLS,
+  linkPairKey,
+  linkIdentity,
+  normalizeLineType,
+  isDashedLineType
 } from '../.build/harness.mjs'
 
 function probe(id, name, model, neighbors) {
@@ -86,6 +90,50 @@ test('deriveTopology：两端相互上报只留一条链路，未知邻居生成
       (n) => n.name === 'AR1' && n.role === 'router' && n.deviceId === '127.0.0.1:2001'
     )
   )
+})
+
+test('deriveTopology：同一对设备两条并接链路各自成条（按端口对去重，不再按设备对吞掉）', async () => {
+  const lldp = ['GE0/0/1  SW1  GE0/0/1  120', 'GE0/0/2  SW1  GE0/0/2  120', ''].join('\n')
+  const t = await deriveTopology([probe('127.0.0.1:2001', 'AR1', 'AR2220', lldp)])
+  assert.equal(t.links.length, 2)
+  assert.deepEqual(
+    t.links.map((l) => l.lineKey).sort(),
+    ['GE0/0/1->GE0/0/1', 'GE0/0/2->GE0/0/2']
+  )
+  assert.deepEqual(
+    t.links.map((l) => l.label).sort(),
+    ['GE0/0/1 ↔ GE0/0/1', 'GE0/0/2 ↔ GE0/0/2']
+  )
+})
+
+test('链路身份与线型：设备对 / 一条线 / 虚线类型映射（多线并接与串口虚线的口径）', () => {
+  assert.equal(linkPairKey('C2', 'C1'), 'C1|C2')
+  assert.equal(
+    linkIdentity({ from: 'C1', to: 'C2', lineKey: 'GE0/0/1->GE0/0/1' }),
+    'C1|C2|GE0/0/1->GE0/0/1'
+  )
+  // 同设备对的两条线必须得到不同身份（否则手动层会互相顶掉、删除会连坐）
+  assert.notEqual(
+    linkIdentity({ from: 'C1', to: 'C2', lineKey: 'GE0/0/1->GE0/0/1' }),
+    linkIdentity({ from: 'C1', to: 'C2', lineKey: 'GE0/0/2->GE0/0/2' })
+  )
+  // 无 lineKey（历史数据）→ 末段为空，上层据此退回「按设备对」的旧语义
+  assert.equal(linkIdentity({ from: 'C1', to: 'C2' }), 'C1|C2|')
+  // lineName 归一化（大小写容错、空值不落字段、未知类型原样保留）
+  assert.equal(normalizeLineType(' copper '), 'Copper')
+  assert.equal(normalizeLineType('serial'), 'Serial')
+  assert.equal(normalizeLineType('POS'), 'POS')
+  assert.equal(normalizeLineType('ATM'), 'ATM')
+  assert.equal(normalizeLineType('Custom'), 'Custom')
+  assert.equal(normalizeLineType(''), undefined)
+  assert.equal(normalizeLineType(undefined), undefined)
+  // 线型映射：串口族虚线，铜缆/未知实线
+  assert.ok(isDashedLineType('Serial'))
+  assert.ok(isDashedLineType('e1'))
+  assert.ok(isDashedLineType('POS'))
+  assert.ok(!isDashedLineType('Copper'))
+  assert.ok(!isDashedLineType('Auto'))
+  assert.ok(!isDashedLineType(undefined))
 })
 
 test('deriveTopology：LLDP 未开启的设备被跳过，不产出节点错误', async () => {

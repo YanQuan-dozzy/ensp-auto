@@ -4,6 +4,7 @@ import {
   type TopologyLink,
   type TopologyNode
 } from './model'
+import { lineKeyOfPorts, linkIdentity } from '@shared/topology-link'
 
 /**
  * 邻居推导（来源二：实采做图，对应 PRD F-5.3）。
@@ -81,8 +82,8 @@ export async function deriveTopology(
   const links: TopologyLink[] = []
   const byName = new Map<string, TopologyNode>()
   const byId = new Map<string, TopologyNode>()
-  const seenLinks = new Set<string>()
-  const linkKey = (a: string, b: string): string => (a < b ? `${a}|${b}` : `${b}|${a}`)
+  /** 已产出的「线」集合：按设备对 + 端口对去重（同一物理链路的另一端也会报到它） */
+  const seenLines = new Set<string>()
 
   for (const p of probes) {
     const node: TopologyNode = {
@@ -135,13 +136,17 @@ export async function deriveTopology(
             })())
       if (!target) continue
       if (target.id === p.id) continue // 自环（邻居报自己）无意义
-      const key = linkKey(p.id, target.id)
-      if (seenLinks.has(key)) continue // 两端各自上报同一条链路时只留一条
-      seenLinks.add(key)
+      // 同一对设备之间可能有多条物理连线（不同接口），故去重键 = 设备对 + 端口对：
+      // 按设备对去重会把并联的第二条线吞掉（修复前的行为）。
+      const lineKey = lineKeyOfPorts(e.localIntf, e.neighborIntf)
+      const key = linkIdentity({ from: p.id, to: target.id, lineKey })
+      if (seenLines.has(key)) continue // 两端各自上报同一条链路时只留一条
+      seenLines.add(key)
       links.push({
-        id: `${p.id}->${target.id}:${e.localIntf}-${e.neighborIntf}`,
+        id: `${p.id}->${target.id}:${lineKey}`,
         from: p.id,
         to: target.id,
+        lineKey,
         label: `${e.localIntf} ↔ ${e.neighborIntf}`,
         source: 'discovered'
       })

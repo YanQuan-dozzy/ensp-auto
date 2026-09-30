@@ -192,6 +192,53 @@ test('preflight：VLAN ID 越界 与 save 卡 [Y/N]', () => {
   assert.ok(rulesOf(['sysname R1', 'save force']).includes('save-in-apply'))
 })
 
+// ————————————————— v2.30：用户视图命令 × 目标视图 —————————————————
+
+const USER_VIEW_RULE = 'user-view-command-in-system-view'
+
+test('preflight：用户视图命令落在系统视图批次里必须报（实测翻车点）', () => {
+  const f = preflightCommands(['reset saved-configuration'])
+  const hit = f.find((x) => x.rule === USER_VIEW_RULE)
+  assert.ok(hit, 'reset saved-configuration 在默认（系统视图）批次里必须报')
+  assert.equal(hit.level, 'warn')
+  assert.ok(hit.fix.includes("view:'user'"), '纠正建议必须给出可照做的参数写法')
+  assert.ok(preflightCommands(['reboot']).some((x) => x.rule === USER_VIEW_RULE))
+  assert.ok(preflightCommands(['reset current-configuration']).some((x) => x.rule === USER_VIEW_RULE))
+})
+
+test('preflight：显式 view:user 或批次里已有 return 时不报用户视图冲突', () => {
+  assert.deepEqual(
+    preflightCommands(['reset saved-configuration'], { view: 'user' }).filter((x) => x.rule === USER_VIEW_RULE),
+    [],
+    'view:user 时就不该再报（这条冲突已经由工具处理掉了）'
+  )
+  assert.deepEqual(
+    preflightCommands(['return', 'reset saved-configuration']).filter((x) => x.rule === USER_VIEW_RULE),
+    [],
+    '批次里先 return 回用户视图的写法能成功，不该误报'
+  )
+  // quit 只退一层（接口视图 → 系统视图），因此不能免除告警
+  assert.ok(
+    preflightCommands(['quit', 'reset saved-configuration']).some((x) => x.rule === USER_VIEW_RULE),
+    'quit 不足以回到用户视图，仍应报'
+  )
+})
+
+test('preflight：普通配置命令与 save 不受用户视图规则干扰（save 走自己的规则）', () => {
+  assert.deepEqual(rulesOf(['sysname R1', 'vlan batch 10', 'interface GigabitEthernet0/0/1']), [])
+  const save = preflightCommands(['save'])
+  assert.ok(save.some((x) => x.rule === 'save-in-apply'))
+  assert.ok(!save.some((x) => x.rule === USER_VIEW_RULE), 'save 已有专属规则，不重复报')
+})
+
+test('诊断表：UNSETTLED（回显结束但没回到提示符）有条目与可照做的纠正', () => {
+  assert.ok(VRP_ERROR_GUIDE.UNSETTLED, 'UNSETTLED 必须登记，否则假成功只能给出一句生硬报错')
+  const hint = explainVrpError('UNSETTLED', 'reset saved-configuration')
+  assert.ok(hint)
+  assert.ok(hint.hint.includes('reset saved-configuration'), '提示里要能看到是哪条命令')
+  assert.ok(hint.hint.includes('提示符'), '提示要点出「没有回到提示符」这一根因')
+})
+
 test('preflight：干净的命令集与空输入都不产生噪声', () => {
   assert.deepEqual(
     rulesOf([

@@ -400,10 +400,11 @@ test('v2.9 upgradeAgentDefaults：只抬被旧 UI 卡住的轮数（12 / 50）�
   assert.equal(upgradeAgentDefaults(a), a)
 })
 
-test('v2.9 迁移只在落盘版本落后时跑一次：之后用户主动填回的旧默认值不会被改回去', () => {
+test('v2.9/v2.28 迁移只在落盘版本落后时跑一次：之后用户主动填回的旧出厂值不会被改回去', () => {
   const dir = tmpRoot()
   const file = path.join(dir, 'ensp-auto.json')
-  // 老文件：version 1 + 出厂默认值（轮数 12、压缩 20 万字符 / 保留 4 轮）
+  // 老文件：version 1 + 出厂默认值
+  // （轮数 12、压缩 80 万字符 / 单条 1.2 万字符 / 保留 4 轮）
   fs.writeFileSync(
     file,
     JSON.stringify({
@@ -417,7 +418,7 @@ test('v2.9 迁移只在落盘版本落后时跑一次：之后用户主动填回
           activeProfileId: 'p-old',
           systemPrompt: ''
         },
-        compaction: { enabled: true, toolResultMaxChars: 12000, transcriptMaxChars: 200000, keepRounds: 4, pressureRatio: 0.75, summarize: true }
+        compaction: { enabled: true, toolResultMaxChars: 12000, transcriptMaxChars: 800000, keepRounds: 4, pressureRatio: 0.75, summarize: true }
       },
       aliases: {},
       recentPorts: []
@@ -428,24 +429,27 @@ test('v2.9 迁移只在落盘版本落后时跑一次：之后用户主动填回
   const s1 = new JsonStore(file).getSettings()
   assert.equal(s1.agent.profiles[0].maxRounds, 200, '旧默认轮数要被抬')
   assert.equal(s1.agent.profiles[0].contextWindow, 256000, '预置档旧窗口要被抬')
-  assert.equal(s1.compaction.transcriptMaxChars, 800000)
+  // v2.28：预算不再跟着窗口走 —— 80 万字符在 512k 窗口下永远不触发（实测长任务里压缩失效）
+  assert.equal(s1.compaction.transcriptMaxChars, 200000)
+  assert.equal(s1.compaction.toolResultMaxChars, 8000)
   assert.equal(s1.compaction.keepRounds, 8)
   // 迁移后立刻回写版本号，否则重启会重跑
-  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).version, 2)
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).version, 3)
 
-  // 用户主动把两个值改回旧默认：这是显式选择，不许再被迁移盖掉
+  // 用户主动把这两个值改回旧出厂值：这是显式选择，不许再被迁移盖掉 ——
+  // 靠的是「版本已是最新，迁移不再跑」，而不是「判据认不出这些值」
   const store = new JsonStore(file)
   const s2 = store.updateSettings({
     ...s1,
     agent: { ...s1.agent, profiles: [{ ...s1.agent.profiles[0], maxRounds: 50 }] },
-    compaction: { ...s1.compaction, transcriptMaxChars: 200000, keepRounds: 4 }
+    compaction: { ...s1.compaction, transcriptMaxChars: 800000, keepRounds: 4 }
   })
   assert.equal(s2.agent.profiles[0].maxRounds, 50)
-  assert.equal(s2.compaction.transcriptMaxChars, 200000)
+  assert.equal(s2.compaction.transcriptMaxChars, 800000)
 
   const reopened = new JsonStore(file).getSettings()
   assert.equal(reopened.agent.profiles[0].maxRounds, 50, '重启后仍是用户填的值')
-  assert.equal(reopened.compaction.transcriptMaxChars, 200000)
+  assert.equal(reopened.compaction.transcriptMaxChars, 800000)
   assert.equal(reopened.compaction.keepRounds, 4)
 })
 

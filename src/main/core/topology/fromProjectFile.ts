@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import { gunzipSync } from 'node:zlib'
 import { guessRole, type Topology, type TopologyLink, type TopologyNode } from './model'
+import { lineKeyOfPorts, normalizeLineType } from '@shared/topology-link'
 
 /**
  * 工程文件解析（来源一 / F-5.2）：eNSP .topo → 拓扑，三层降级的第一层。
@@ -42,7 +43,7 @@ export const MAX_TOPO_DECODED_BYTES = 64 * 1024 * 1024
  * 文本字节解码：严格 UTF-8 优先；非法（真机中文版 .topo 实为 GBK，且头部谎称
  * encoding="UNICODE"）时回退 GBK。与通信层 encoding.ts 同一套判据（严格校验优先）。
  */
-function decodeText(buf: Buffer): { text: string; encoding: 'utf8' | 'gbk' } {
+export function decodeText(buf: Buffer): { text: string; encoding: 'utf8' | 'gbk' } {
   try {
     return { text: new TextDecoder('utf-8', { fatal: true }).decode(buf), encoding: 'utf8' }
   } catch {
@@ -304,74 +305,90 @@ export function parseTopoXml(xml: string): TopoParseResult {
       ...(ifaces.length > 0 ? { interfaces: ifaces } : {}),
       ...(d.comPort ? { deviceId: `127.0.0.1:${d.comPort}` } : {}),
       ...(d.x !== undefined ? { x: d.x } : {}),
-      ...(d.y !== undefined ? { y: d.y } : {})
+      ...(d.y !== undefined ? { y: d.y } : {}),
+      // B4 第四批：把工程里的原始摆放另存一份。自适应布局会覆盖 x/y，但「优先按 eNSP
+      // 原始排布」需要知道源里是怎么摆的（哪台在左、哪台在上），故源坐标单独留档。
+      ...(d.x !== undefined ? { srcX: d.x } : {}),
+      ...(d.y !== undefined ? { srcY: d.y } : {})
     })
   }
   if (nodes.length === 0) {
     warnings.push('未识别到任何设备。若为新版格式或压缩变体，需按真机 .topo 样例校准解析器。')
   }
 
-  // label 合并器：同端点对多条 interfacePair → 「ifA ↔ ifB / ifA2 ↔ ifB2 …」，全部保留
-  // （与 ensp- 参考实现每个 interfacePair 一条独立连线的展示等价：并联链路每对都有标注，不截断）
-  const labelByKey = new Map<string, string[]>()
-  const seen = new Set<string>()
-  const resolveFor = (raw: string): string[] => {
-    const id = idByKey.get(raw.toLowerCase()) ?? raw
-    return ifacesById.get(id) ?? []
-  }
-  /** 端口序号 → 接口名（含交换机 1-based 偏移） */
+  // 端口序号 → 接口名（含交换机 1-based 偏移），供每对 interfacePair 各自成一条链路的标注/线标识
   const resolveIfLabel = (raw: string, index: number): string => {
     const id = idByKey.get(raw.toLowerCase()) ?? raw
-    return resolveInterfaceName(resolveFor(raw), index, switchByKey.get(id.toLowerCase()) ?? false)
+    const ifaces = ifacesById.get(id) ?? []
+    return resolveInterfaceName(ifaces, index, switchByKey.get(id.toLowerCase()) ?? false)
   }
-  const addFileLink = (rawA: string, rawB: string, label?: string): void => {
+
+  // 链路：**每个 interfacePair 一条独立链路**（B4 之后修复「两台设备多条并接只画一根线」）。
+  //
+  // 修复前是「同端点对去重成 1 条 + label 拼起来」：画布上只有一根线，四个接口标注挤在
+  // 两端，既看不出并联了多条链路，也无法按条删除/按条调整标注。现在每条线各自成实体：
+  // - `lineKey` = 「本端接口 -> 对端接口」，是设备对内区分线的稳定标识（跨刷新、跨导入不变）
+  // - `lineType` = eNSP 的 lineName（Copper / Serial / …），供渲染层区分线型（串口族走虚线）
+  const linkSeqOfPair = new Map<string, number>()
+  const addFileLink = (rawA: string, rawB: string, opts?: { label?: string; lineKey?: string; lineType?: string }): void => {
     const a = idByKey.get(rawA.toLowerCase()) ?? rawA
     const b = idByKey.get(rawB.toLowerCase()) ?? rawB
     if (a === b) return
-    const key = a < b ? `${a}|${b}` : `${b}|${a}`
-    if (!seen.has(key)) {
-      seen.add(key)
-      links.push({ id: `file-${a}->${b}`, from: a, to: b, source: 'file', ...(label ? { label } : {}) })
-      return
-    }
-    const prev = links.find((l) => l.id === `file-${a}->${b}`)
-    if (prev && label) {
-      labelByKey.set(key, labelByKey.get(key) ?? (prev.label ? [prev.label] : []))
-      const parts = labelByKey.get(key)!
-      if (!parts.includes(label)) {
-        parts.push(label)
-        prev.label = parts.join(' / ')
-      }
-    }
+    const pair = a < b ? `${a}|${b}` : `${b}|${a}`
+    const seq = linkSeqOfPair.get(pair) ?? 0
+    linkSeqOfPair.set(pair, seq + 1)
+    const lineType = normalizeLineType(opts?.lineType)
+    links.push({
+      id: `file-${a}->${b}#${seq}`,
+      from: a,
+      to: b,
+      source: 'file',
+      // 没有端口对信息（旧版/异常工程）→ **不落 lineKey**：这类线无法与实采的同一条线
+      // 区分，退回「按设备对」语义（file 权威、不重复出线），与修复前一致
+      ...(opts?.lineKey ? { lineKey: opts.lineKey } : {}),
+      ...(opts?.label ? { label: opts.label } : {}),
+      ...(lineType ? { lineType } : {})
+    })
   }
 
   // 1) 真机新版：<line srcDeviceID destDeviceID>（内部 interfacePair 仅含端口序号，无 name 端点）
   for (const m of xml.matchAll(/<\s*line\b([^>]*?)(?:\/>|>([\s\S]*?)<\/\s*line\s*>)/gi)) {
     const ids = extractLineEndpoints(m[1] ?? '')
     if (!ids) continue
+    const lineAttrs = parseAttrs(m[1] ?? '')
+    const lineTypeOfLine = lineAttrs['linename'] ?? lineAttrs['linetype']
     const inner = m[2] ?? ''
     let matched = false
     for (const ip of inner.matchAll(/<interfacePair\b([^>]*?)\/?\s*>/gi)) {
-      const idx = extractPairIndices(parseAttrs(ip[1] ?? ''))
+      const ipAttrs = parseAttrs(ip[1] ?? '')
+      const idx = extractPairIndices(ipAttrs)
       if (!idx) continue
       matched = true
-      addFileLink(
-        ids[0],
-        ids[1],
-        `${resolveIfLabel(ids[0], idx[0])} ↔ ${resolveIfLabel(ids[1], idx[1])}`
-      )
+      const srcIf = resolveIfLabel(ids[0], idx[0])
+      const dstIf = resolveIfLabel(ids[1], idx[1])
+      addFileLink(ids[0], ids[1], {
+        label: `${srcIf} ↔ ${dstIf}`,
+        lineKey: lineKeyOfPorts(srcIf, dstIf),
+        ...(ipAttrs['linename'] ?? ipAttrs['linetype'] ?? lineTypeOfLine
+          ? { lineType: ipAttrs['linename'] ?? ipAttrs['linetype'] ?? lineTypeOfLine! }
+          : {})
+      })
     }
-    if (!matched) addFileLink(ids[0], ids[1])
+    if (!matched) addFileLink(ids[0], ids[1], lineTypeOfLine ? { lineType: lineTypeOfLine } : undefined)
   }
   // 2) 旧版/他版：interfacePair 自带 name 端点（<fromdevice name="…"/>），兼容自闭合与成对
   for (const m of xml.matchAll(/<\s*interfacePair\b([^>]*?)(?:\/>|>([\s\S]*?)<\/interfacePair>)/gi)) {
     const pair = extractLinkEndpoints(`${m[1] ?? ''} ${m[2] ?? ''}`)
     if (!pair) continue
-    const idx = extractPairIndices(parseAttrs(m[1] ?? ''))
-    const label = idx
-      ? `${resolveIfLabel(pair[0], idx[0])} ↔ ${resolveIfLabel(pair[1], idx[1])}`
-      : undefined
-    addFileLink(pair[0], pair[1], label)
+    const attrs = parseAttrs(m[1] ?? '')
+    const idx = extractPairIndices(attrs)
+    const srcIf = idx ? resolveIfLabel(pair[0], idx[0]) : undefined
+    const dstIf = idx ? resolveIfLabel(pair[1], idx[1]) : undefined
+    const lineType = attrs['linename'] ?? attrs['linetype']
+    addFileLink(pair[0], pair[1], {
+      ...(srcIf && dstIf ? { label: `${srcIf} ↔ ${dstIf}`, lineKey: lineKeyOfPorts(srcIf, dstIf) } : {}),
+      ...(lineType ? { lineType } : {})
+    })
   }
 
   return {

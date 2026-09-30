@@ -1,6 +1,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { TerminalBuffer, DEFAULT_TERMINAL_BUFFER_BYTES } from '../.build/harness.mjs'
+import {
+  TerminalBuffer,
+  DEFAULT_TERMINAL_BUFFER_BYTES,
+  DEFAULT_TERMINAL_MAX_SEGMENTS
+} from '../.build/harness.mjs'
 
 /**
  * 终端回放缓冲（2026-09-25）。
@@ -98,4 +102,54 @@ test('TerminalBuffer：clear 清内容但序号不回退（水位不能倒退）
 
 test('TerminalBuffer：默认容量为 256KB', () => {
   assert.equal(DEFAULT_TERMINAL_BUFFER_BYTES, 256 * 1024)
+})
+
+// ——————————————————————————————————————————————————————————————
+// M4（PERF-MEM-REVIEW-2026-09-29 §4.1）：段数上限
+// ——————————————————————————————————————————————————————————————
+
+test('M4：逐字节回显不得撑出无界 segment 对象（字节上限挡不住这种形态）', () => {
+  // 设备分页续读 / 逐字符回显：每 chunk 1 字节。字节上限 256KB 要 26 万个 chunk
+  // 才触发，而那时段数早已是 26 万条对象（单设备 25~50MB）。
+  const buf = new TerminalBuffer(DEFAULT_TERMINAL_BUFFER_BYTES, 64)
+  for (let i = 0; i < 5000; i++) buf.append(utf8('x'), false)
+
+  assert.ok(
+    buf.segmentCount <= 64,
+    `段数没有上界：${buf.segmentCount} 条（上限 64）`
+  )
+  // 字节计数必须与实际保留内容一致，否则下一次 trim 会算错
+  assert.equal(
+    buf.byteLength,
+    buf.snapshot().reduce((n, s) => n + s.data.length, 0),
+    'bytes 记账与实际段内容不符'
+  )
+})
+
+test('M4：段数裁剪只能整段丢弃，不能切断（seq 仍严格单调）', () => {
+  const buf = new TerminalBuffer(1024 * 1024, 3)
+  buf.append(utf8('aaaaaa'), false)
+  buf.append(utf8('bbbbbb'), false)
+  buf.append(utf8('cccccc'), false)
+  buf.append(utf8('dddddd'), false)
+
+  assert.equal(buf.segmentCount, 3)
+  // 最旧的那段被整段丢掉，留下后三段（内容不被切开）
+  assert.deepEqual(
+    buf.snapshot().map((s) => s.data),
+    ['bbbbbb', 'cccccc', 'dddddd']
+  )
+})
+
+test('M4：每个 chunk 的 seq 必须严格递增（渲染层靠它水位去重，复用会丢字节）', () => {
+  const buf = new TerminalBuffer(1024 * 1024, 8)
+  const seqs = []
+  for (let i = 0; i < 40; i++) seqs.push(buf.append(utf8('x'), i % 2 === 0))
+
+  assert.equal(new Set(seqs).size, 40, '出现了重复 seq：渲染层会把后到的那条静默丢弃')
+  for (let i = 1; i < seqs.length; i++) {
+    assert.equal(seqs[i], seqs[i - 1] + 1, `seq 不连续：${seqs[i - 1]} → ${seqs[i]}`)
+  }
+  // 最后一段的 seq 必须是最后一次 append 的编号（快照水位依赖它）
+  assert.equal(buf.snapshot()[buf.snapshot().length - 1].seq, buf.lastSeq)
 })

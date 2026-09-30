@@ -18,7 +18,9 @@ import {
   diffLines,
   parseVersion,
   classifyDanger,
-  isReadOnlyCommand
+  isReadOnlyCommand,
+  isUserViewCommand,
+  CONFIRM_RE
 } from '../.build/harness.mjs'
 
 // ————————————————— 提示符解析与视图推断 —————————————————
@@ -245,6 +247,47 @@ test('只读白名单：display/show 通过，配置命令被拒', () => {
   }
   for (const bad of ['system-view', 'vlan 10', 'undo shutdown', 'save']) {
     assert.equal(isReadOnlyCommand(bad), false, `${bad} 不应通过白名单`)
+  }
+})
+
+// ————————————————— v2.30：确认提示形态（AR 路由器实测校准） —————————————————
+
+test('确认提示：方括号 [Y/N] 形态仍命中（含大小写/冒号/尾空白）', () => {
+  for (const tail of [
+    '[Y/N]',
+    '[y/n]',
+    '[Y/N]:',
+    'Are you sure to continue? [Y/N]:',
+    '[Y/N]\r'
+  ]) {
+    assert.ok(CONFIRM_RE.test(tail), `应命中确认提示：${JSON.stringify(tail)}`)
+  }
+})
+
+test('确认提示：圆括号 (y/n)[n] 形态命中（路由器二次确认，实测 AR2200）', () => {
+  for (const tail of [
+    '(y/n)[n]',
+    '(Y/N)[N]',
+    'Continue? (y/n)[n]:',
+    '(y/n)[n]\r',
+    'Continue? (y/n):'
+  ]) {
+    assert.ok(CONFIRM_RE.test(tail), `应命中确认提示：${JSON.stringify(tail)}`)
+  }
+})
+
+test('确认提示：普通提示符 / 正文不误命中', () => {
+  for (const tail of ['<Huawei>', '[Huawei]', '[Huawei-GigabitEthernet0/0/1]', '1.1.1.1', 'n']) {
+    assert.equal(CONFIRM_RE.test(tail), false, `不应命中：${JSON.stringify(tail)}`)
+  }
+})
+
+test('用户视图命令：reset saved-configuration / reboot 识别（v2.30）', () => {
+  for (const ok of ['reset saved-configuration', 'reset current-configuration', 'reboot', 'REBOOT']) {
+    assert.equal(isUserViewCommand(ok), true, `${ok} 应识别为用户视图命令`)
+  }
+  for (const bad of ['system-view', 'save', 'display version', 'vlan 10', 'reset saved-configuration\nreboot']) {
+    assert.equal(isUserViewCommand(bad), false, `${bad} 不应识别为用户视图命令`)
   }
 })
 

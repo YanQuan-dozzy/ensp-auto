@@ -1,10 +1,12 @@
 import path from 'node:path'
-import { INVOKE } from '@shared/channels'
+import { EVENT, INVOKE } from '@shared/channels'
 import { ipcMain } from 'electron'
 import { findTopologyFiles } from '../core/topology/findFiles'
 import { showOpenDialogSafe } from './dialogs'
 import type { TopologyLink, TopologyNode } from '@shared/types'
+import { sanitizePortOffsets } from '@shared/topology-ports'
 import { importTopoPath, toStr } from './helpers'
+import type { EmitFn } from './helpers'
 import type { Services } from '../services'
 import type { BrowserWindow } from 'electron'
 
@@ -13,7 +15,11 @@ import type { BrowserWindow } from 'electron'
  *
  * 本模块只做「校验 → 调服务 → 回传」，业务逻辑在 services / core。
  */
-export function registerTopologyIpc(services: Services, getWindow: () => BrowserWindow | null): void {
+export function registerTopologyIpc(
+  services: Services,
+  getWindow: () => BrowserWindow | null,
+  emit: EmitFn
+): void {
   ipcMain.handle(INVOKE.topologyClear, async () => {
     services.topology.clear()
     return services.topology.snapshot()
@@ -42,7 +48,10 @@ export function registerTopologyIpc(services: Services, getWindow: () => Browser
         : []
       const linkKeys = Array.isArray(args?.linkKeys)
         ? args.linkKeys.filter(
-            (v): v is string => typeof v === 'string' && /^[^|]+\|[^|]+$/.test(v)
+            // 两种粒度都收：
+            // - 设备对 `A|B`（断开设备 / 旧渲染层）
+            // - 线标识 `A|B|本端接口->对端接口`（按条删除；lineKey 缺省时末段为空）
+            (v): v is string => typeof v === 'string' && /^[^|]+\|[^|]+(\|.*)?$/.test(v)
           )
         : []
       return services.topology.remove({ nodeIds, linkKeys })
@@ -56,10 +65,13 @@ export function registerTopologyIpc(services: Services, getWindow: () => Browser
     const result = await showOpenDialogSafe(win, {
       title: '导入 eNSP 工程文件',
       defaultPath,
-      filters: [{ name: 'eNSP 工程', extensions: ['topo'] }],
+      filters: [{ name: 'eNSP 工程（.topo / .paper）', extensions: ['topo', 'paper'] }],
       properties: ['openFile']
     })
     if (result.canceled || !result.filePaths[0]) return null
+    // ★ 进度条起点：弹框期间什么都没做（用户还在挑文件），此刻才真正开始解析。
+    // 先于解析推事件 —— 渲染层收到即点亮「读取工程文件」，覆盖住这段同步解析。
+    emit(EVENT.topologyImportStarted, { filePath: result.filePaths[0] })
     const res = importTopoPath(services, result.filePaths[0])
     if (res && !services.getSettings().storage?.topologyDir) {
       try {
@@ -126,6 +138,10 @@ function sanitizeNodes(list: unknown): TopologyNode[] {
     const role = ROLES.has(toStr(o.role)) ? (toStr(o.role) as TopologyNode['role']) : 'unknown'
     const x = typeof o.x === 'number' ? o.x : undefined
     const y = typeof o.y === 'number' ? o.y : undefined
+    // eNSP 源坐标（B4 第四批）：白名单显式收下，否则逐字段重建会静默丢弃，
+    // 「优先按 eNSP 原始排布」在导入/保存一轮后就失效
+    const srcX = typeof o.srcX === 'number' ? o.srcX : undefined
+    const srcY = typeof o.srcY === 'number' ? o.srcY : undefined
     const ifaces = Array.isArray(o.interfaces)
       ? (o.interfaces as unknown[]).filter((v): v is string => typeof v === 'string')
       : undefined
@@ -137,7 +153,9 @@ function sanitizeNodes(list: unknown): TopologyNode[] {
       ...(toStr(o.deviceId) ? { deviceId: toStr(o.deviceId) } : {}),
       ...(ifaces && ifaces.length > 0 ? { interfaces: ifaces } : {}),
       ...(Number.isFinite(x) ? { x } : {}),
-      ...(Number.isFinite(y) ? { y } : {})
+      ...(Number.isFinite(y) ? { y } : {}),
+      ...(Number.isFinite(srcX) ? { srcX } : {}),
+      ...(Number.isFinite(srcY) ? { srcY } : {})
     })
   }
   return out
@@ -152,12 +170,18 @@ function sanitizeLinks(list: unknown): TopologyLink[] {
     const from = toStr(o.from)
     const to = toStr(o.to)
     if (!from || !to) continue
+    const portOffsets = sanitizePortOffsets(o.portOffsets)
     out.push({
       id: toStr(o.id) || `${from}|${to}`,
       from,
       to,
       ...(toStr(o.label) ? { label: toStr(o.label) } : {}),
-      source: SOURCES.has(toStr(o.source)) ? (toStr(o.source) as TopologyLink['source']) : 'manual'
+      source: SOURCES.has(toStr(o.source)) ? (toStr(o.source) as TopologyLink['source']) : 'manual',
+      // 多线并接的身份与线型：不显式回填会被这个白名单重建对象静默丢掉
+      // （丢了 lineKey → 标注偏移落到「按设备对」的旧语义上，并联线之间会互相串味）
+      ...(toStr(o.lineKey) ? { lineKey: toStr(o.lineKey) } : {}),
+      ...(toStr(o.lineType) ? { lineType: toStr(o.lineType) } : {}),
+      ...(portOffsets ? { portOffsets } : {})
     })
   }
   return out

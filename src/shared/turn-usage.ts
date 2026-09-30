@@ -14,16 +14,30 @@
 export interface UsageSample {
   promptTokens: number
   outputTokens: number
+  /** v2.28：缓存分项（provider 没给时缺省，按 0 计） */
+  cacheReadTokens?: number
+  cacheWriteTokens?: number
+  freshInputTokens?: number
 }
 
 /** 本轮累计用量 */
 export interface TurnUsage {
   /** 模型往返次数（ReAct 的步数） */
   rounds: number
-  /** 各次 promptTokens 之和 */
+  /** 各次 promptTokens 之和（= 未命中 + 缓存命中 + 缓存写入） */
   promptTokens: number
   /** 各次 outputTokens 之和 */
   outputTokens: number
+  /**
+   * v2.28：缓存命中 / 缓存写入 / 未命中输入的分项累计。
+   *
+   * 为什么必须分开：`promptTokens` 把三者加在一起，而命中部分通常按 0.1 倍计价。
+   * 只看总数会把「300 万输入」当成「300 万全价输入」——据此优化会优化错方向
+   * （真正贵的大头可能是输出，而不是输入）。
+   */
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  freshInputTokens: number
   /** 是否至少有一次是真实测量（false = 全是字符估算） */
   measured: boolean
   /** 最后一次的上下文窗口（用于显示占比时的分母） */
@@ -36,6 +50,9 @@ export const EMPTY_TURN_USAGE: TurnUsage = {
   rounds: 0,
   promptTokens: 0,
   outputTokens: 0,
+  cacheReadTokens: 0,
+  cacheWriteTokens: 0,
+  freshInputTokens: 0,
   measured: false,
   contextWindow: 0,
   lastRatio: 0
@@ -51,11 +68,27 @@ export function accumulateUsage(
     rounds: prev.rounds + 1,
     promptTokens: prev.promptTokens + Math.max(0, Math.floor(sample.promptTokens || 0)),
     outputTokens: prev.outputTokens + Math.max(0, Math.floor(sample.outputTokens || 0)),
+    cacheReadTokens: prev.cacheReadTokens + Math.max(0, Math.floor(sample.cacheReadTokens || 0)),
+    cacheWriteTokens: prev.cacheWriteTokens + Math.max(0, Math.floor(sample.cacheWriteTokens || 0)),
+    freshInputTokens: prev.freshInputTokens + Math.max(0, Math.floor(sample.freshInputTokens || 0)),
     // 只要有一次实测就记 true —— 与「估算」区分开，界面上要标注
     measured: prev.measured || opts.measured === true,
     contextWindow: opts.contextWindow ?? prev.contextWindow,
     lastRatio: opts.ratio ?? prev.lastRatio
   }
+}
+
+/**
+ * v2.28：缓存命中率（0~1）。分母是「计入 prompt 的全部输入」——
+ * 与 `promptTokens` 同一口径，所以这个比例可以直接解释那一列数字。
+ *
+ * 没有任何分项数据（老 provider 不给 usage）时返回 null，
+ * 界面据此**不显示**命中率，而不是显示一个看着像 0% 的假数字。
+ */
+export function cacheHitRatio(u: TurnUsage): number | null {
+  const denom = u.cacheReadTokens + u.cacheWriteTokens + u.freshInputTokens
+  if (denom <= 0) return null
+  return u.cacheReadTokens / denom
 }
 
 /**
@@ -82,6 +115,10 @@ export function describeTurnUsage(u: TurnUsage): string {
   const total = u.promptTokens + u.outputTokens
   const parts = [`${formatTokens(total)} tokens`, `${u.rounds} 轮`]
   if (!u.measured) parts.push('估算')
+  // v2.28：有缓存分项时补一句命中率。它是「这一列数字到底多贵」的唯一线索 ——
+  // 命中部分通常按 0.1 倍计价，只给总数会让用户高估成本并优化错方向。
+  const hit = u.measured ? cacheHitRatio(u) : null
+  if (hit !== null) parts.push(`缓存命中 ${Math.round(hit * 100)}%`)
   return parts.join(' · ')
 }
 

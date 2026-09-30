@@ -29,6 +29,7 @@
  */
 
 import type { ErrorCode } from '@shared/types'
+import { isUserViewCommand } from '@shared/risk'
 
 // ——————————————————————————————————————————————
 // ① 错误码 → 诊断引导
@@ -191,6 +192,22 @@ export const VRP_ERROR_GUIDE: Readonly<Partial<Record<ErrorCode, VrpErrorGuide>>
     fixes: ['改用分片查看（display 指定对象）或带 limit 的采集工具；截断快照不可作为回滚基线']
     ,
     topics: ['error_ref']
+  },
+  UNSETTLED: {
+    code: 'UNSETTLED',
+    meaning:
+      '命令回显已结束（以空白收尾）但**设备没有回到提示符** —— 本层无法确认命令真的执行完了（v2.30）',
+    causes: [
+      '设备停在某种**未被识别的交互提示**上等输入（确认提示写法不在已知形态内，如 (y/n)[n]）',
+      '设备正在执行一条耗时命令，输出与提示符都比静默/停顿窗口更晚到达',
+      '设备回显被截断或连接半断（提示符永远不会到）'
+    ],
+    fixes: [
+      '先取证：get_device_context 看它报告的提示符与视图是否正常（正常说明只是慢）',
+      '提示符异常/缺失时，到该设备的交互终端里人工看一眼 —— 若确实停在确认提示上，人工应答后再继续',
+      '绝不要紧接着下发下一条命令：设备会把它的输入当成对那个挂起提示的应答吃掉'
+    ],
+    topics: ['basics', 'error_ref']
   }
 }
 
@@ -310,13 +327,23 @@ const MAX_VLAN_ID = 4094
  *
  * 只做**确定性**判定：规则命中即一定值得看一眼，不做需要设备现状才能断言的推断
  * （例如「该接口是否已被 shutdown」）。返回空数组表示没发现可疑写法。
+ *
+ * `opts.view` 是**本批命令将在哪个视图下发**（apply_config 的 view 参数）：
+ * 用户视图命令在系统视图下必然 Unrecognized，这条冲突只有把视图传进来才判得准。
+ * 缺省 `'system'`（= 老调用方的实际行为）。
  */
-export function preflightCommands(commands: readonly string[]): PreflightFinding[] {
+export function preflightCommands(
+  commands: readonly string[],
+  opts: { view?: 'system' | 'user' } = {}
+): PreflightFinding[] {
+  const targetView = opts.view ?? 'system'
   const lines = commands.map((c) => String(c).trim()).filter((c) => c.length > 0)
   if (!lines.length) return []
   const out: PreflightFinding[] = []
   const ctx: PreflightCtx = { proto: '' }
   const lower = lines.map((l) => l.toLowerCase())
+  /** 批次里是否已经出现过视图导航（return / quit）—— 出现后用户视图命令就能正常执行 */
+  let sawUserNav = false
 
   // ① 全角字符：设备按 ASCII 解析，全角空格/标点必报 Unrecognized 或 Wrong parameter
   for (const line of lines) {
@@ -362,6 +389,27 @@ export function preflightCommands(commands: readonly string[]): PreflightFinding
     if (/^ospf(\s|$)/.test(line)) ctx.proto = 'ospf'
     else if (/^rip(\s|$)/.test(line)) ctx.proto = 'rip'
     else if (/^quit$/.test(line)) ctx.proto = ''
+
+    /*
+     * v2.30：用户视图命令落在系统视图批次里 —— 必然 Unrecognized（实测翻车点）。
+     * 模型自己在本批里先插过 `return` 时不报（它确实把设备带回了用户视图）；
+     * `quit` 不算 —— 从接口视图 quit 只退到系统视图，用户视图命令照样失败。
+     */
+    const sawReturn = /^return$/.test(line)
+    if (targetView === 'system' && !sawUserNav && isUserViewCommand(raw) && !/^save(\s|$)/.test(line)) {
+      out.push({
+        level: 'warn',
+        rule: 'user-view-command-in-system-view',
+        command: raw,
+        message:
+          `「${raw}」是用户视图命令，而本批会在系统视图下逐条下发 —— 该视图下必然回 ` +
+          'Error: Unrecognized command',
+        fix:
+          "给 apply_config 传 view:'user'（本工具会先 return 回用户视图再下发）；" +
+          '若是清启动配置，直接用 reset_saved_configuration 更省事（它获批后会自动应答 [Y/N]）'
+      })
+    }
+    if (sawReturn) sawUserNav = true
 
     // ② 掩码 ↔ 反掩码互写（`network` 的语义随协议视图而变，先按视图分流）
     if (tok[0]!.toLowerCase() === 'network' && tok.length >= 2) {

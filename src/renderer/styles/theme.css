@@ -19,6 +19,9 @@ html[data-theme='dark'] {
   --border-subtle: rgba(255, 255, 255, 0.07);
   --border-default: rgba(255, 255, 255, 0.12);
   --border-strong: rgba(255, 255, 255, 0.20);
+  --border: var(--border-default);
+  --bg-panel: var(--bg-elevated);
+  --bg-input: var(--bg-base);
 
   --text-primary: #e6edf3;
   --text-secondary: #96a2b4;
@@ -45,16 +48,32 @@ html[data-theme='dark'] {
   --info: #06b6d4;
   --agent: #8b5cf6;
   --agent-subtle: rgba(139, 92, 246, 0.16);
+  /* 日常信息卡渐变收尾色：深色下是基色实心叠加，浅色下必须换成白色系，
+     否则深色底会把卡片压成灰紫，与浅色背景明显割裂（详见 app.css#assistant-panel） */
+  --agent-panel-end: rgba(17, 20, 32, 0.45);
   --server: #14b8a6;
   --cloud: #6366f1;
+
+  /* 拓扑连线 / MiniMap 的角色色：深色底用低饱和亮色（Catppuccin 系），
+     浅色底必须换成深饱和色 —— 线宽只有 1.6px，浅色线压在浅色画布上
+     对比度不足 1.5:1，等于看不见。见 TopoRender.tsx#NODE_LINE_COLOR */
+  --topo-line-router: #cba6f7;
+  --topo-line-switch: #89dceb;
+  --topo-line-firewall: #f38ba8;
+  --topo-line-wlan: #fab387;
+  --topo-line-server: #94e2d5;
+  --topo-line-cloud: #b4befe;
+  --topo-line-pc: #a6e3a1;
+  --topo-line-unknown: #6c7086;
 
   --shadow-sm: 0 1px 2px rgba(0, 4, 16, 0.35), 0 0 0 1px rgba(255, 255, 255, 0.04);
   --shadow-md: 0 4px 14px -2px rgba(0, 4, 16, 0.45), 0 2px 6px -1px rgba(0, 4, 16, 0.3);
   --shadow-lg: 0 10px 28px -4px rgba(0, 4, 16, 0.55), 0 4px 10px -2px rgba(0, 4, 16, 0.35);
-  --shadow-pop: 0 16px 36px -4px rgba(0, 4, 16, 0.7), 0 6px 16px -2px rgba(0, 4, 16, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.08);
+  --shadow-pop: 0 20px 48px -6px rgba(0, 4, 16, 0.75), 0 6px 16px -2px rgba(0, 4, 16, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.08);
+  --shadow-card: 0 2px 8px -2px rgba(0, 4, 16, 0.4), 0 0 0 1px var(--border-subtle);
   --shadow-glow-accent: 0 0 20px rgba(59, 130, 246, 0.25);
 
-  --glass-bg: rgba(17, 20, 32, 0.78);
+  --glass-bg: rgba(17, 20, 32, 0.82);
   --glass-border: rgba(255, 255, 255, 0.09);
 
   --terminal-bg: #0b0d14;
@@ -74,6 +93,9 @@ html[data-theme='light'] {
   --border-subtle: rgba(0, 0, 0, 0.06);
   --border-default: rgba(0, 0, 0, 0.12);
   --border-strong: rgba(0, 0, 0, 0.22);
+  --border: var(--border-default);
+  --bg-panel: var(--bg-elevated);
+  --bg-input: var(--bg-surface);
 
   --text-primary: #1f2328;
   --text-secondary: #59636e;
@@ -99,16 +121,30 @@ html[data-theme='light'] {
   --info: #0284c7;
   --agent: #7c3aed;
   --agent-subtle: rgba(124, 58, 237, 0.1);
+  /* 浅色：白底 + 极淡紫，与 --bg-surface 同族，卡片自然浮在浅色背景上 */
+  --agent-panel-end: rgba(255, 255, 255, 0.72);
   --server: #0d9488;
   --cloud: #6366f1;
 
-  --shadow-sm: 0 1px 2px rgba(27, 31, 36, 0.04), 0 0 0 1px rgba(27, 31, 36, 0.04);
-  --shadow-md: 0 4px 12px rgba(27, 31, 36, 0.08);
-  --shadow-lg: 0 8px 24px rgba(27, 31, 36, 0.12);
-  --shadow-pop: 0 14px 34px rgba(27, 31, 36, 0.16);
+  /* 拓扑连线 / MiniMap 角色色：沿用同一批语义色，细线压在浅色画布上仍有 ≥3.5:1；
+     wlan / unknown 的语义色偏浅，各再深一档 */
+  --topo-line-router: var(--agent);
+  --topo-line-switch: var(--info);
+  --topo-line-firewall: var(--danger);
+  --topo-line-wlan: #b45309;
+  --topo-line-server: var(--server);
+  --topo-line-cloud: var(--cloud);
+  --topo-line-pc: var(--success);
+  --topo-line-unknown: #64748b;
+
+  --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.04), 0 0 0 1px rgba(15, 23, 42, 0.05);
+  --shadow-md: 0 4px 14px -2px rgba(15, 23, 42, 0.07), 0 2px 6px -1px rgba(15, 23, 42, 0.04);
+  --shadow-lg: 0 10px 24px -4px rgba(15, 23, 42, 0.10);
+  --shadow-pop: 0 18px 40px -6px rgba(15, 23, 42, 0.16), 0 0 0 1px rgba(15, 23, 42, 0.08);
+  --shadow-card: 0 2px 8px -2px rgba(15, 23, 42, 0.06), 0 0 0 1px var(--border-default);
   --shadow-glow-accent: 0 0 16px rgba(29, 99, 237, 0.2);
 
-  --glass-bg: rgba(255, 255, 255, 0.85);
+  --glass-bg: rgba(255, 255, 255, 0.88);
   --glass-border: rgba(0, 0, 0, 0.08);
 
   --terminal-bg: #ffffff;
@@ -140,10 +176,13 @@ html[data-theme='light'] {
   --radius-xl: 16px;
   --radius-full: 999px;
 
-  --dur-fast: 150ms;
-  --dur-base: 220ms;
+  --dur-fast: 140ms;
+  --dur-base: 200ms;
+  --dur-smooth: 280ms;
   --ease: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-spring: cubic-bezier(0.34, 1.4, 0.64, 1);
 
-  /* T5.4：开关旋钮填充色（两主题同为物理白，不是背景语义） */
+  /* T5.4：开关旋钮填充色与阴影 */
   --switch-knob: #ffffff;
+  --switch-knob-shadow: 0 1px 3px rgba(0, 0, 0, 0.28), 0 0 0 1px rgba(0, 0, 0, 0.04);
 }

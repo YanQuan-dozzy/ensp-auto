@@ -33,7 +33,7 @@ export function registerIpc(services: Services, getWindow: () => BrowserWindow |
 
   registerDeviceIpc(services, emit)
   registerAgentIpc(services, getWindow)
-  registerTopologyIpc(services, getWindow)
+  registerTopologyIpc(services, getWindow, emit)
   registerSettingsIpc(services)
   registerMcpIpc(services)
   registerWiresharkIpc(services, getWindow)

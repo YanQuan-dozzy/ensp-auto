@@ -15,7 +15,8 @@ import {
   accumulateUsage,
   formatTokens,
   describeTurnUsage,
-  shouldShowUsage
+  shouldShowUsage,
+  cacheHitRatio
 } from '../.build/harness.mjs'
 
 // ————————————————————— 用量归集 —————————————————————
@@ -127,4 +128,58 @@ test('shouldShowUsage：多轮或大 token 显示', () => {
 
 test('shouldShowUsage：0 轮一律不显示', () => {
   assert.equal(shouldShowUsage(EMPTY_TURN_USAGE), false)
+})
+
+// ————————————————————— v2.28：缓存分项 —————————————————————
+//
+// 为什么单独立一组：`promptTokens` 的口径是「未命中 + 命中 + 写入」，而命中通常
+// 按 0.1 倍计价。只给总数，用户会把「300 万输入」当成「300 万全价输入」，
+// 据此优化就会优化错方向（真正的大头可能是输出）。
+
+test('缓存：分项累加，缺省字段按 0 计（老端点不给 usage 时不能凭空造数）', () => {
+  let u = accumulateUsage(EMPTY_TURN_USAGE, { promptTokens: 1000, outputTokens: 100 })
+  assert.equal(u.cacheReadTokens, 0)
+  assert.equal(u.cacheWriteTokens, 0)
+  assert.equal(u.freshInputTokens, 0)
+  assert.equal(cacheHitRatio(u), null, '没有分项数据时必须返回 null，而不是 0%')
+
+  u = accumulateUsage(u, {
+    promptTokens: 900,
+    outputTokens: 100,
+    cacheReadTokens: 800,
+    cacheWriteTokens: 50,
+    freshInputTokens: 50
+  })
+  assert.equal(u.cacheReadTokens, 800)
+  assert.equal(u.cacheWriteTokens, 50)
+  assert.equal(u.freshInputTokens, 50)
+  assert.equal(u.rounds, 2)
+})
+
+test('缓存：命中率 = 命中 / (命中 + 写入 + 未命中)', () => {
+  const u = accumulateUsage(EMPTY_TURN_USAGE, {
+    promptTokens: 1000,
+    outputTokens: 0,
+    cacheReadTokens: 700,
+    cacheWriteTokens: 100,
+    freshInputTokens: 200
+  })
+  assert.equal(cacheHitRatio(u), 0.7)
+})
+
+test('缓存：实测且有分项时，用量行带命中率；纯估算时不带', () => {
+  const measured = accumulateUsage(
+    EMPTY_TURN_USAGE,
+    { promptTokens: 1000, outputTokens: 200, cacheReadTokens: 900, cacheWriteTokens: 0, freshInputTokens: 100 },
+    { measured: true }
+  )
+  assert.match(describeTurnUsage(measured), /缓存命中 90%/)
+
+  // 估算态（没拿到 provider usage）不许出现命中率 —— 那是编出来的数字
+  const estimated = accumulateUsage(
+    EMPTY_TURN_USAGE,
+    { promptTokens: 1000, outputTokens: 200, cacheReadTokens: 900, cacheWriteTokens: 0, freshInputTokens: 100 },
+    { measured: false }
+  )
+  assert.doesNotMatch(describeTurnUsage(estimated), /缓存命中/)
 })

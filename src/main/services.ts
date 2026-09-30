@@ -414,7 +414,6 @@ export class Services {
 
     const controller = new AbortController()
     const { runtime, kind } = this.createRuntime(sessionId)
-    this.active.set(sessionId, { sessionId, controller, runtime })
 
     // v2.12：把本轮的会话根 ID 告诉渲染层。新建会话时渲染层的 activeRootId 是 null
     // （root 由这里 createRoot 产生），而消息删除/重新生成都需要它定位会话树。
@@ -447,15 +446,23 @@ export class Services {
       { ok: boolean; ms: number; summary: string; errorCode?: string; cardMeta?: unknown }
     >()
     /**
-     * v2.5 并发落盘：`tool_end` 的到达顺序取决于**哪台设备先回**，而会话树
-     * （历史回溯 + 报告导出）必须保持模型给出的调用顺序。
+     * v2.5 并发落盘：把「已回来的工具结果」按调用顺序落成树节点。
      *
-     * 做法：Map 的迭代顺序就是 `tool_start` 的登记顺序，从头往后遇到第一个还没回来的
-     * 就停下 —— 这样既保证顺序，又不会为了等一台慢设备而压住后面已完成的节点。
+     * `tool_end` 的到达顺序取决于**哪台设备先回**，而会话树（历史回溯 + 报告导出）
+     * 必须保持模型给出的调用顺序。`pendingTools` 的迭代顺序就是 `tool_start` 的
+     * 登记顺序，从头往后扫即可还原该顺序。
      * 注意不能「谁回来就先写谁」：那会让历史会话里的工具顺序与当次看到的不一致，
      * 而这种错位在报告里是看不出来的（顺序看着就是随机的）。
+     *
+     * ⚠️ **顺序保证是靠「不删未完成的条目」维持的，不是靠 `break`**：
+     * 扫到「还没回来」的条目时**不能**把它丢掉，否则后面的已回结果会越过它先落盘，
+     * 顺序就乱了。正确做法是把它留在队里、本次先跳过（见循环里的注释）。
+     *
+     * @param finalize 收尾模式（finally 里调）。此时队列里可能还剩**永远等不到结果的**
+     *   调用 —— `runGroupedBounded`（concurrency.ts）在 abort 后会跳过剩余项，
+     *   它们不会有 `tool_end`。这些条目在收尾模式下会被落成「未取得结果」的占位节点。
      */
-    const flushToolNodes = (): void => {
+    const flushToolNodes = (finalize = false): void => {
       const ready: Array<{
         callId: string
         tc: NonNullable<SessionNode['toolCall']>
@@ -463,7 +470,29 @@ export class Services {
       }> = []
       for (const [callId, tc] of pendingTools) {
         const r = resolvedToolResults.get(callId)
-        if (!r) break
+        if (!r) {
+          // M6（PERF-MEM-REVIEW-2026-09-29 §4.1）：这里是**跳过**而不是 `break`。
+          //
+          // 原来的 `break` 会在第一个「还没回来」的条目上停下，而 abort 后
+          // 被 `runGroupedBounded` 跳过的调用**永远不会有 tool_end** —— 于是
+          // 它一直堵在队首，此后每一次 flush 都卡在同一条目，该任务**后续所有**
+          // 工具节点都不再写入会话树（历史回溯 / 报告导出静默丢数据）。
+          // 继续扫其他条目，让已经回来的结果该落就落。
+          if (!finalize) continue
+          // 收尾模式：这个调用再也不会有结果 —— 仍要落一个节点占位，否则
+          // 历史里这次调用凭空消失（模型重放时会以为它没被调用过）。
+          ready.push({
+            callId,
+            tc,
+            r: {
+              ok: false,
+              ms: 0,
+              summary: '任务中止，未取得结果',
+              errorCode: 'ABORTED'
+            }
+          })
+          continue
+        }
         ready.push({ callId, tc, r })
       }
       for (const { callId, tc, r } of ready) {
@@ -566,6 +595,18 @@ export class Services {
     }
 
     try {
+      // M3（PERF-MEM-REVIEW-2026-09-29 §三）：登记必须在 try 之内。
+      // 此前 `this.active.set` 在 try 之前（本文件 :417），而 try 在 :568 ——
+      // 中间 150 行完全没有保护。这期间任何抛错（会话树磁盘写失败、
+      // 「无法确定本轮会话根 ID」那行显式 throw、send 同步异常）都会让
+      // startAgent 直接 reject、finally 永不执行，于是：
+      //   ① `active` 里的条目永久驻留，强引用 ReactRuntime → buildContext 闭包 →
+      //      全部 store 图（一会话就钉住一份，永久内存泄漏）；
+      //   ② `isAgentRunning(sessionId)` 从此恒为 true ⇒ 该 sessionId 再也起不了任务；
+      //   ③ ipc/agent.ts 的 `.catch(emitAgentFailure)` 只发事件，不清理 `active`。
+      // 上面到 try 之间的代码全是同步的（无 await），把它挪进 try 不会给
+      // 「同一会话并发起两个任务」开窗口。
+      this.active.set(sessionId, { sessionId, controller, runtime })
       for await (const event of runtime.run({
         sessionId,
         text,
@@ -605,7 +646,10 @@ export class Services {
     } finally {
       flushAssistant()
       // v2.5：收尾时把还没落盘的已回结果补上（中途 abort 时，某一批可能只回了一部分）
-      flushToolNodes()
+      // M6：finalize —— 队列里若还剩「永远不会回来」的调用（abort 后被
+      // `runGroupedBounded` 跳过），也必须落一个占位节点，否则历史里这次调用
+      // 凭空消失，且残留的条目会永远堵在队首（见 flushToolNodes 的注释）。
+      flushToolNodes(true)
       // v2.16：把本轮收尾信息落进会话树（历史回放据此合成带用量/模型的收尾卡，
       // 与实时流一致）。所有收尾路径都经这里；失败静默 —— 它是锦上添花。
       if (doneReason) {

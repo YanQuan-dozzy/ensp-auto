@@ -35,6 +35,36 @@ interface IndexFile {
 const NOTIFY_COALESCE_MS = 60
 
 /**
+ * D1（PERF-MEM-REVIEW-2026-09-29 §三）：索引落盘的去抖窗口。
+ *
+ * 为什么必须去抖：`append()` 每落一个节点就整份重写索引（原子写 + fsync +
+ * mkdir + rename，全同步）。一次 30 轮的典型实验约 130 个节点 ⇒ 130 次全量
+ * 索引写 + 130 次 `fsyncSync`（Windows 上是 FlushFileBuffers，单次 0.1~数 ms，
+ * 撞上杀软扫描可达数十 ms），**全部同步阻塞主进程** —— 而主进程同时还在
+ * 扛渲染层 IPC、telnet/SSH 通信与工具执行。索引只有 25KB 量级，一秒落一次
+ * 完全够，而 D4 的退避最坏还能冻 70ms。
+ *
+ * 索引是**派生数据**（`tree-*.jsonl` 才是真相，见类注释），推迟落盘不丢信息：
+ * 进程被 kill 时最多丢失「最近一次去抖窗口内」的 nodeCount/updatedAt/resumable，
+ * 而节点本身已经 append 进了 jsonl。
+ */
+const INDEX_PERSIST_DEBOUNCE_MS = 600
+
+/**
+ * M1/D8（PERF-MEM-REVIEW-2026-09-29 §三）：`cache` 里最多留几棵树。
+ *
+ * 一次被打开过的会话，它的**整棵**节点数组（含每条 assistant 正文、thinking
+ * 全文、`toolCall.args/summary/cardMeta`）就永久驻留 —— 唯一的清理点是
+ * deleteSession / deleteFromNode / resetAll，也就是说**用户「关掉会话窗口」
+ * 一点内存都不释放**。一周点开 50 个历史会话就是 50 份完整节点数组钉在主进程。
+ *
+ * 上界取 8：足够覆盖「列表 + 正在看的那棵 + 刚对比过的几棵」，又能让
+ * 跨会话的常驻量封顶。淘汰只是**内存**行为 —— 被淘汰的树随时能从
+ * `tree-*.jsonl` 重新解析出来，不丢任何数据。
+ */
+const CACHE_MAX_TREES = 8
+
+/**
  * 索引条目的形状判定（N44）：只要求 id 存在，其余字段在归一化阶段补齐。
  *
  * 为什么不像 snapshots/changes 那样要求全部字段：id 缺失的条目无法被寻址（等于垃圾），
@@ -48,17 +78,30 @@ function isSessionNodeMeta(v: unknown): v is SessionNodeMeta {
 
 export class SessionTreeStore {
   private index: Map<string, SessionNodeMeta> = new Map()
-  /** rootId → 已加载的节点数组（惰性） */
+  /** rootId → 已加载的节点数组（惰性，按 LRU 上界，见 CACHE_MAX_TREES） */
   private cache = new Map<string, SessionNode[]>()
   /** nodeId → rootId（追加时定位所属会话） */
   private owner = new Map<string, string>()
   /** N19：列表广播的待发定时器（合流用，见 notify） */
   private notifyTimer: ReturnType<typeof setTimeout> | null = null
+  /** D1：索引待落盘的合流定时器（见 scheduleIndexPersist） */
+  private indexTimer: ReturnType<typeof setTimeout> | null = null
+  /** D1：定时器已到期但落盘还没成功（退避重试用） */
+  private indexDirty = false
 
   constructor(private readonly opts: SessionTreeStoreOptions) {
     fs.mkdirSync(opts.dir, { recursive: true })
     this.loadIndex()
+    // D1：去抖落盘必须在进程退出前冲掉，否则「最后一批节点」只有 jsonl 没有索引条目
+    //（表现为会话列表里的 nodeCount 停在旧值，排序位置也不对）。
+    // 只挂一次、且 unref 掉以免拖住退出。
+    this.onExit = (): void => {
+      if (this.indexDirty) this.flushIndex()
+    }
+    process.once('beforeExit', this.onExit)
   }
+
+  private readonly onExit: () => void
 
   private indexFile(): string {
     return path.join(this.opts.dir, 'sessions-index.json')
@@ -142,7 +185,67 @@ export class SessionTreeStore {
   private persistIndex(): void {
     const data: IndexFile = { version: 1, sessions: Object.fromEntries(this.index) }
     // T2.5：统一原子写（此前是 `${indexFile}.tmp` 固定名，并发写会互相顶掉半成品）
-    atomicWriteJsonSync(this.indexFile(), data)
+    // D4：索引**不要 fsync** —— 它是从 `tree-*.jsonl` 可重建的派生数据
+    //（类注释就是这么定位它的）。fsync 是单次 0.1~数 ms 的 FlushFileBuffers，
+    // 索引一天被写上百次，却从来不是「读不出来就丢数据」的那一类。
+    // 快照正文 / 拓扑 / 设置仍然保持 fsync。
+    atomicWriteJsonSync(this.indexFile(), data, { fsync: false })
+    // 落盘成功了，pending 的那批变更已经进磁盘
+    this.indexDirty = false
+  }
+
+  /**
+   * D1：把索引落盘**推迟**到合流窗口结束。
+   *
+   * 内存态（index / list()）是立即更新的 —— 去抖只推迟**写盘**，不影响任何可见性。
+   * 用法纪律：调用点仍要保留原有的「写失败回滚」分支（见 §十 的提醒），
+   * 只是把「同步写」换成「排一次延迟写」。
+   */
+  private scheduleIndexPersist(): void {
+    this.indexDirty = true
+    if (this.indexTimer) return
+    this.indexTimer = setTimeout(() => {
+      this.indexTimer = null
+      this.flushIndex()
+    }, INDEX_PERSIST_DEBOUNCE_MS)
+    this.indexTimer.unref?.()
+  }
+
+  /**
+   * D1：立即把待落盘的索引写掉。
+   *
+   * 写失败**不抛**：调用方是定时器 / beforeExit / 收尾路径，抛出去只会变成
+   * unhandled exception（退出钩子里抛更是直接改变退出码）。失败保持 dirty，
+   * 下一次 append 会重新排定时器。
+   */
+  flushIndex(): void {
+    if (!this.indexDirty) return
+    try {
+      this.persistIndex()
+      this.indexDirty = false
+    } catch (e) {
+      console.warn(`[session-tree] 会话索引落盘失败（下次变更时重试）：${this.indexFile()}`, e)
+    }
+  }
+
+  /**
+   * M1/D8：把最久没用的那棵树从内存里挤掉。
+   *
+   * 淘汰必须**连带清 owner** —— 否则那些 nodeId 还能定位到一个「已经被挤出内存」
+   * 的 root，`getById` 会去把它重新解析回来，白挤一场（这正是原实现
+   * `deleteSession:573` 里已在做的事，抽出来复用）。
+   *
+   * 数据本身在 `tree-*.jsonl` 里，淘汰不丢任何东西。
+   */
+  private evictOldest(): void {
+    if (this.cache.size <= CACHE_MAX_TREES) return
+    // Map 的插入序 = 最久未重新插入的在前；`tree()` 命中时会重新 set 提到队尾
+    const oldest = this.cache.keys().next()
+    if (oldest.done) return
+    const rootId = oldest.value
+    const nodes = this.cache.get(rootId)
+    this.cache.delete(rootId)
+    for (const n of nodes ?? []) this.owner.delete(n.id)
   }
 
   /**
@@ -216,6 +319,7 @@ export class SessionTreeStore {
       /* 读失败视为空，下次写入重建 */
     }
     this.cache.set(rootId, nodes)
+    this.evictOldest()
 
     // 判据：坏行之后仍有合法节点（中段损坏），或整个文件没有一行是合法的（整体损坏）。
     // 只有「坏行全部落在最后一段、且之前有合法节点」才算可恢复的尾部截断。
@@ -239,12 +343,23 @@ export class SessionTreeStore {
 
   private tree(rootId: string): SessionNode[] {
     if (!this.cache.has(rootId)) this.parseTree(rootId)
-    return this.cache.get(rootId) ?? []
+    const hit = this.cache.get(rootId)
+    if (hit) {
+      // LRU 触达：删了重插，把这棵树提到队尾（Map 保持插入序）
+      this.cache.delete(rootId)
+      this.cache.set(rootId, hit)
+    }
+    return hit ?? []
   }
 
   private appendLine(rootId: string, node: SessionNode): void {
     const file = this.treeFile(rootId)
-    fs.mkdirSync(path.dirname(file), { recursive: true })
+    // 目录由构造函数 / createRoot 那一轮建好，这里每次 append 再 mkdir 一次
+    // 是 130 次多余的同步 syscall —— 但**不能删**：appendLine 也可能在
+    // 目录被外部删掉（用户清了数据目录）之后被调用，那时它必须自己兜住。
+    // 这里保留 mkdir 但改成「只在目录不存在时」（existsSync 比 mkdirSync 便宜得多），
+    // 正常路径零 syscall。
+    if (!fs.existsSync(path.dirname(file))) fs.mkdirSync(path.dirname(file), { recursive: true })
     fs.appendFileSync(file, `${JSON.stringify(node)}\n`, 'utf8')
   }
 
@@ -275,6 +390,11 @@ export class SessionTreeStore {
     this.index.set(root.id, meta)
     this.cache.set(root.id, [root])
     this.owner.set(root.id, root.id)
+    // M1/D8：新建会话也要受 LRU 上界约束 —— 只在 `tree()` 的惰性加载路径淘汰的话，
+    // **长期不重启的进程里 cache 仍会随 `createRoot` 次数单调增长**（用户开
+    // 数十个会话不重启就是数十棵常驻），而那正是本条目要堵的那类无界驻留。
+    // 刚 set 进去的这棵在队尾，不会被自己挤掉。
+    this.evictOldest()
     this.persistIndex()
     this.appendLine(root.id, root)
     this.notify()
@@ -300,15 +420,31 @@ export class SessionTreeStore {
     if (meta) {
       meta.updatedAt = full.createdAt
       meta.nodeCount += 1
-      // v2.8：有新节点进来说明任务在推进 → 重新标记为「未收尾」。
+      // v2.8：有新节点进说明任务在推进 → 重新标记为「未收尾」。
       // 不能只在 createRoot 时置 true：用户续跑完一个会话、并把它标成了
       // 「已收尾」，若后续再发一条新指令（新节点入树），它又变成未收尾了。
+      // ⚠️ D1 把落盘改成去抖时**误删了这一行**（注释还在、行为没了），
+      // v28-session-title 的「append 后必须重新可续跑」用例当场抓到 ——
+      // 内存态必须同步改，去抖只推迟**写盘**（见 scheduleIndexPersist 的头注释）。
       meta.resumable = true
-      this.persistIndex()
+      // D1：nodeCount/updatedAt/resumable 都不需要逐节点持久化 → 去抖落盘。
+      // 磁盘写失败不阻塞追加：节点已经进了 jsonl，索引缺这几个字段不丢数据
+      //（nodeCount 会在下次任意一次落盘时补齐；即使一直失败，list() 仍用内存值）。
+      this.scheduleIndexPersist()
     }
     this.appendLine(rootId, full)
     this.notify()
     return full
+  }
+
+  /** 测试/诊断用：当前驻留内存的树（验证 LRU 上界，见 perf-mem-review.test.mjs） */
+  cachedRootIds(): string[] {
+    return [...this.cache.keys()]
+  }
+
+  /** 测试/诊断用：owner 表条目数 */
+  ownerCount(): number {
+    return this.owner.size
   }
 
   // ———————————————————— 读 ————————————————————

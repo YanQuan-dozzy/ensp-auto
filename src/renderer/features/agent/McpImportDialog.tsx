@@ -126,7 +126,7 @@ export function McpImportDialog({
                   认出 {preview.names.length} 台：{preview.names.join('、')}
                 </>
               ) : text.trim() ? (
-                '还差一点 —— 点「确认导入」看具体问题'
+                '还差一点：点「确认导入」看具体问题'
               ) : (
                 '等待粘贴'
               )}

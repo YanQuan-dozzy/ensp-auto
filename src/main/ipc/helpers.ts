@@ -5,6 +5,7 @@ import { app } from 'electron'
 import { newMcpServerId } from '@shared/profiles'
 import { parseDeviceId } from '@shared/transport'
 import { readTopoFile } from '../core/topology/fromProjectFile'
+import { readPaperFile } from '../core/topology/fromPaper'
 import type { Attachment } from '@shared/attachments'
 import type { DeviceId, McpServerConfig } from '@shared/types'
 import type { Services } from '../services'
@@ -63,16 +64,18 @@ export function sanitizeSshAuth(raw: unknown): { ok: true; auth: SshAuthPayload 
 }
 
 /**
- * 按路径导入 .topo（dialog 与 find-files 两条 UI 入口共用）：
- * 校验规则与 import_topology_file 工具一致（.topo 扩展 / 不越界 / 存在为文件），
+ * 按路径导入拓扑工程（dialog 与 find-files 两条 UI 入口共用）：
+ * 支持 .topo（明文工程）与 .paper（eNSP 实验包，取其中的 .topo 成员）。
+ * 校验规则与 import_topology_file 工具一致（扩展白名单 / 不越界 / 存在为文件），
  * 导入成功后记录来源路径供 find_topology_files 标 is_active。
  */
 export function importTopoPath(services: Services, filePath: string): TopoImportPayload | null {
   const resolved = path.resolve(filePath)
-  if (path.extname(resolved).toLowerCase() !== '.topo') return null
+  const ext = path.extname(resolved).toLowerCase()
+  if (ext !== '.topo' && ext !== '.paper') return null
   if (resolved.includes('..')) return null
   if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) return null
-  const { topology, report } = readTopoFile(resolved)
+  const { topology, report } = ext === '.paper' ? readPaperFile(resolved) : readTopoFile(resolved)
   services.topology.setFile(topology, resolved)
   return { topology, report }
 }

@@ -8,7 +8,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { TopologyStore, linkKey } from '../.build/harness.mjs'
+import { TopologyStore, linkKey, linkIdentity } from '../.build/harness.mjs'
 
 function tmpStore(t) {
   const file = path.join(os.tmpdir(), `ensp-topo-store-${process.pid}-${Math.random().toString(36).slice(2)}.json`)
@@ -113,6 +113,87 @@ test('重复删除幂等：墓碑不叠加、不出错', (t) => {
   store.remove({ linkKeys: [linkKey('SW1', 'PC3')] })
   store.remove({ linkKeys: [linkKey('SW1', 'PC3')] })
   assert.equal(store.snapshot().links.length, 0)
+})
+
+// —— 多线并接（同一对设备多条物理连线）：删除 / 落库按「条」—— 
+
+/** 核心层双归：C1↔C2 并接两条线 */
+const TWO_LINE_TOPO = {
+  nodes: [
+    { id: 'C1', name: 'C1', role: 'switch' },
+    { id: 'C2', name: 'C2', role: 'switch' }
+  ],
+  links: [
+    { id: 'f#0', from: 'C1', to: 'C2', label: 'GE0/0/1 ↔ GE0/0/1', lineKey: 'GE0/0/1->GE0/0/1', source: 'file' },
+    { id: 'f#1', from: 'C1', to: 'C2', label: 'GE0/0/2 ↔ GE0/0/2', lineKey: 'GE0/0/2->GE0/0/2', source: 'file' }
+  ],
+  updatedAt: 1
+}
+
+test('多线并接：按条删除只掉命中的那条，另一条保留；重导入不复活', (t) => {
+  const store = tmpStore(t)
+  store.setFile(TWO_LINE_TOPO)
+  assert.equal(store.snapshot().links.length, 2)
+
+  store.remove({ linkKeys: [linkIdentity({ from: 'C1', to: 'C2', lineKey: 'GE0/0/1->GE0/0/1' })] })
+  const s = store.snapshot()
+  assert.equal(s.links.length, 1)
+  assert.equal(s.links[0].lineKey, 'GE0/0/2->GE0/0/2')
+
+  // 墓碑按线匹配：重新导入同一工程，被删的那条不复活，另一条仍在
+  store.setFile(TWO_LINE_TOPO)
+  const again = store.snapshot()
+  assert.equal(again.links.length, 1)
+  assert.equal(again.links[0].lineKey, 'GE0/0/2->GE0/0/2')
+})
+
+test('多线并接：按设备对删除 / 删除节点 → 该对全部线一起断开', (t) => {
+  const store = tmpStore(t)
+  store.setFile(TWO_LINE_TOPO)
+  store.remove({ linkKeys: [linkKey('C1', 'C2')] }) // 断开全部（设备对粒度）
+  assert.equal(store.snapshot().links.length, 0)
+  store.setFile(TWO_LINE_TOPO)
+  assert.equal(store.snapshot().links.length, 0) // 跨层墓碑持久生效
+
+  const store2 = tmpStore(t)
+  store2.setFile(TWO_LINE_TOPO)
+  store2.remove({ nodeIds: ['C2'] }) // 删节点连带该设备的全部线
+  const s = store2.snapshot()
+  assert.equal(s.nodes.length, 1)
+  assert.equal(s.links.length, 0)
+})
+
+test('多线并接：手动层按条合并——两条线的标注偏移各自独立、不互相顶掉', (t) => {
+  const store = tmpStore(t)
+  store.setFile(TWO_LINE_TOPO)
+  store.applyManual({
+    nodes: [],
+    links: [
+      {
+        id: 'f#0',
+        from: 'C1',
+        to: 'C2',
+        label: 'GE0/0/1 ↔ GE0/0/1',
+        lineKey: 'GE0/0/1->GE0/0/1',
+        source: 'manual',
+        portOffsets: { from: [{ x: 10, y: 0 }] }
+      },
+      {
+        id: 'f#1',
+        from: 'C1',
+        to: 'C2',
+        label: 'GE0/0/2 ↔ GE0/0/2',
+        lineKey: 'GE0/0/2->GE0/0/2',
+        source: 'manual',
+        portOffsets: { from: [{ x: -10, y: 0 }] }
+      }
+    ]
+  })
+  const s = store.snapshot()
+  assert.equal(s.links.length, 2)
+  const byLine = new Map(s.links.map((l) => [l.lineKey, l]))
+  assert.deepEqual(byLine.get('GE0/0/1->GE0/0/1').portOffsets, { from: [{ x: 10, y: 0 }] })
+  assert.deepEqual(byLine.get('GE0/0/2->GE0/0/2').portOffsets, { from: [{ x: -10, y: 0 }] })
 })
 
 test('单文件隔离：导入新工程文件重置旧工程手动层，防止幽灵节点污染', (t) => {

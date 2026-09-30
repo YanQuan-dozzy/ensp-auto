@@ -207,7 +207,14 @@ export class SnapshotStore {
 
   private persist(): void {
     // T2.5：统一原子写（唯一临时名 + rename + 失败清理 + 退避重试）
-    atomicWriteJsonSync(this.indexFile, this.index)
+    // D4：索引关掉 fsync（同 changes.ts 的理由：fsync 同步阻塞主进程，
+    // 而这里的写盘节奏由 apply_config 驱动，一次任务十几次）。
+    // **正文（`atomicWriteFileSync(file, config)`）仍保持 fsync** —— 快照正文是
+    // 回滚基线的真相来源，没有别处能重建；关掉它会直接违反
+    // 「不完整快照不得作回滚基线」这条既有约束。
+    // 这里同样不去抖：`save()` 的「落盘失败 → 回滚内存 + 删掉刚写的正文」
+    // 是硬纪律（write-pipeline.test.mjs 守着），去抖会把它变成异步失败。
+    atomicWriteJsonSync(this.indexFile, this.index, { fsync: false })
   }
 
   /**

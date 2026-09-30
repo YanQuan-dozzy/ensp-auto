@@ -1,5 +1,6 @@
 import fs from 'node:fs'
 import { emptyTopology, linkKey, mergeLayers, type Topology, type TopologyLink, type TopologyNode } from './model'
+import { linkIdentity } from '@shared/topology-link'
 import { atomicWriteJsonSync } from '../fs/atomic'
 
 /**
@@ -239,7 +240,16 @@ export class TopologyStore {
    */
   applyManual(manual: { nodes: TopologyNode[]; links: TopologyLink[] }): Topology {
     const liveNodeIds = new Set(manual.nodes.filter((n) => !n.deleted).map((n) => n.id))
-    const liveLinkKeys = new Set(manual.links.filter((l) => !l.deleted).map((l) => linkKey(l.from, l.to)))
+    /**
+     * 手动层的链路身份分两级（见 @shared/topology-link）：
+     * - 带 lineKey 的条目 → 按「设备对 + 线标识」复活同一条线的墓碑；
+     * - 不带 lineKey 的历史条目 → 按设备对复活（旧语义）。
+     * 混用同一把 key 会让「删掉第 2 条线」误复活第 1 条，或让并联的另一条被同 id 顶掉。
+     */
+    const liveLineKeys = new Set(manual.links.filter((l) => !l.deleted && l.lineKey).map(linkIdentity))
+    const livePairs = new Set(
+      manual.links.filter((l) => !l.deleted && !l.lineKey).map((l) => linkKey(l.from, l.to))
+    )
 
     const nodes = new Map<string, TopologyNode>()
     for (const n of this.manualLayer.nodes) {
@@ -253,14 +263,16 @@ export class TopologyStore {
     }
 
     const links = new Map<string, TopologyLink>()
+    const keyOf = (l: TopologyLink): string => (l.lineKey ? linkIdentity(l) : linkKey(l.from, l.to))
     for (const l of this.manualLayer.links) {
-      const k = linkKey(l.from, l.to)
-      if (l.deleted && liveLinkKeys.has(k)) continue
+      const k = keyOf(l)
+      const revived = l.lineKey ? liveLineKeys.has(k) : livePairs.has(k)
+      if (l.deleted && revived) continue
       if (!links.has(k)) links.set(k, l)
     }
     for (const l of manual.links) {
       if (l.deleted) continue
-      links.set(linkKey(l.from, l.to), l)
+      links.set(keyOf(l), l)
     }
 
     this.manualLayer = { nodes: [...nodes.values()], links: [...links.values()] }
@@ -272,13 +284,22 @@ export class TopologyStore {
   /**
    * 删除（v0.6 F-5.6）：节点 → 打墓碑并连带墓碑其全部链路；
    * 单条链路 → 只打链路墓碑。所有墓碑并入 manual 层，跨层（file/discovered）生效。
+   *
+   * `linkKeys` 同时接受两种粒度（见 @shared/topology-link）：
+   * - **线标识** `设备对|线标识` → 只删这一条（画布上右键删除单条连线走这里）；
+   * - **设备对** `A|B` → 删该设备对的**全部**线（断开设备、旧版渲染层调用走这里）。
    */
   remove(target: { nodeIds?: string[]; linkKeys?: string[] }): Topology {
     const nodeIds = new Set(target.nodeIds ?? [])
     const linkKeys = new Set(target.linkKeys ?? [])
     if (nodeIds.size === 0 && linkKeys.size === 0) return this.snapshot()
 
-    // 删除节点时连带其全部链路（链路墓碑与显式 linkKeys 同效）
+    /** 该链路是否命中删除目标（两种粒度都认） */
+    const isTarget = (l: TopologyLink): boolean =>
+      linkKeys.has(linkKey(l.from, l.to)) ||
+      (l.lineKey !== undefined && linkKeys.has(linkIdentity(l)))
+
+    // 删除节点时连带其全部链路（按设备对粒度，整对断开）
     const merged = this.snapshot()
     for (const l of merged.links) {
       if (nodeIds.has(l.from) || nodeIds.has(l.to)) linkKeys.add(linkKey(l.from, l.to))
@@ -287,7 +308,9 @@ export class TopologyStore {
     const tombNodes: TopologyNode[] = []
     const tombLinks: TopologyLink[] = []
     const tombstonedNodes = new Set<string>()
-    const tombstonedLinks = new Set<string>()
+    /** 墓碑去重按「条」：并联的两条线必须各留一枚墓碑，否则另一条会复活 */
+    const tombstonedLines = new Set<string>()
+    const tombKeyOf = (l: TopologyLink): string => (l.lineKey ? linkIdentity(l) : linkKey(l.from, l.to))
 
     const tombstoneNode = (n: TopologyNode): void => {
       if (tombstonedNodes.has(n.id)) return
@@ -295,9 +318,9 @@ export class TopologyStore {
       tombNodes.push({ id: n.id, name: n.name, role: n.role, deleted: true, source: 'manual' })
     }
     const tombstoneLink = (l: TopologyLink): void => {
-      const key = linkKey(l.from, l.to)
-      if (tombstonedLinks.has(key)) return
-      tombstonedLinks.add(key)
+      const key = tombKeyOf(l)
+      if (tombstonedLines.has(key)) return
+      tombstonedLines.add(key)
       tombLinks.push({ ...l, deleted: true, source: 'manual' })
     }
 
@@ -310,10 +333,11 @@ export class TopologyStore {
     const keepLinks: TopologyLink[] = []
     const seenKeys = new Set<string>()
     for (const l of this.manualLayer.links) {
-      const key = linkKey(l.from, l.to)
+      const key = tombKeyOf(l)
       if (seenKeys.has(key)) continue
       seenKeys.add(key)
-      if (linkKeys.has(key) && !l.deleted) tombstoneLink(l)
+      // 手动层条目用「条」粒度判定：同设备对的另一条线不该被连坐删除
+      if (isTarget(l) && !l.deleted) tombstoneLink(l)
       else keepLinks.push(l)
     }
     // 合并结果里非 manual 来源的节点/链路（file/discovered）也需要墓碑
@@ -321,7 +345,7 @@ export class TopologyStore {
       if (nodeIds.has(n.id) && !n.deleted) tombstoneNode(n)
     }
     for (const l of merged.links) {
-      if (linkKeys.has(linkKey(l.from, l.to)) && !l.deleted) tombstoneLink(l)
+      if (isTarget(l) && !l.deleted) tombstoneLink(l)
     }
 
     this.manualLayer = { nodes: [...keepNodes, ...tombNodes], links: [...keepLinks, ...tombLinks] }

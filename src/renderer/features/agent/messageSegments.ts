@@ -299,20 +299,65 @@ export interface TurnSlice {
  * body 里已无 user 段，它的起点就是本轮起点，语义正好对上。
  */
 export function splitTurns(segments: Segment[]): TurnSlice[] {
+  return splitTurnsReusing(segments, undefined)
+}
+
+/**
+ * R3（PERF-MEM-REVIEW-2026-09-29 §三）：带前缀复用的按轮切分。
+ *
+ * 为什么需要它：流式输出期间**只有最后一轮**在长（前面的轮早就定稿了），
+ * 但朴素的 `splitTurns` 每个 delta 都要为**每一轮**新建 `TurnSlice` 与
+ * `body` 数组 —— 200 段 / 20 轮就是每 token 20 轮 × 数组分配。
+ *
+ * 复用判据是**逐元素引用相同**：`groupMessages` 已经保证「未变化的段复用同一
+ * 个 segment 对象」（见文件头「前缀稳定」那段说明），所以引用比较足以判定
+ * 「这一轮的内容与上次完全一致」。命中则整个 `TurnSlice` 对象原样返回 ——
+ * `turn.body` 引用不变，调用方挂在上面的 `useMemo` 就不会重算。
+ *
+ * 传 `prev` 与不传结果完全一致（纯优化，不改语义）。
+ */
+export function splitTurnsReusing(segments: Segment[], prev?: TurnSlice[]): TurnSlice[] {
   const out: TurnSlice[] = []
+  /** 上一次的轮，按顺序与本次的轮一一对齐复用 */
+  let prevAt = 0
   let cur: TurnSlice | null = null
+  /** 当前轮的候选，与 `cur` 同步增长；命中复用时整轮替换 */
+  let body: Segment[] = []
+
+  const flush = (): void => {
+    if (!cur) return
+    const prevTurn = prev?.[prevAt]
+    if (prevTurn && prevTurn.key === cur.key && sameBodies(prevTurn.body, body)) {
+      out.push(prevTurn)
+    } else {
+      out.push(cur)
+    }
+    prevAt += 1
+    cur = null
+    body = []
+  }
+
   for (const seg of segments) {
     if (seg.kind === 'user') {
-      cur = { key: seg.id, user: seg, body: [] }
-      out.push(cur)
+      flush()
+      cur = { key: seg.id, user: seg, body }
       continue
     }
     if (!cur) {
-      cur = { key: `turn-head-${segmentKey(seg)}`, body: [] }
-      out.push(cur)
+      cur = { key: `turn-head-${segmentKey(seg)}`, body }
     }
-    cur.body.push(seg)
+    body.push(seg)
   }
+  flush()
   return out
+}
+
+/** 两轮的段列表是否逐元素同一引用（长度也要一致） */
+function sameBodies(a: Segment[], b: Segment[]): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false
+  }
+  return true
 }
 

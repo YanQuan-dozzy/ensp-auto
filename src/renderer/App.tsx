@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { useApp } from '@/stores/app'
 import { activeProfileOf } from '@shared/profiles'
 import { EVENT } from '@shared/channels'
-import type { WindowStatePayload } from '@shared/api'
+import type { AppInfoPayload, WindowStatePayload } from '@shared/api'
 import { DevicePanel } from '@/features/devices/DevicePanel'
 import { TerminalPane } from '@/features/terminal/TerminalPane'
 import { AgentPanel } from '@/features/agent/AgentPanel'
@@ -89,6 +89,7 @@ export function App(): ReactNode {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [isMaximized, setIsMaximized] = useState(false)
   const [alwaysOnTop, setAlwaysOnTopState] = useState(false)
+  const [appVersion, setAppVersion] = useState('')
   const [leftW, setLeftW] = useState(settings.panels.left)
   const [rightW, setRightW] = useState(settings.panels.right)
   const dragging = useRef<'left' | 'right' | null>(null)
@@ -116,6 +117,12 @@ export function App(): ReactNode {
   // 初始化置顶状态（非持久化，随窗口生命周期）
   useEffect(() => {
     void window.api.window.isAlwaysOnTop().then(setAlwaysOnTopState)
+  }, [])
+
+  // 状态栏版本号取真实 app 版本（package.json 的 version → 主进程 app.getVersion()），
+  // 与「设置 → 关于」同一事实源：写死字面量会在升级时静默过期。
+  useEffect(() => {
+    void window.api.app.info().then((i: AppInfoPayload) => setAppVersion(i.version))
   }, [])
 
   const toggleAlwaysOnTop = (): void => {
@@ -175,6 +182,26 @@ export function App(): ReactNode {
   }, [])
 
   useEffect(() => {
+    /**
+     * R4（PERF-MEM-REVIEW-2026-09-29 §4.3）：拖拽用 rAF 节流。
+     *
+     * 原来每个 `mousemove` 都直接 `setLeftW/setRightW` ⇒ 每秒 60~120 次
+     * **`App` 顶层重渲染**（`App` 没有 memo）。连带后果不只是本面板：
+     * `AgentPanel` 顶层会重跑、`DevicePanel` 整个设备列表重渲；
+     * 拓扑页上更糟 —— `TopologyCanvas` 的内联箭头回调（`onNodeDragStart` /
+     * `onPaneClick` / `onSetSub`）每次换引用，ReactFlow 内部的 memo 全部失效。
+     *
+     * 做法：**宽度值每帧最多提交一次**，rAF 之外只更新 ref。
+     * 视觉上分隔条仍然跟手（宽度本来就只在重渲染后才可见），
+     * 而 `onUp` 读的是 ref，落盘的永远是最后一个真实位置。
+     */
+    let raf: number | null = null
+    const flush = (): void => {
+      raf = null
+      if (!dragging.current) return
+      setLeftW(leftWRef.current)
+      setRightW(rightWRef.current)
+    }
     const onMove = (e: MouseEvent): void => {
       if (!dragging.current) return
       const curSettings = useApp.getState().settings
@@ -182,21 +209,25 @@ export function App(): ReactNode {
 
       if (dragging.current === 'left') {
         const curRight = curSettings.panels.rightCollapsed ? 0 : rightWRef.current
-        const next = computeClampedLeft(e.clientX, winW, curRight)
-        leftWRef.current = next
-        setLeftW(next)
+        leftWRef.current = computeClampedLeft(e.clientX, winW, curRight)
       } else {
         const curLeft = curSettings.panels.leftCollapsed ? 0 : leftWRef.current
-        const next = computeClampedRight(e.clientX, winW, curLeft)
-        rightWRef.current = next
-        setRightW(next)
+        rightWRef.current = computeClampedRight(e.clientX, winW, curLeft)
       }
+      if (raf === null) raf = requestAnimationFrame(flush)
     }
     const onUp = (): void => {
       if (!dragging.current) return
+      if (raf !== null) {
+        cancelAnimationFrame(raf)
+        raf = null
+      }
       const which = dragging.current
       dragging.current = null
       document.body.style.cursor = ''
+      // 拖拽期间 setState 被 rAF 节流，最后一帧未必提交过 —— 落盘前补一次
+      if (which === 'left') setLeftW(leftWRef.current)
+      else setRightW(rightWRef.current)
       void updateSettings({
         panels: {
           ...useApp.getState().settings.panels,
@@ -207,6 +238,7 @@ export function App(): ReactNode {
     window.addEventListener('mousemove', onMove)
     window.addEventListener('mouseup', onUp)
     return () => {
+      if (raf !== null) cancelAnimationFrame(raf)
       window.removeEventListener('mousemove', onMove)
       window.removeEventListener('mouseup', onUp)
     }
@@ -602,10 +634,46 @@ export function App(): ReactNode {
               ) : null}
             </div>
 
-            {activeTab === 'topology' ? <TopologyCanvas /> : null}
+            {/*
+              R11（PERF-MEM-REVIEW-2026-09-29 §4.3）：**保活**而不是卸载。
+
+              原来这里是 `activeTab === 'x' ? <X /> : null` —— 切走的组件被真卸载，
+              切回来时 `TopologyCanvas` 要重跑布局内核 + 走线 + 全量 `toFlowNodes/Edges`，
+              `ChangeTimeline` 要跨 IPC 重拉，`TracePanel` 要重拉整棵会话树。
+              用户「点一下另一个 tab 再切回来」就白付一次完整代价。
+
+              做法与终端一致（见下方 TerminalPane）：每个面板常驻在一层 `.col` 里，
+              靠 `display` 切换显隐 —— 组件不卸载，state（滚动位置、已拉取的数据、
+              React Flow 的节点/视口）自然全部保留。`.col` 自带卡片外观
+              （背景/边框/圆角），所以必须**每个面板各包一层**，不能共用一个容器。
+
+              ⚠️ React Flow 在 `display:none` 期间容器尺寸为 0，切回来时必须重新
+              量尺寸做 fit —— `TopologyCanvas` 内部的 `ResizeObserver` 会在容器重新
+              有尺寸时触发，这正是终端已经依赖的同一条路径（见 TerminalPane 的
+              R8 合流）。**不要把这几层改成 `visibility:hidden`**：那样尺寸不为 0，
+              ResizeObserver 不触发，拓扑不会重新 fit，视口会错位。
+
+              `SkillsPanel` 保持卸载 —— 它是纯列表、无内部状态，重挂载代价可忽略。
+            */}
+            <div
+              className="col"
+              style={{ flex: 1, minWidth: 0, minHeight: 0, display: activeTab === 'topology' ? 'flex' : 'none' }}
+            >
+              <TopologyCanvas />
+            </div>
             {activeTab === 'skills' ? <SkillsPanel /> : null}
-            {activeTab === 'changes' ? <ChangeTimeline /> : null}
-            {activeTab === 'trace' ? <TracePanel /> : null}
+            <div
+              className="col"
+              style={{ flex: 1, minWidth: 0, minHeight: 0, display: activeTab === 'changes' ? 'flex' : 'none' }}
+            >
+              <ChangeTimeline />
+            </div>
+            <div
+              className="col"
+              style={{ flex: 1, minWidth: 0, minHeight: 0, display: activeTab === 'trace' ? 'flex' : 'none' }}
+            >
+              <TracePanel />
+            </div>
             {/* v1.8：终端保活 —— 切走用 CSS 隐藏而不是卸载，避免 xterm 滚动缓冲（10000 行）
                 随切 tab 丢失；xterm 在 display:none 期间仍积累写入，ResizeObserver 在
                 显示时重新 fit 尺寸 */}
@@ -666,7 +734,7 @@ export function App(): ReactNode {
             <span>扫描 {scanProgress.scanned}/{scanProgress.total}</span>
           </>
         ) : null}
-        <span style={{ marginLeft: 'auto' }}>v0.1.0</span>
+        <span style={{ marginLeft: 'auto' }}>{appVersion ? `v${appVersion}` : ''}</span>
       </div>
 
       <GateDialog />

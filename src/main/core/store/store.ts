@@ -37,8 +37,11 @@ interface Persisted {
  * 为什么要门控、而不是让上调逻辑一直挂在读取路径上：读取路径同时也是写入路径
  * （每次 updateSettings 都会重新规整），一直挂着就意味着用户之后主动把轮数填回 50、
  * 把字符预算填回 200000 都会被静默改回新默认值 —— 那正是「改了没反应且没有任何报错」。
+ *
+ * 每次新增一条一次性迁移都要 +1，否则老安装永远拿不到它。
+ * v3（2026-09-28）：压缩预算脱离「跟着窗口走」（80 万 → 20 万字符、单条 1.2 万 → 8 千）。
  */
-const PERSIST_VERSION = 2
+const PERSIST_VERSION = 3
 
 const EMPTY: Persisted = {
   version: PERSIST_VERSION,
@@ -91,13 +94,13 @@ function withNormalizedAgent(s: Settings): Settings {
 }
 
 /**
- * v2.9：出厂默认值上调（一次性，见 PERSIST_VERSION 的说明）。
+ * 出厂默认值迁移（一次性，见 PERSIST_VERSION 的说明）。
  *
- * 覆盖两处「档位默认值跟着 eNSP 长实验上调」的地方：
- * - agent 档案：工具调用轮数、上下文窗口（shared/profiles.ts）
- * - 压缩设置：字符预算、保留轮数（shared/runtime-policy.ts）
+ * 覆盖两处「档位默认值随版本调整」的地方：
+ * - agent 档案：工具调用轮数、上下文窗口（shared/profiles.ts，v2.9）
+ * - 压缩设置：字符预算、单条工具结果预算、保留轮数（shared/runtime-policy.ts，v2.9 + v2.28）
  *
- * 两处内部都只认「仍停在旧默认值上」的那一个组合，用户自己调过的值一律不动。
+ * 两处内部都只认「仍停在某个旧出厂值上」的那一个组合，用户自己调过的值一律不动。
  */
 function migrateDefaultValues(s: Settings): Settings {
   return {

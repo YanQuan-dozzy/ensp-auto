@@ -113,16 +113,29 @@ export function planRetry(
 
 export interface CompactionSettings {
   enabled: boolean
-  /** 单条工具结果的字符上限，超出保头保尾（这是最常见的溢出源） */
+  /**
+   * 单条工具结果的字符上限，超出保头保尾（这是最常见的溢出源）。
+   *
+   * v2.28：默认值从 1.2 万降到 8 千。每条结果都会在**后续每一轮**里重发一次，
+   * 所以它的成本是「条数 × 剩余轮数」——长任务里单条少 1/3 会累积成很大的差额。
+   * 超预算的部分不会丢：先整份归档到磁盘，再把定位符留给模型（v2.14 的溢出落盘）。
+   */
   toolResultMaxChars: number
   /**
-   * 整个 transcript 的字符预算，超出即压缩老轮次。
+   * 整个 transcript 的字符预算，超出即压缩老轮次。**这是与窗口无关的绝对上限**。
    *
-   * v2.9：默认值从 20 万提到 80 万，跟着模型窗口一起上调。
-   * 理由是这两个数字**必须同一个量级**：字符判据若远小于 token 判据，
-   * 它就会变成实际的主判据 —— 20 万字符按 3.2 字符/token 折算约 6.3 万 token，
-   * 只有 256k 窗口的 24%，于是「窗口抬大了」在长实验里一点用都没有，
-   * 压缩照样在原来的位置触发。80 万 ≈ 256k token × 3.2，token 判据重新成为主判据。
+   * v2.28：默认值从 80 万降到 20 万。
+   *
+   * 为什么必须降：token 判据是 `contextWindow × pressureRatio`，而 `contextWindow`
+   * 是**用户手填的**。本仓实测到一个真实案例：窗口填 512k，token 判据就要等到
+   * 512k × 0.75 = 384k tokens，可字符判据要 80 万字符（≈25 万 tokens，实测更**先**
+   * 触发）—— 一次 33 轮的任务最终只涨到 10.8 万 tokens / 约 34.6 万字符，
+   * **两条判据一条都没摸到**。结果是上百条工具回显全部原样留在 transcript 里，
+   * 每一轮都要重发一遍，该任务累计输入 174 万 tokens。
+   *
+   * 结论：把预算挂在窗口上等于「窗口填得越大、压缩越不触发、账单越失控」。
+   * 20 万字符 ≈ 6.3 万 tokens，是「够模型记住当前在干什么」与「每轮别重发太多」
+   * 之间的折中；老的原始回显不会被删 —— 溢出归档仍在磁盘上，可用 read_attachment 取回。
    */
   transcriptMaxChars: number
   /**
@@ -151,38 +164,59 @@ export interface CompactionSettings {
 
 export const DEFAULT_COMPACTION: CompactionSettings = {
   enabled: true,
-  toolResultMaxChars: 12_000,
-  transcriptMaxChars: 800_000,
+  toolResultMaxChars: 8_000,
+  transcriptMaxChars: 200_000,
   keepRounds: 8,
   pressureRatio: 0.75,
   summarize: true
 }
 
-/** v2.9 之前的两项默认值（一次性迁移的判据，见 upgradeCompactionDefaults） */
-const LEGACY_COMPACTION_DEFAULTS = {
-  transcriptMaxChars: 200_000,
-  keepRounds: 4
+/**
+ * 曾作为**出厂值**发布过、现已废弃的取值。
+ *
+ * 判据是「恰好等于某个旧出厂值」，不是「比新值大/小」——「只要小于新值就抬」
+ * 会把用户主动调小的预算静默改回去（想早点压缩省 token 是完全合理的需求）。
+ */
+const LEGACY_COMPACTION_VALUES: {
+  transcriptMaxChars: readonly number[]
+  toolResultMaxChars: readonly number[]
+  keepRounds: readonly number[]
+} = {
+  /** v2.9 的 transcriptMaxChars（在 512k 窗口下永远不会触发，见字段说明） */
+  transcriptMaxChars: [800_000],
+  /** v1.7~v2.28 的 toolResultMaxChars */
+  toolResultMaxChars: [12_000],
+  /** v2.9 之前的 keepRounds */
+  keepRounds: [4]
 }
 
 /**
- * v2.9：把仍停在旧默认值上的压缩设置抬到新默认值（20 万 → 80 万字符、保留 4 → 8 轮）。
+ * 把仍停在**旧出厂值**上的压缩设置抬到当前默认值。
+ *
+ * v2.9：20 万 → 80 万字符、保留 4 → 8 轮。
+ * v2.28：80 万 → 20 万字符、单条 1.2 万 → 8 千字符（见两个字段各自的说明：
+ *   跟着窗口走的预算让「窗口填得越大、账单越失控」，实测长任务里压缩从不触发）。
  *
  * 为什么需要：设置是本地持久化的，只改 DEFAULT_COMPACTION 对老用户不生效
- * （deepMergeSettings 里存量的值优先）。为什么只认旧默认值、而不是「小于新值就抬」：
- * 用户可能是特意把预算调小的（想早点压缩、省 token），那种值必须原样保留。
+ * （deepMergeSettings 里存量的值优先）。为什么只认旧出厂值、而不是「小于/大于新值就抬」：
+ * 用户可能是特意调过的（想早点压缩省 token、或想让单条回显更完整），
+ * 那种值必须原样保留（tests/unit 里有守着这条的用例）。
  *
  * **只在落盘版本落后时调用一次**（见 store.ts 的 migrateDefaultValues）：
- * 每次保存都跑的话，用户之后主动填回 200000 或 4 会被静默改回去 —— 正是这个项目
+ * 每次保存都跑的话，用户之后主动填回旧值会被静默改回去 —— 正是这个项目
  * 最讨厌的那类「改了没反应、还没有任何报错」。
  *
  * 没变化时返回**原对象**（调用方依赖引用稳定，见 store 的 merge 语义）。
  */
 export function upgradeCompactionDefaults(c: CompactionSettings): CompactionSettings {
   let next = c
-  if (c.transcriptMaxChars === LEGACY_COMPACTION_DEFAULTS.transcriptMaxChars) {
+  if (LEGACY_COMPACTION_VALUES.transcriptMaxChars.includes(c.transcriptMaxChars)) {
     next = { ...next, transcriptMaxChars: DEFAULT_COMPACTION.transcriptMaxChars }
   }
-  if (c.keepRounds === LEGACY_COMPACTION_DEFAULTS.keepRounds) {
+  if (LEGACY_COMPACTION_VALUES.toolResultMaxChars.includes(c.toolResultMaxChars)) {
+    next = { ...next, toolResultMaxChars: DEFAULT_COMPACTION.toolResultMaxChars }
+  }
+  if (LEGACY_COMPACTION_VALUES.keepRounds.includes(c.keepRounds)) {
     next = { ...next, keepRounds: DEFAULT_COMPACTION.keepRounds }
   }
   return next

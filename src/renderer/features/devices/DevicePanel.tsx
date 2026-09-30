@@ -280,17 +280,7 @@ export function DevicePanel(): ReactNode {
                 <div className="device-meta">
                   {isSsh(d) ? (
                     <>
-                      <span
-                        style={{
-                          fontSize: 10,
-                          padding: '1px 6px',
-                          borderRadius: 99,
-                          background: 'var(--agent-subtle)',
-                          color: 'var(--agent)'
-                        }}
-                      >
-                        ssh
-                      </span>{' '}
+                      <span className="transport-badge">ssh</span>{' '}
                       {parseDeviceId(d.id)?.host ?? ''}:{d.port}
                     </>
                   ) : (

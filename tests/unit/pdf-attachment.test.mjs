@@ -277,6 +277,103 @@ test('AttachmentStore.readText：PDF 按行分页，返回 format=pdf 与抽取�
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
+// ——————————————————————————————————————————————————————————————
+// M5（PERF-MEM-REVIEW-2026-09-29 §4.1）：docCache 的 LRU + 字节预算 + 换目录清理
+// ——————————————————————————————————————————————————————————————
+
+/** 造一份 PDF，正文共 `lines` 行（每行内容可控长度） */
+function pdfWithLines(lines, pad = 0) {
+  const content = Array.from(
+    { length: lines },
+    (_, i) => `BT /F1 12 Tf 1 0 0 1 72 ${700 - i * 14} Tm (${'x'.repeat(pad)}${i}) Tj ET`
+  ).join('\n')
+  return simplePdf(content)
+}
+
+test('M5：缓存是 LRU —— 命中过的文档翻回来仍在缓存里（FIFO 会被挤掉重抽）', async () => {
+  const dir = tmpDir('doclru')
+  const store = new AttachmentStore(dir)
+
+  const files = []
+  for (let i = 0; i < 4; i++) {
+    const src = path.join(dir, `doc${i}.pdf`)
+    fs.writeFileSync(src, pdfWithLines(5))
+    const imported = await store.import('s1', [src])
+    files.push(imported.attachments[0].path)
+  }
+
+  // 先把 4 份都读一遍填满缓存，再回头读第 1 份（把它提到队尾）
+  for (const f of files) await store.readText(f, 0, 10)
+  assert.equal(store.docCacheStats().entries, 4)
+  await store.readText(files[0], 0, 10)
+  // 再读一份新的（第 5 份）触发淘汰 —— 被淘汰的应是「最久未用」的那份，
+  // 也就是 files[1]，而刚命中的 files[0] 必须留下
+  const extra = path.join(dir, 'doc-extra.pdf')
+  fs.writeFileSync(extra, pdfWithLines(5))
+  const imp = await store.import('s1', [extra])
+  await store.readText(imp.attachments[0].path, 0, 10)
+
+  assert.ok(store.docCacheStats().entries <= 4, '条目数超上限')
+  // 仍然能正确读出内容（淘汰只影响性能，不影响正确性）
+  const back = await store.readText(files[0], 0, 10)
+  assert.equal(back.ok, true)
+  assert.equal(back.text.split('\n')[0], '0')
+
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('M5：总字符预算必须封顶（4 份 200 万字符 ≈ 16MB 常驻）', async () => {
+  const dir = tmpDir('docbudget')
+  const store = new AttachmentStore(dir)
+
+  // 每份约 6 万字符 × 4 份 = 24 万 → 低于 50 万预算，应全留
+  for (let i = 0; i < 4; i++) {
+    const src = path.join(dir, `big${i}.pdf`)
+    fs.writeFileSync(src, pdfWithLines(30, 2000))
+    const imported = await store.import('s1', [src])
+    await store.readText(imported.attachments[0].path, 0, 5)
+  }
+  const st = store.docCacheStats()
+  assert.ok(st.chars <= 500_000, `字符预算超了：${st.chars}`)
+  assert.ok(st.chars > 0, '缓存没生效（characters 记账为 0）')
+
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('M5：setRootDir 必须清缓存（旧目录的大文档不该继续驻留）', async () => {
+  const dir = tmpDir('docroot')
+  const store = new AttachmentStore(dir)
+  const src = path.join(dir, 'a.pdf')
+  fs.writeFileSync(src, pdfWithLines(5))
+  const imported = await store.import('s1', [src])
+  await store.readText(imported.attachments[0].path, 0, 10)
+  assert.ok(store.docCacheStats().entries > 0)
+
+  store.setRootDir(path.join(dir, 'other'))
+  assert.equal(store.docCacheStats().entries, 0, 'setRootDir 没有清缓存')
+  assert.equal(store.docCacheStats().chars, 0, '字符记账没有归零')
+  // 同一个目录再设一次不应白清（幂等）
+  store.setRootDir(path.join(dir, 'other'))
+  assert.equal(store.docCacheStats().entries, 0)
+
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('M5：失败结果不进缓存（否则会把有用的成功结果挤走）', async () => {
+  const dir = tmpDir('docfail')
+  const store = new AttachmentStore(dir)
+  // 加密 PDF：抽取必然失败
+  const enc = pdf(obj(1, '<< /Type /Catalog /Pages 2 0 R >>'), obj(2, '<< /Type /Pages >>'), 'trailer\n<< /Encrypt 9 0 R >>\n')
+  const src = path.join(dir, 'enc.pdf')
+  fs.writeFileSync(src, enc)
+  const imported = await store.import('s1', [src])
+  const r = await store.readText(imported.attachments[0].path, 0, 10)
+  assert.equal(r.ok, false)
+  assert.equal(store.docCacheStats().entries, 0, '失败结果被缓存了')
+
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
 test('AttachmentStore.readText：非文档二进制报 NOT_TEXT 且给出处置建议（不再一律 BAD_PARAM）', async () => {
   const dir = tmpDir('binstore')
   const store = new AttachmentStore(dir)

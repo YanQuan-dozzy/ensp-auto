@@ -120,7 +120,7 @@ const TAB_META: Record<SettingsTab, { title: string; desc: string; foot: string 
   },
   wireshark: {
     title: '抓包分析',
-    desc: '让代理读懂 .pcap —— 接入本机 Wireshark 的分析能力',
+    desc: '让代理读懂 .pcap，接入本机 Wireshark 的分析能力',
     foot: '抓包分析设置即时生效'
   },
   ssh: {
@@ -130,7 +130,7 @@ const TAB_META: Record<SettingsTab, { title: string; desc: string; foot: string 
   },
   permission: {
     title: '权限与审批',
-    desc: '代理能干到哪一步 —— 破坏性操作与外部工具的口径',
+    desc: '代理能干到哪一步：破坏性操作与外部工具的管控口径',
     foot: '权限设置即时生效，且只影响后续操作'
   }
 }

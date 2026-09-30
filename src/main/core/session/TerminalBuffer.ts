@@ -31,6 +31,23 @@ export type { TerminalBufferSegment }
 export const DEFAULT_TERMINAL_BUFFER_BYTES = 256 * 1024
 
 /**
+ * M4（PERF-MEM-REVIEW-2026-09-29 §4.1）：**段数**上限。
+ *
+ * 为什么光有字节上限不够：`append` 每个 TCP chunk 压一条 segment，而 `trim()`
+ * 原来只按**字节**裁（256KB）。设备以小包慢速吐数据时（分页续读、逐字符回显、
+ * 一个字节一个字节地回 `---- More ----`），**每 chunk 1 字节就能塞满
+ * 262144 条 segment 对象** —— 每个对象带 `data`/`fromAgent`/`seq` 三个字段外加
+ * 对象头，单设备实际占用 25~50MB，而字节计数才 256KB。
+ *
+ * 上界取 512：正常交互（一次命令回显）只有几条到几十条，512 足够覆盖整屏回放。
+ *
+ * ⚠️ **只能靠「丢最旧的整段」来兜底，不能在 append 里合并相邻片** ——
+ * 合并会让两条 chunk 复用同一个 `seq`，而渲染层是按 `seq` 水位去重的
+ * （见 `append` 的注释），后果是终端随机丢字节。
+ */
+export const DEFAULT_TERMINAL_MAX_SEGMENTS = 512
+
+/**
  * 把下标向前对齐到 UTF-8 字符边界。
  *
  * 裁剪时若从多字节字符中间切开，xterm 开头几个字符就是乱码（连续字节解不出来）。
@@ -47,7 +64,10 @@ export class TerminalBuffer {
   private bytes = 0
   private seq = 0
 
-  constructor(private readonly maxBytes: number = DEFAULT_TERMINAL_BUFFER_BYTES) {}
+  constructor(
+    private readonly maxBytes: number = DEFAULT_TERMINAL_BUFFER_BYTES,
+    private readonly maxSegments: number = DEFAULT_TERMINAL_MAX_SEGMENTS
+  ) {}
 
   get byteLength(): number {
     return this.bytes
@@ -62,7 +82,16 @@ export class TerminalBuffer {
     return this.segments.length
   }
 
-  /** 追加一段设备原始输出，返回本次分配的序号 */
+  /**
+   * 追加一段设备原始输出，返回本次分配的序号。
+   *
+   * ⚠️ **一个 chunk 一条 segment，`seq` 严格是「本次 append 的编号」——
+   * 这里绝不能把相邻片合并**：`DeviceSession` 把本方法的返回值直接当作实时事件的
+   * `seq` 广播给渲染层（`deps.onRaw(..., seq, ...)`），而渲染层用
+   * `p.seq > snap.seq` 决定「快照之后到达的实时片要不要画」。
+   * 一旦两条 chunk 复用同一个 `seq`，后到的那条会因为不大于水位而被**静默丢弃**
+   * （表现为终端随机丢字节）。段数问题在 `trim()` 里按条数裁，不在这里合并。
+   */
   append(chunk: Uint8Array, fromAgent: boolean): number {
     this.seq += 1
     if (!chunk.byteLength) return this.seq
@@ -87,6 +116,12 @@ export class TerminalBuffer {
   private trim(): void {
     // 优先按整段丢弃：段边界天然是合法的字节边界，不会切断字符
     while (this.bytes > this.maxBytes && this.segments.length > 1) {
+      const dropped = this.segments.shift()!
+      this.bytes -= dropped.data.length
+    }
+    // M4：段数兜底。字节上限挡不住「每 chunk 1 字节」的形态（256KB / 1B
+    // = 26 万个对象），这里再按条数裁一次 —— 同样整段丢，不切字符。
+    while (this.segments.length > this.maxSegments) {
       const dropped = this.segments.shift()!
       this.bytes -= dropped.data.length
     }

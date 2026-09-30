@@ -78,6 +78,30 @@ export interface ConnectAllProgress {  total: number
   ok: number
 }
 
+/**
+ * 拓扑加载阶段（v2.29）—— 顺序即真实执行顺序，进度条据此推进。
+ *
+ * 为什么按「阶段」而不是按百分比伪造：导入大工程时耗时集中在**布局**与**走线**两段
+ * 同步计算上（实测 300 台拓扑 ≈ 19ms，40 台 ≈ 4ms；老版本 300 台要 82ms）。这段
+ * 时间界面无法响应，用户会以为卡死。按真实阶段上报既能给出可信进度，又能在出问题时
+ * 一眼看出卡在哪一步。
+ */
+export type TopoLoadPhase = 'read' | 'layout' | 'route' | 'render'
+
+/** 阶段顺序（进度条据此把「阶段 + 阶段内比例」折成总进度，见 TopoLoadingBar） */
+export const TOPO_LOAD_PHASES: readonly TopoLoadPhase[] = ['read', 'layout', 'route', 'render'] as const
+
+/** 拓扑加载进度（v2.29） */
+export interface TopoLoadProgress {
+  phase: TopoLoadPhase
+  /** 0~1；同一阶段内可细化（如按已布局设备数），阶段切换时由调用方单调推进 */
+  ratio: number
+  /** 可选的人工可读说明（如「正在重排 40 台设备」） */
+  detail?: string
+  /** 本阶段开始时间戳（用于「已耗时」提示，避免用户以为卡死） */
+  startedAt: number
+}
+
 export type MainTab = 'terminal' | 'topology' | 'skills' | 'changes' | 'trace'
 
 /** 主会话（单会话模型；会话树分支用 activeRootId/activeStartNodeId 表达回溯） */

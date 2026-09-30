@@ -565,7 +565,7 @@ test('★ 计划模式：不执行则收尾且不碰设备；写意见则留在�
   assert.equal(events2.filter((e) => e.type === 'plan_reviewed')[0].action, 'revising')
 })
 
-test('★ 任务清单：todo_write 后下发 todo_update（并把清单写进后续 system prompt）', async () => {
+test('★ 任务清单：todo_write 后下发 todo_update，清单追加进 transcript 且不进 system prompt', async () => {
   const settings = settingsWith()
   const todoTool = realTool('todo_write')
   const todoScript = [
@@ -612,10 +612,20 @@ test('★ 任务清单：todo_write 后下发 todo_update（并把清单写进�
     assert.equal(updates[0].todos[0].content, '建 VLAN 10')
     assert.equal(store.get('s-aaaaaaaa')[0].status, 'in_progress')
 
-    // 清单必须进后续请求的 system prompt（模型才知道做到哪了）
+    // v2.28：清单必须让模型看见（做到哪了），但**不能进 system prompt** ——
+    // 它是服务端 prompt cache 的第一个前缀，逐字变化会让后面整段 transcript 全价重算。
+    // 所以它只作为一段文本追加到 transcript 末尾。
     const after = requests2.filter((r) => !r.isSummary)
-    assert.match(after[after.length - 1].systemPrompt, /当前任务清单/)
-    assert.match(after[after.length - 1].systemPrompt, /建 VLAN 10/)
+    const last = after[after.length - 1]
+    assert.doesNotMatch(last.systemPrompt, /当前任务清单/, '★ 清单不许再进 system prompt（会击穿前缀缓存）')
+    assert.ok(
+      last.messages.some((m) => JSON.stringify(m.content).includes('建 VLAN 10')),
+      '清单必须出现在 transcript 里，模型才知道做到哪了'
+    )
+
+    // 整轮任务的 system prompt 必须**逐字不变** —— 否则前缀缓存从变化点起全部失效
+    const prompts = new Set(after.map((r) => r.systemPrompt))
+    assert.equal(prompts.size, 1, '★ 同一任务的 system prompt 必须逐字一致（缓存前提）')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -643,7 +653,7 @@ test('★ todo_write：没有清单存储时返回 UNSUPPORTED（对外 MCP 出�
   assert.equal(end.errorCode, 'UNSUPPORTED')
 })
 
-test('★ 清单跨任务持久：重开会话时把已有清单推给界面并注入提示词', async () => {
+test('★ 清单跨任务持久：重开会话时把已有清单推给界面并挂到首轮用户消息上', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'todo-resume-'))
   const store = new TodoStore(path.join(dir, 'todos.json'))
   try {
@@ -662,9 +672,16 @@ test('★ 清单跨任务持久：重开会话时把已有清单推给界面并�
     const restore = events.filter((e) => e.type === 'todo_update')
     assert.equal(restore.length, 1, '本轮开始时应下发一次清单恢复事件')
     assert.equal(restore[0].todos.length, 2)
+    // v2.28：注入点是 transcript（首轮用户消息），不是 system prompt ——
+    // 后者是服务端 prompt cache 的第一个前缀，逐字变化会让后面整段全价重算。
     const req = requests.find((r) => !r.isSummary)
-    assert.match(req.systemPrompt, /第一步已完成/)
-    assert.match(req.systemPrompt, /第二步待做/)
+    assert.doesNotMatch(req.systemPrompt, /第一步已完成/, '★ 清单不许进 system prompt')
+    const injected = req.messages.some((m) => JSON.stringify(m.content).includes('第一步已完成'))
+    assert.ok(injected, '恢复的清单必须随首轮用户消息交给模型，否则它会重做已完成的事')
+    assert.ok(
+      req.messages.some((m) => JSON.stringify(m.content).includes('第二步待做')),
+      '未完成的步骤同样要在清单里'
+    )
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }

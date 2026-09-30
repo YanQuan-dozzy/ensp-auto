@@ -136,7 +136,7 @@ export function QuestionDialog(): ReactNode {
           <p style={{ fontSize: 'var(--text-xs)', color: 'var(--text-muted)' }}>
             {isPlan
               ? '批准后我会按方案开始改动设备；写操作仍会逐次弹出危险操作确认。取消（Esc）则本轮结束，不碰任何设备。'
-              : '回答后代理会带着答案继续当前任务 —— 已连接的设备、已采集的回显都还在，不用重说一遍。'}
+              : '回答后代理会带着答案继续当前任务，已连接的设备、已采集的回显都还在，无需重说一遍。'}
           </p>
 
           <div className="dialog-actions">

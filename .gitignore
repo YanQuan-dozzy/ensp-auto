@@ -34,3 +34,10 @@ tests/.build/
 # 由 tools/make-launcher.py 用 csc 编译 tools/launcher.cs 得到的启动器二进制
 # （源码是 launcher.cs，二进制不入库；构建方式见 tools/）
 start.exe
+
+# git filter-branch 的工作目录（中断后可能残留，绝非源码；重建历史时由 git 自管）
+.git-rewrite/
+
+# Electron 运行时重定向到工作区的控制台日志（渲染进程 CSP 告警等）
+log.txt
+log-*.txt

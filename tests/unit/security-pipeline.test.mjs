@@ -14,6 +14,7 @@ import {
   classifyDanger,
   isReadOnlyCommand,
   planDangerGate,
+  planCommandGate,
   GATE_DENIED_SUMMARY,
   parsePort,
   parsePortOr
@@ -53,10 +54,125 @@ test('T1.1 闸门策略：被否的文案不谎称「用户拒绝」', () => {
   assert.ok(!denied.summary.includes('用户拒绝'))
 })
 
-test('T1.1 命令级危险清单不受「关掉确认框」影响', () => {
-  // 闸门开关只管“要不要问人”，清单拦截是另一层，永远生效
+test('T1.1 命令级危险清单：默认拦截（确认框开启）', () => {
+  // 闸门开启时清单照拦
   assert.equal(classifyDanger('save').dangerous, true)
   assert.equal(classifyDanger('reboot').dangerous, true)
+})
+
+// ———————————————— v2.28 命令级清单同样受「关掉确认框」管辖 ————————————————
+
+test('v2.28 planCommandGate：关掉确认框 → 命令级清单同步放行', () => {
+  const blocked = planCommandGate({
+    dangerous: true,
+    reason: '命中危险命令清单：reboot',
+    multiLine: false,
+    confirmDanger: true
+  })
+  assert.equal(blocked.kind, 'block')
+
+  const released = planCommandGate({
+    dangerous: true,
+    reason: '命中危险命令清单：reboot',
+    multiLine: false,
+    confirmDanger: false
+  })
+  assert.equal(released.kind, 'run')
+  assert.ok(released.note.includes('命令级危险清单'), '放行必须留痕（哪一层被松开了）')
+})
+
+test('v2.28 planCommandGate：多行命令关掉确认框也不放行', () => {
+  // 多行不是「危险分类」而是分类的前提 —— 设备逐行执行，单条判定管不住第二行
+  const plan = planCommandGate({
+    dangerous: true,
+    reason: '命令包含 2 行',
+    multiLine: true,
+    confirmDanger: false
+  })
+  assert.equal(plan.kind, 'block', '多行命令永远拦，与开关无关')
+})
+
+test('v2.28 planCommandGate：非危险命令直接放行且无标注', () => {
+  const plan = planCommandGate({
+    dangerous: false,
+    multiLine: false,
+    confirmDanger: true
+  })
+  assert.equal(plan.kind, 'run')
+  assert.equal(plan.note, undefined)
+})
+
+test('v2.28 apply_config：关掉确认框后 reboot 真正放行到设备', async () => {
+  const { mock, deviceId, changes, ctx, teardown } = await setup({
+    confirmDanger: false,
+    handlers: [{ match: /^reboot$/i, respond: () => ({ text: 'System is rebooting...' }) }]
+  })
+  try {
+    const res = await applyConfig.handler(
+      { deviceId, commands: ['reboot'], description: '放行破坏性命令' },
+      ctx
+    )
+    assert.notEqual(
+      res.error?.code,
+      'DANGER_COMMAND_BLOCKED',
+      '关掉确认框后命令级清单必须放行（这正是本次修复）'
+    )
+    assert.ok(mock.receivedCommands.includes('reboot'), '命令必须真的下发到设备')
+    assert.equal(changes.latest(deviceId).result, res.ok ? 'ok' : 'failed')
+  } finally {
+    await teardown()
+  }
+})
+
+test('v2.28 apply_config：关掉确认框后「save」不再被 DANGER_COMMAND_BLOCKED 拦', async () => {
+  const { mock, deviceId, ctx, teardown } = await setup({
+    confirmDanger: false,
+    handlers: [{ match: /^save$/i, respond: () => ({ text: 'Save the configuration successfully.' }) }]
+  })
+  try {
+    const res = await applyConfig.handler(
+      { deviceId, commands: ['save'], description: '保存配置' },
+      ctx
+    )
+    assert.notEqual(res.error?.code, 'DANGER_COMMAND_BLOCKED')
+    assert.ok(mock.receivedCommands.includes('save'), '放行后命令必须真的下发到设备')
+  } finally {
+    await teardown()
+  }
+})
+
+test('v2.28 apply_config：关掉确认框后仍拦多行命令（判定的前提）', async () => {
+  const { mock, deviceId, ctx, teardown } = await setup({ confirmDanger: false })
+  try {
+    const res = await applyConfig.handler(
+      { deviceId, commands: ['sysname IT', 'quit\rreboot'], description: '夹带多行' },
+      ctx
+    )
+    assert.equal(res.ok, false)
+    assert.equal(res.error.code, 'DANGER_COMMAND_BLOCKED', '多行命令不受开关影响')
+    assert.equal(mock.receivedCommands.includes('reboot'), false)
+  } finally {
+    await teardown()
+  }
+})
+
+test('v2.28 出口资格：没有 commandGateRelease 的出口（对外 MCP）清单照拦', async () => {
+  // MCP 出口复用同一个 apply_config，但 requestGate 恒 false、且不给放行资格 ——
+  // 本机「关确认框」绝不能顺带放行远程客户端的破坏性命令。
+  const { mock, deviceId, ctx, teardown } = await setup({
+    handlers: [{ match: /^reboot$/i, respond: () => ({ text: 'System is rebooting...' }) }]
+  })
+  try {
+    delete ctx.commandGateRelease
+    const res = await applyConfig.handler(
+      { deviceId, commands: ['reboot'], description: '外部出口尝试' },
+      ctx
+    )
+    assert.equal(res.error.code, 'DANGER_COMMAND_BLOCKED')
+    assert.equal(mock.receivedCommands.includes('reboot'), false)
+  } finally {
+    await teardown()
+  }
 })
 
 // ———————————————————— T1.2 命令内嵌 CR/LF（R4） ————————————————————
@@ -303,7 +419,7 @@ function configHandlers(extra = []) {
   ]
 }
 
-async function setup({ handlers = [], mockOpts = {} } = {}) {
+async function setup({ handlers = [], mockOpts = {}, confirmDanger = true } = {}) {
   const mock = new MockVrp({ ...mockOpts, handlers: configHandlers(handlers) })
   const port = await mock.listen()
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensp-sec-'))
@@ -321,6 +437,8 @@ async function setup({ handlers = [], mockOpts = {} } = {}) {
       require: () => session
     },
     settings: {},
+    // v2.28：命令级清单放行资格由出口显式给出（缺省 false = 保守拦截）
+    commandGateRelease: confirmDanger === false,
     snapshots,
     changes,
     requestGate: async () => true,

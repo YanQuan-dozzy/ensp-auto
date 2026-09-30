@@ -80,15 +80,77 @@ export function buildTroubleshootTranscript(
   return text.length > maxChars ? `${text.slice(0, maxChars)}\n…（轨迹已截断）` : text
 }
 
-/** 技能标题：优先用涉及的工具名拼，最多 3 个（具体题目留给用户改名） */
+/**
+ * 失败码 → 人话主题词。
+ *
+ * 为什么不直接堆工具名：列表里一行要放下「名称 + 描述」，`apply_config` 这类
+ * 机器名既长又读不出「是哪类问题」；同一段轨迹里失败往往集中在同一个工具上，
+ * 拼出来的标题（如「排障：connect_device、apply_config」）信息量接近零。
+ * 错误码是人给的，天然就是主题词。
+ */
+const ERROR_THEME: Record<string, string> = {
+  NOT_CONNECTED: '设备连接',
+  DEVICE_BUSY: '设备占用',
+  DANGER_COMMAND_BLOCKED: '危险命令',
+  UNRECOGNIZED: '命令不被支持',
+  FAILED: '配置下发',
+  TIMEOUT: '操作超时'
+}
+
+/** 标题形态兜底：按工具名归主题（工具名是稳定的，比中文正文可靠） */
+const TOOL_THEME: Record<string, string> = {
+  connect_device: '设备连接',
+  disconnect_device: '设备连接',
+  register_device: '设备注册',
+  apply_config: '配置下发',
+  save_configuration: '配置保存',
+  verify_ping: '连通性校验',
+  verify_route: '路由校验',
+  verify_dhcp: 'DHCP 校验',
+  verify_nat: 'NAT 校验',
+  verify_expectation: '回显校验'
+}
+
+/** 标题主题数上限：技能列表一行要放得下，再多就没有可读性了 */
+const TITLE_THEME_MAX = 2
+
+/**
+ * 一段失败片段的主主题。
+ *
+ * ★ 错误码与工具名必须**二选一**，不能「错误码拿不到时再拿工具名补」：
+ * 同一次失败会被两条路径各产出一个主题（`DANGER_COMMAND_BLOCKED` → 危险命令，
+ * `apply_config` → 配置下发），标题立刻翻倍成「危险命令、配置下发排障」——
+ * 读起来像是两类问题，其实只有一件。
+ * 工具名只在错误码认不出来时兜底（工具名是稳定契约，别从中文摘要里猜）。
+ */
+function episodeTheme(failure: TroubleshootEpisode['failure']): string {
+  if (failure.errorCode) {
+    const byCode = ERROR_THEME[failure.errorCode.toUpperCase()]
+    if (byCode) return byCode
+  }
+  return TOOL_THEME[failure.name] ?? ''
+}
+
+/**
+ * 技能标题：**只给「是哪一类问题」的主题词**，不堆工具名。
+ *
+ * 榜单式标题（`排障：connect_device、apply_config`）在技能列表里会撑成一眼读不完的长串，
+ * 而用户真正需要的只是「这条能解决什么」。所以一率收敛成「〈主题〉排障」，
+ * 两三个不同主题时才并列；一个主题都认不出就退回通用名 —— 具体题目用户可在技能页改名。
+ */
 export function troubleshootDraftTitle(episodes: readonly TroubleshootEpisode[]): string {
-  const names = [...new Set(episodes.map((e) => e.failure.name))].slice(0, 3)
-  return names.length ? `排障：${names.join('、')}` : '排障：实验失败复盘'
+  const themes: string[] = []
+  for (const e of episodes) {
+    const t = episodeTheme(e.failure)
+    if (t && !themes.includes(t) && themes.length < TITLE_THEME_MAX) themes.push(t)
+  }
+  if (themes.length === 0) return '排障经验'
+  return `${themes.join('、')}排障`
 }
 
 /** 技能描述：说明来源（让人一眼看出这是自动沉淀的、可能需要人工确认） */
 export function troubleshootDraftDescription(episodes: readonly TroubleshootEpisode[]): string {
-  return `由会话轨迹自动沉淀（${episodes.length} 个「失败→修正」片段）。内容基于本机实际操作，启用前请人工核对。`
+  return `本次轨迹沉淀：${episodes.length} 个「失败→修正」片段，基于本机实际操作，启用前请核对。`
 }
 
 /** 清洗模型输出：模型常无视「不要代码块」，这里剥掉最外层围栏与引导语（与 cleanEnhanced 同口径） */

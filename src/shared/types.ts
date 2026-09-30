@@ -46,6 +46,8 @@ export type ErrorCode =
   | 'NOT_CONNECTED'
   | 'DECODE'
   | 'TRUNCATED'
+  // v2.30：下发后回显结束但设备没回到提示符 —— 无法确认命令真的执行完（危险命令不得报成功）
+  | 'UNSETTLED'
   // —— 策略层错误 ——
   | 'NOT_ALLOWED_IN_READ_MODE'
   | 'DANGER_COMMAND_BLOCKED'
@@ -258,6 +260,18 @@ export type AgentEvent =
       ratio: number
       /** true = 至少有过一次真实测量；false = 只有字符估算 */
       measured: boolean
+      /**
+       * v2.28：缓存分项（provider 给了才有）。
+       *
+       * 为什么必须单独给出来：`promptTokens` 的口径是
+       * `未命中输入 + 缓存命中 + 缓存写入`（见 runtime-policy#promptTokensOf），
+       * 而缓存命中通常按 0.1 倍计价 —— 只给一个总数会让用户把「300 万输入」
+       * 误读成「300 万全价输入」，据此优化就会优化错方向。
+       */
+      cacheReadTokens?: number
+      cacheWriteTokens?: number
+      /** 未被缓存命中的那部分输入（= usage.input），全价计费 */
+      freshInputTokens?: number
     }
   /**
    * v2.7：结构化提问。运行时在此处**就地暂停**，等界面回传答案后继续 ——
@@ -338,6 +352,15 @@ export interface TopologyNode {
   interfaces?: string[]
   x?: number
   y?: number
+  /**
+   * eNSP 工程里的**原始坐标**（B4 第四批）。
+   *
+   * 自适应布局会把整理结果写进 `x/y`（覆盖工程里的摆放），而「优先按 eNSP 原始排布」
+   * 需要知道源里怎么摆的 —— 故解析工程时把源坐标另存一份，之后任何层的坐标覆盖都不动它。
+   * 手动新建的设备没有这个字段，排序时退回名称自然序。
+   */
+  srcX?: number
+  srcY?: number
   /** 来源（手动补画节点在合并结果里标记为 manual，便于渲染层过滤重建手动集） */
   source?: TopologySource
   /** 删除墓碑：合并时该节点被过滤（跨刷新、跨层持久生效） */
@@ -353,6 +376,36 @@ export interface TopologyLink {
   source: TopologySource
   /** 删除墓碑：合并时该链路被过滤 */
   deleted?: boolean
+  /**
+   * 同端点对内的「线」标识 —— 两台设备之间可以并接多条线，`lineKey` 区分是哪一条。
+   *
+   * - 工程文件 / 实采：本端接口 → 对端接口（如 `GE0/0/1->GE0/0/1`）
+   * - 手动补画：链路 id（同一个设备对可以拖多条）
+   * - **缺省 = 历史数据**（旧版本「一个设备对一条线」的条目）→ 上层退回按设备对处理，
+   *   见 `model.ts#mergeLayers` 与 `store.ts#remove`。
+   */
+  lineKey?: string
+  /** eNSP 链路类型（.topo 的 `lineName`，如 Copper / Serial / Auto…）；缺省 = 未标注 */
+  lineType?: string
+  /**
+   * 接口标注的手动微调偏移（B4）。
+   *
+   * 只存**相对自动槽位的增量**，因此设备拖动、链路重排后偏移仍然成立；
+   * 按「端 + 端口序号」与 label 的端口顺序对齐（from[i] 对应第 i 个 from 端口）。
+   * 缺省 = 完全交给自动槽位摆放。属于展示层数据，不写进 eNSP 工程文件。
+   */
+  portOffsets?: TopologyLinkOffsets
+}
+
+/** 接口标注偏移：两端各按端口序号存 {x,y}（画布坐标像素） */
+export interface TopologyLinkOffsets {
+  from?: TopologyPortOffset[]
+  to?: TopologyPortOffset[]
+}
+
+export interface TopologyPortOffset {
+  x: number
+  y: number
 }
 
 export interface Topology {
@@ -703,6 +756,15 @@ export interface McpSettings {
 export interface EnspSettings {
   /** eNSP_Client.exe 绝对路径；空串表示自动探测 */
   exePath: string
+  /**
+   * 导入 eNSP 工程后自动重排拓扑（**默认关**）。
+   *
+   * 为什么默认关：工程文件里的摆放是作者有意为之的（分区、上下级、连线走向都带语义），
+   * 导入后按原样显示才是「打开自己的工程」；重排会覆盖 eNSP 里的摆放，且是持久化覆盖
+   * （写进手动层），误操作后刷新/重启都回不去。想重排的用户点画布工具栏的
+   * 「自适应布局」即可，或在此把这个开关打开。
+   */
+  autoLayoutOnImport: boolean
 }
 
 /** 单个 Wireshark CLI 工具的探测结果 */
@@ -1001,7 +1063,7 @@ export const DEFAULT_SETTINGS: Settings = {
   },
   panels: { left: 240, right: 380, leftCollapsed: false, rightCollapsed: false, centerCollapsed: false },
   mcp: { enabled: false, port: 49150, servers: [], exposeToAgent: true },
-  ensp: { exePath: '' },
+  ensp: { exePath: '', autoLayoutOnImport: false },
   notify: { onTaskEnd: true, onGate: true, sound: 'default' },
   permission: { confirmDanger: true, externalToolConfirm: false },
   retry: DEFAULT_RETRY,

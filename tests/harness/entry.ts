@@ -60,7 +60,8 @@ export { saveTopoFile, importTopologyFile } from '../../src/main/tools/topology'
 export { parseVersion, DeviceSession } from '../../src/main/core/session/DeviceSession'
 export {
   TerminalBuffer,
-  DEFAULT_TERMINAL_BUFFER_BYTES
+  DEFAULT_TERMINAL_BUFFER_BYTES,
+  DEFAULT_TERMINAL_MAX_SEGMENTS
 } from '../../src/main/core/session/TerminalBuffer'
 export {
   SessionManager,
@@ -74,12 +75,14 @@ export {
 } from '../../src/main/tools/registry'
 // D7：两份工具集合的具名出口（toolsets 刻意零 electron 依赖，可进 harness）
 export { builtinTools, agentTools } from '../../src/main/tools/toolsets'
-export { classifyDanger, isReadOnlyCommand, isViewNavigationCommand, DANGEROUS_COMMANDS } from '../../src/shared/risk'
+export { classifyDanger, isReadOnlyCommand, isViewNavigationCommand, isUserViewCommand, DANGEROUS_COMMANDS, USER_VIEW_COMMANDS } from '../../src/shared/risk'
 export {
   planDangerGate,
+  planCommandGate,
   GATE_DENIED_REASON,
   GATE_DENIED_SUMMARY,
-  GATE_SKIPPED_NOTE
+  GATE_SKIPPED_NOTE,
+  COMMAND_GATE_SKIPPED_NOTE
 } from '../../src/shared/gate-policy'
 export {
   parsePort,
@@ -112,6 +115,9 @@ export {
   verifyExpectation,
   restoreSnapshot,
   saveConfiguration,
+  // v2.30：清空启动配置（danger + 闸门 + 代答自己触发的 [Y/N]）+ 目标视图归一化
+  resetSavedConfiguration,
+  normalizeTargetView,
   checkExpectation,
   // v2.24：单一视图切换命令的「工具选错了」护栏
   loneViewNavCommand
@@ -136,6 +142,7 @@ export { parseLldpNeighbors, deriveTopology } from '../../src/main/core/topology
 export { guessRole, mergeTopology, mergeLayers, emptyTopology, linkKey } from '../../src/main/core/topology/model'
 export { TopologyStore } from '../../src/main/core/topology/store'
 export { decodeTopo, parseTopoXml, readTopoFile, parseDeviceInterfaces, resolveInterfaceName, MAX_TOPO_FILE_BYTES } from '../../src/main/core/topology/fromProjectFile'
+export { parsePaper, readPaperFile, findPaperMember, PAPER_HEADER_BYTES, PAPER_ENTRY_BYTES } from '../../src/main/core/topology/fromPaper'
 export { topologyToXml, writeTopoFile, stableGuid } from '../../src/main/core/topology/toProjectFile'
 export { findTopologyFiles, defaultSearchRoots } from '../../src/main/core/topology/findFiles'
 export { TOOLS } from '../../src/main/tools/index'
@@ -227,7 +234,45 @@ export { historyToMessages, appendQueuedUserMessages, extractPlan, buildAgentSys
 export { ReactRuntime } from '../../src/main/agent/react.runtime'
 export type { ReactRuntimeOptions } from '../../src/main/agent/react.runtime'
 export { createMcpServer } from '../../src/main/mcp/server'
-export { computeAutoLayout } from '../../src/renderer/features/topology/autoLayout'
+export { computeAutoLayout, layoutTopology, layoutTopologyTree, inferLayoutMode, sourcePosOf, BLOCK_PAD, LAYOUT_GRID, LAYER_GAP, naturalCompare } from '../../src/renderer/features/topology/autoLayout'
+// 源图保真布局内核（2026-10-01 第七版：源坐标骨架）
+export { layoutTopologyBySource, pitchCells } from '../../src/renderer/features/topology/autoLayoutModule'
+export { estimateNodeSize, estimateNodeSizeAligned, nodeSizeOf, textWidth } from '../../src/renderer/features/topology/nodeSize'
+// 坐标口径层（2026-09-29）：「布局坐标 = 设备框中心」——偶数尺寸 + 中心↔左上角换算。
+// 单测守三条不变式：尺寸全偶、中心落格点则左上角也落格点、批量换算往返一致。
+export {
+  centerToTopLeft,
+  topLeftToCenter,
+  alignNodeSizes,
+  toCenterPositions,
+  toTopLeftPositions,
+  computeBlockBoxes as computeBlockBoxesCentered
+} from '../../src/renderer/features/topology/layoutGrid'
+export {
+  planRoutes,
+  checkRouteInvariants,
+  routeToPath,
+  allocateLanes,
+  buildRowModel,
+  OVERLAP_TOLERANCE,
+  selectFramedBlocks,
+  drawingBounds,
+  snapRouteToHandles,
+  segHitsRect,
+  FRAME_AREA_RATIO,
+  // v2.29：障碍空间索引（导入性能治理）—— 单测断言「索引粗筛不丢真实障碍」
+  ObstacleIndex
+} from '../../src/renderer/features/topology/topoRouting'
+export {
+  assignLinkPorts,
+  portPointOf,
+  endSideOf,
+  portPcts,
+  isCornerSide,
+  handlePlacementOf,
+  positionOfSide8
+} from '../../src/renderer/features/topology/portSlots'
+export { computeBlockBoxes } from '../../src/renderer/features/topology/autoLayout'
 // T5.5：三栏布局 / 自适应档位 / 工具条折叠的纯函数（测试直接验证生产实现，不抄抄件）
 export {
   CENTER_MIN_WIDTH,
@@ -240,9 +285,37 @@ export {
   computeClampedLeft,
   computeClampedRight,
   computeWindowResizeShrink,
-  shouldCollapseButton
+  shouldCollapseButton,
+  // N73：工具栏「实测预算 → 各优先级折叠阈值」（按钮数量变化时阈值自动跟着走）
+  autoCollapseThreshold,
+  autoCollapseThresholds
 } from '../../src/renderer/features/layout/panelSizing'
 export { splitPortLabel, shortIf } from '../../src/renderer/features/topology/portLabel'
+export {
+  toFlowNodes,
+  toFlowEdges,
+  sideOf,
+  sideToPosition,
+  slotAxisOf,
+  assignPortSlots,
+  chipWidthOf,
+  SLOT_GAP_X,
+  SLOT_GAP_Y
+} from '../../src/renderer/features/topology/TopoRender'
+export {
+  sanitizePortOffsets,
+  withPortOffset,
+  MAX_PORT_OFFSET,
+  MAX_PORT_OFFSET_ITEMS
+} from '../../src/shared/topology-ports'
+// 链路身份（设备对 / 一条线）与线型（eNSP lineName → 实线/虚线）
+export {
+  linkPairKey,
+  lineKeyOfPorts,
+  linkIdentity,
+  normalizeLineType,
+  isDashedLineType
+} from '../../src/shared/topology-link'
 
 // —— v1.3：技能模块 ——
 
@@ -388,7 +461,10 @@ export {
   READ_MAX_LINE_CHARS,
   READ_MAX_OUTPUT_BYTES,
   READ_LIMIT_DEFAULT,
-  READ_LIMIT_MAX
+  READ_LIMIT_MAX,
+  // D3：行偏移索引的缓存诊断（测试验证「翻页不重扫」）
+  clearLineIndexCache,
+  lineIndexCacheSize
 } from '../../src/main/core/attachments/lineReader'
 // v2.1：PDF 文本抽取（附件里的 .pdf 也能按行读了）
 export {
@@ -693,6 +769,8 @@ export {
   lineTotalOf
 } from '../../src/renderer/features/agent/structuredResult'
 export { smallToolData, CARD_META_MAX_CHARS, cardMetaOf } from '../../src/main/agent/runtime.iface'
+// M2：事件流缓冲的释放时机（close 不得吞事件、读空后不得继续持有 raw）
+export { EventStream } from '../../src/main/agent/runtime.iface'
 // H（v2.14）：两个已实现卡片投影的工具所做的截断上限（用例据此断言边界）
 export { DIFF_CARD_LIMIT, diffWithSnapshot } from '../../src/main/tools/command'
 export { CHECK_CARD_LIMIT } from '../../src/main/tools/check'
@@ -704,7 +782,9 @@ export {
   accumulateUsage,
   formatTokens,
   describeTurnUsage,
-  shouldShowUsage
+  shouldShowUsage,
+  // v2.28：缓存命中率（解释「累计输入」这一列到底多贵）
+  cacheHitRatio
 } from '../../src/shared/turn-usage'
 
 // —— v2.11：工具调用归类汇总 ——

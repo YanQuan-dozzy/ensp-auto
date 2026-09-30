@@ -113,3 +113,75 @@ export function shouldCollapseButton(input: CollapseInput): boolean {
   if (priority === 'high') return width < 480 || tier === 'xs'
   return false
 }
+
+/**
+ * 工具栏「实测预算」→ 各优先级按钮各自的折叠阈值（N73，2026-09-29）。
+ *
+ * 背景：`collapseBelow` 原先一律是手写绝对像素（620/680/760/840/850/880/950…）。
+ * 它只对「写这串数字时的那几个按钮」成立；拓扑工具栏从 6 个按钮加到 9 个之后，
+ * 明明装不下了阈值还判「不用收」→ 文字继续显示 → Flex 把按钮压扁（图标宽被压到 0），
+ * 用户看到的就是「宽度自适应失效」。
+ *
+ * 修法不是再调一遍数字（下次加按钮照旧坏），而是**实测**后反推：
+ * - `available`  = 容器能给右区的宽度（容器宽 - 左区固有宽 - 间距）
+ * - `iconWidth`  = 全部按钮收成纯图标后的固有宽度
+ * - `fullWidth`  = 全部按钮显示文字时的固有宽度
+ *
+ * 三条不变式（由测试冻结）：
+ * ① `available >= fullWidth`  → 全部显示文字（含 critical）
+ * ② `available <= iconWidth`  → 全部收成图标
+ * ③ 两者之间 → **按优先级逐级收起**：low 最先收，其次 medium、high，
+ *    critical 最后才收。若九宫格一刀切（所有按钮同一阈值），
+ *    按钮会在某个像素点集体变图标 —— 那是「跳变」不是「自适应」。
+ *
+ * 分配法：把 [iconWidth, fullWidth] 按优先级切成若干档（每档对应一个优先级），
+ * 各档的阈值 = 该档「开始收起」的可用宽度。低优先级档的阈值最高（先收）。
+ */
+export interface ToolbarOverflowBudget {
+  /** 预算口径的可用宽度（容器实测宽 - 左区固有宽 - 间距） */
+  available: number
+  /** 收成纯图标后的固有宽度 */
+  iconWidth: number
+  /** 全部展开文字时的固有宽度 */
+  fullWidth: number
+}
+
+/**
+ * 优先级顺序（先收 → 后收）。critical 永不自动收起（只在极窄兜底）。
+ * 这张表是产品口径：改顺序要有测试盯着。
+ */
+const COLLAPSE_ORDER: readonly CollapsePriority[] = ['low', 'medium', 'high', 'critical']
+
+/**
+ * 各优先级按钮的 `collapseBelow` 阈值（用**同一把尺子**量：`available`）。
+ *
+ * 判定时统一传 `width: budget.available`，故阈值之间的大小关系就是「谁先收」。
+ * 阈值从高到低：low > medium > high > critical。
+ */
+export function autoCollapseThresholds(
+  budget: ToolbarOverflowBudget
+): Record<CollapsePriority, number> {
+  const { iconWidth, fullWidth } = budget
+  const span = Math.max(0, fullWidth - iconWidth)
+  const n = COLLAPSE_ORDER.length
+  // 第 i 档（0 = low，最左）在 [iconWidth, fullWidth] 上对应的分界点。
+  // low 的阈值最高（available 一变小就先触发），critical 最低。
+  const out = {} as Record<CollapsePriority, number>
+  COLLAPSE_ORDER.forEach((p, i) => {
+    // 从满宽往图标宽方向倒退：low 的阈值 = 满宽（装不下就收），
+    // 后面每档再往回收 span/n，于是 critical 要等到最紧才收。
+    out[p] = Math.round(fullWidth - (span * i) / n)
+  })
+  return out
+}
+
+/**
+ * 单个优先级的阈值 —— 供只需要一档的调用点使用（等价于上表的对应项）。
+ * 保留单值形态是为了让 `shouldCollapseButton({ collapseBelow })` 的老口径不变。
+ */
+export function autoCollapseThreshold(
+  budget: ToolbarOverflowBudget,
+  priority: CollapsePriority = 'low'
+): number {
+  return autoCollapseThresholds(budget)[priority]
+}

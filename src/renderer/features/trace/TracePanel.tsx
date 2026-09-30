@@ -97,10 +97,10 @@ function DiffRowView({ row }: { row: DiffRow }): ReactNode {
     <div className={`trace-diff-row ${row.kind}`}>
       <span className="trace-diff-prefix mono">{DIFF_PREFIX[row.kind]}</span>
       <div className="trace-diff-side a">
-        {row.a ? stepText(row.a) : <span className="trace-diff-none">—</span>}
+        {row.a ? stepText(row.a) : <span className="trace-diff-none">-</span>}
       </div>
       <div className="trace-diff-side b">
-        {row.b ? stepText(row.b) : <span className="trace-diff-none">—</span>}
+        {row.b ? stepText(row.b) : <span className="trace-diff-none">-</span>}
       </div>
     </div>
   )

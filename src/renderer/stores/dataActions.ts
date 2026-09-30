@@ -1,9 +1,10 @@
 /**
  * 启动 / 设置 / 会话树 / 拓扑 / 技能 域 actions（T5.8 拆分 —— 自 app.ts 原样搬移，无行为变化）。
  */
-import type { SessionNode, Settings, TopologyLink, TopologyNode } from '@shared/types'
+import type { SessionNode, Settings, Topology, TopologyLink, TopologyNode } from '@shared/types'
 import type { ScanProgress } from '@shared/api'
 import { EVENT } from '@shared/channels'
+import { computeAutoLayout, sourcePosOf } from '@/features/topology/autoLayout'
 import type { AppState, SliceGet, SliceSet } from './appState'
 import {
   applyTheme,
@@ -56,7 +57,9 @@ export function dataActions(
   | 'setProfileKey'
   | 'clearTopology'
   | 'refreshTopology'
+  | 'setTopoLoading'
   | 'saveManualTopology'
+  | 'restoreSourceLayout'
   | 'removeTopology'
   | 'importTopology'
   | 'discoverTopoFiles'
@@ -109,6 +112,8 @@ export function dataActions(
       activeRootId: rootId,
       activeStartNodeId: startNodeId,
       messages: nodesToMessages(nodes),
+      // R3：切换会话时清掉上一段流式正文（它属于旧会话）
+      streamingText: null,
       queueCount: 0,
       agentTodos: todos,
       ...extra
@@ -158,6 +163,8 @@ export function dataActions(
         activeRootId: null,
         activeStartNodeId: null,
         messages: [],
+        // R3：同上，流式正文属于旧会话
+        streamingText: null,
         queueCount: 0,
         agentTodos: [],
         // v2.8：用户主动开新会话 = 不打算续跑，收起提示
@@ -387,6 +394,11 @@ export function dataActions(
       }
     },
 
+    /** v2.29：拓扑加载进度（null = 收尾，进度条消失） */
+    setTopoLoading(p) {
+      set({ topoLoading: p })
+    },
+
     async saveManualTopology(input: { nodes: TopologyNode[]; links: TopologyLink[] }) {
       // R27：写盘失败不能静默 —— 节点会停在拖过去的位置，看起来"保存好了"，
       // 下次打开却回到原样。这里给可见反馈，并把拓扑刷回磁盘上的真实状态。
@@ -401,6 +413,46 @@ export function dataActions(
           .refreshTopology()
           .catch(() => undefined)
       }
+    },
+
+    /**
+     * v2.31：恢复 eNSP 原始布局 —— 把全部设备坐标写回工程文件里的 `srcX`/`srcY`。
+     *
+     * 手动层的坐标覆盖是**持久化**的：自适应布局跑过一次，那些坐标就永久压住了工程里的摆放，
+     * 之后无论关不关自动重排、甚至重新导入同一个工程（`setFile` 会命中该工程的 manual 缓存），
+     * 画布都还是算法布局。这个动作就是那把「撤销」：把覆盖值改成源坐标，
+     * 合并结果里的 x/y 就重新等于工程原样。
+     *
+     * 只对**有源坐标**的设备写（手动新建的 `m-node-` 没有 srcX/srcY，应当保留用户摆的位置）；
+     * 没有源坐标可归位的设备一台都没找到时给一条提示，避免用户以为按钮坏了。
+     */
+    async restoreSourceLayout() {
+      const t = get().topology
+      const restorable = t.nodes.filter(
+        (n) => typeof n.srcX === 'number' && typeof n.srcY === 'number'
+      )
+      if (restorable.length === 0) {
+        get().noteSystemMessage(
+          t.nodes.length === 0
+            ? '画布上还没有设备，先从 eNSP 工程导入一份拓扑'
+            : '当前画布上的设备没有 eNSP 源坐标（可能是手动添加或实采发现的），无法恢复原始布局',
+          'info'
+        )
+        return
+      }
+      const nodes: TopologyNode[] = restorable.map((n) => ({
+        id: n.id,
+        name: n.name,
+        role: n.role,
+        ...(n.model ? { model: n.model } : {}),
+        ...(n.deviceId ? { deviceId: n.deviceId } : {}),
+        ...(n.interfaces && n.interfaces.length > 0 ? { interfaces: n.interfaces } : {}),
+        x: Math.round(n.srcX as number),
+        y: Math.round(n.srcY as number),
+        source: 'manual'
+      }))
+      await get().saveManualTopology({ nodes, links: t.links.filter((l) => l.source === 'manual') })
+      get().noteSystemMessage(`已恢复 ${nodes.length} 台设备到 eNSP 工程里的原始摆布`, 'info')
     },
 
     async removeTopology(input: { nodeIds?: string[]; linkKeys?: string[] }) {
@@ -419,10 +471,20 @@ export function dataActions(
 
     async importTopology() {
       try {
+        // 进度条**只在用户选完文件之后**才开始 —— 弹系统文件选择框期间（用户还在挑文件）
+        // 主进程什么都没做，此时点亮进度条等于谎报「正在解析」。
+        // 故进度条的起点放在 `topologyImportFile` 的回调里：handler 一进入解析就推
+        // `import-progress` 事件（见 ipc/topology.ts），渲染层据此置位。
         const r = await window.api.topology.importFile()
-        if (r) set({ topology: r.topology })
+        if (r) {
+          set({ topology: r.topology })
+          await autoLayoutAfterImport(r.topology, get)
+        } else {
+          set({ topoLoading: null })
+        }
         return r
       } catch (e) {
+        set({ topoLoading: null })
         return null
       }
     },
@@ -437,10 +499,19 @@ export function dataActions(
 
     async importTopoPath(filePath: string) {
       try {
+        // 这条入口（发现面板里点某个 .topo / 拖入路径）没有文件选择框，
+        // 点击即解析 —— 进度条就在此刻点亮。
+        set({ topoLoading: { phase: 'read', ratio: 0, detail: '正在解析 eNSP 工程文件', startedAt: Date.now() } })
         const r = await window.api.topology.importPath(filePath)
-        if (r) set({ topology: r.topology })
+        if (r) {
+          set({ topology: r.topology })
+          await autoLayoutAfterImport(r.topology, get)
+        } else {
+          set({ topoLoading: null })
+        }
         return r
       } catch (e) {
+        set({ topoLoading: null })
         return null
       }
     },
@@ -513,6 +584,70 @@ export function dataActions(
  * （xterm 实例在组件内），这里不再订阅 terminalData（v1.8，原为 no-op 浪费）。
  */
 let subscribed = false
+/**
+ * 导入后自动重排拓扑（B4 第二批；开关 = `settings.ensp.autoLayoutOnImport`）。
+ *
+ * **默认关闭（2026-09-30 改）**：导入 eNSP 工程时**保留工程里的原始摆放**，
+ * 想重排的用户点画布工具栏的「自适应布局」，或到设置里把这个开关打开。
+ *
+ * 为什么默认关：eNSP 工程里的摆放是**作者有意为之**的（分区、上下级、连线走向都带语义），
+ * 自动重排会把它冲掉 —— 用户导入后第一眼看到的是「另一个图」，认不出自己的工程。
+ * 而重排是一次覆盖写入（`source: 'manual'`），刷新/重启都不会回到原样，误操作成本高。
+ *
+ * 实现上复用「自适应布局」的同一套动作：把布局结果当作**坐标覆盖**写进手动层
+ * （`source: 'manual'`，与用户拖动设备是同一种数据），因此刷新/重启后位置仍在。
+ * 失败不阻断导入：重排只影响观感，用户看到原始坐标依然能用。
+ */
+async function autoLayoutAfterImport(t: Topology, get: SliceGet): Promise<void> {
+  const set = get().setTopoLoading
+  if (t.nodes.length === 0) {
+    set(null)
+    return
+  }
+  const startedAt = Date.now()
+  if (!get().settings.ensp.autoLayoutOnImport) {
+    // 关了自动重排也**不能**立刻收尾：真正耗时的是画布那侧的走线 + 首屏元素构建
+    // （40 台 ≈ 4ms、300 台优化前 ≈ 82ms）。交给「绘制画布」阶段，由画布首帧清空。
+    set({ phase: 'render', ratio: 0.4, detail: '正在绘制画布', startedAt })
+    return
+  }
+  // —— 布局阶段：这是导入后最重的一段同步计算（源图保真内核：源坐标量化 + 模块列）——
+  set({ phase: 'layout', ratio: 0, detail: `正在重排 ${t.nodes.length} 台设备`, startedAt })
+  // 让出一次事件循环：进度条得先画到屏幕上，否则后面这段同步计算会把「布局中」
+  // 和计算结果憋在同一个帧里一起提交 —— 用户看不到任何中间态，进度条等于白做。
+  await nextFrame()
+  const pos = computeAutoLayout(t.nodes, t.links, { sourcePos: sourcePosOf(t.nodes) })
+  const nodes: TopologyNode[] = t.nodes.map((n) => {
+    const p = pos.get(n.id)
+    return {
+      id: n.id,
+      name: n.name,
+      role: n.role,
+      ...(n.model ? { model: n.model } : {}),
+      ...(p ? { x: Math.round(p.x), y: Math.round(p.y) } : {}),
+      source: 'manual'
+    }
+  })
+  set({ phase: 'route', ratio: 0.2, detail: '正在保存布局并计算连线', startedAt })
+  try {
+    await get().saveManualTopology({ nodes, links: t.links.filter((l) => l.source === 'manual') })
+  } catch {
+    /* 重排失败不阻断导入 */
+  }
+  // 收尾交给画布首帧（见 TopologyCanvas 的收尾 effect）：最后一跳由它推进并关闭，
+  // 这里不再写终态，避免出现「进度条已消失、图还没出来」的空窗。
+  set({ phase: 'render', ratio: 0.4, detail: '正在绘制画布', startedAt })
+}
+
+/** 等到下一次绘制机会（rAF，退化为 setTimeout；测试环境无 rAF 也能跑） */
+function nextFrame(): Promise<void> {
+  return new Promise((resolve) => {
+    const raf = (globalThis as { requestAnimationFrame?: (cb: () => void) => number }).requestAnimationFrame
+    if (typeof raf === 'function') raf(() => resolve())
+    else setTimeout(resolve, 0)
+  })
+}
+
 function ensureSubscribed(set: SliceSet, get: SliceGet): void {
   if (subscribed) return
   subscribed = true
@@ -537,6 +672,18 @@ function ensureSubscribed(set: SliceSet, get: SliceGet): void {
     get().markTerminalClosed(p)
   )
   window.api.on<import('@shared/types').Topology>(EVENT.topologyUpdated, (t) => set({ topology: t }))
+  // v2.31：导入工程时主进程「真正开始解析」的信号（弹框结束、选中文件之后）。
+  // 进度条的起点在这里 —— 弹文件选择框期间不亮，避免谎报「正在解析」。
+  window.api.on<{ filePath?: string }>(EVENT.topologyImportStarted, () => {
+    set({
+      topoLoading: {
+        phase: 'read',
+        ratio: 0,
+        detail: '正在解析 eNSP 工程文件',
+        startedAt: Date.now()
+      }
+    })
+  })
   window.api.on<import('@shared/types').SessionNodeMeta[]>(EVENT.sessionListUpdated, (list) =>
     set({ sessions: list })
   )

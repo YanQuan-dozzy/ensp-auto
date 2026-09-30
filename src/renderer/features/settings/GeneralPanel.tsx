@@ -444,7 +444,7 @@ export function GeneralPanel(): ReactNode {
       <Section label="通知">
         <Row
           title="任务完成时通知"
-          desc="代理一轮任务结束时弹系统通知（完成 / 失败 / 中止都会通知）。只在窗口不在前台时弹 —— 正在看的人不需要被眼前的进度再提醒一次。"
+          desc="代理一轮任务结束时弹系统通知（完成 / 失败 / 中止都会通知）。只在窗口不在前台时弹：正在看的人不需要被眼前的进度再提醒一次。"
           control={
             <Switch
               checked={settings.notify.onTaskEnd}
@@ -495,7 +495,7 @@ export function GeneralPanel(): ReactNode {
           desc="本应用是 eNSP 实验的 AI 代理工作台：自然语言下目标，代理自己完成扫描、连接、配置、验证与报告。"
           control={
             <>
-              <Chip tone="agent">v{info?.version ?? '—'}</Chip>
+              <Chip tone="agent">v{info?.version ?? '-'}</Chip>
               {info ? <Chip>Electron {info.electron}</Chip> : null}
             </>
           }
@@ -506,7 +506,7 @@ export function GeneralPanel(): ReactNode {
           wide
           control={
             <span className="mono set-inline-detail">
-              Chromium {info?.chrome ?? '—'} · Node {info?.node ?? '—'} · {info?.platform ?? '—'}
+              Chromium {info?.chrome ?? '-'} · Node {info?.node ?? '-'} · {info?.platform ?? '-'}
             </span>
           }
         />

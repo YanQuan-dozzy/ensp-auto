@@ -109,7 +109,18 @@ export class ChangeStore {
 
   private persist(): void {
     // T2.5：统一原子写
-    atomicWriteJsonSync(this.indexFile, this.index)
+    // D4（PERF-MEM-REVIEW-2026-09-29 §4.2）：索引关掉 fsync。
+    // 每条记录一次全量写（600 条时 100~500KB，一次任务 20 次），而 Windows 上
+    // `fsyncSync` 是 FlushFileBuffers，单次 0.1~数 ms、杀软扫描时可达数十 ms，
+    // 且**同步阻塞整个主进程**（它同时在跑 telnet/SSH 与工具执行）。
+    //
+    // 为什么这里不做报告建议的「去抖落盘」：`add`/`remove`/`clear` 都带着
+    // 「写失败回滚内存」的硬纪律（tests/unit/write-pipeline.test.mjs 守着），
+    // 去抖会把「同步抛错」变成「异步失败」，回滚点与调用方的成功返回就对不上了。
+    // 关 fsync 拿到了 fsync 那份开销，且**一行语义都不改** —— 完整去抖需要
+    // 把 before 快照保留到落盘完成，那是另一次改动。
+    // rename 仍是原子的，异常退出不会留下半截 JSON；丢的只是断电瞬间未刷盘的那几条。
+    atomicWriteJsonSync(this.indexFile, this.index, { fsync: false })
   }
 
   /** 追加一条变更记录，返回完整记录 */

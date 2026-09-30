@@ -77,8 +77,12 @@ export function registerSettingsIpc(services: Services): void {
     }
     if (patch?.ensp && typeof patch.ensp === 'object') {
       // 路径只做长度与字符集约束，存在性交给 locate 探测（用户可能填错后还要能改回来）
+      const cur = services.getSettings().ensp
       const exePath = toStr(patch.ensp.exePath).trim()
-      safe.ensp = { exePath: exePath.length > 512 ? exePath.slice(0, 512) : exePath }
+      // 逐字段收敛：布尔项只认布尔，缺省沿用当前值（不接受渲染层塞字符串）
+      const autoLayoutOnImport =
+        typeof patch.ensp.autoLayoutOnImport === 'boolean' ? patch.ensp.autoLayoutOnImport : cur.autoLayoutOnImport
+      safe.ensp = { exePath: exePath.length > 512 ? exePath.slice(0, 512) : exePath, autoLayoutOnImport }
     }
     if (patch?.storage && typeof patch.storage === 'object') {
       // R16：exports / attachments / snapshots 三个目录支持自定义且标称「即时生效」，

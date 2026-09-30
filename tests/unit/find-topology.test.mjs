@@ -1,6 +1,6 @@
 /**
  * 拓扑发现（v1.2，find_topology_files）测试。
- * 覆盖：目录扫描、递归深度、node_modules 跳过、目录同名标记、active 标记、截断。
+ * 覆盖：目录扫描（.topo/.paper）、递归深度、node_modules 跳过、目录同名标记、active 标记、截断。
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -20,8 +20,10 @@ function makeTree() {
     fs.writeFileSync(path.join(root, 'node_modules', 'deep.topo'), '<topo/>')
     fs.mkdirSync(path.join(root, '.git'))
     fs.writeFileSync(path.join(root, '.git', 'hidden.topo'), '<topo/>')
-    // 非 .topo 忽略
+    // 非拓扑文件忽略（含 .paper/notes.txt 等工程包只认扩展名，内容不读）
     fs.writeFileSync(path.join(root, 'notes.txt'), 'hi')
+    // eNSP 实验包 .paper 同样作为拓扑候选
+    fs.writeFileSync(path.join(root, 'lab-paper.paper'), 'binary')
   } catch (e) {
     fs.rmSync(root, { recursive: true, force: true })
     throw e
@@ -29,13 +31,13 @@ function makeTree() {
   return root
 }
 
-test('findTopologyFiles：目录扫描、跳过 node_modules/.git、忽略非 .topo', () => {
+test('findTopologyFiles：目录扫描、跳过 node_modules/.git、认 .topo 与 .paper、忽略其它扩展', () => {
   const root = makeTree()
   try {
     const r = findTopologyFiles({ directory: root })
     assert.equal(r.truncated, false)
     const names = r.candidates.map((c) => c.name).sort()
-    assert.deepEqual(names, ['campus.topo', 'other.topo'])
+    assert.deepEqual(names, ['campus.topo', 'lab-paper.paper', 'other.topo'])
     assert.ok(r.candidates.every((c) => c.directory.startsWith(root)))
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
@@ -50,7 +52,7 @@ test('findTopologyFiles：activePath 命中者排最前并标 isActive', () => {
     assert.equal(r.activeTopology, target)
     assert.equal(r.candidates[0].isActive, true)
     assert.equal(r.candidates[0].path, target)
-    assert.equal(r.count, 2)
+    assert.equal(r.count, 3)
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }

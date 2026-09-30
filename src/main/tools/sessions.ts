@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { buildJson, buildMarkdown } from '../core/session-tree/report'
+import { atomicWriteFileSync } from '../core/fs/atomic'
 import type { SessionTreeStore } from '../core/session-tree/store'
 import { fail, ok, Type, type ToolSpec } from './registry'
 import { safeFileName } from '@shared/naming'
@@ -32,7 +33,12 @@ export function collectSessionReport(
   const dir = path.join(exportsDir, safe)
   fs.mkdirSync(dir, { recursive: true })
   const file = path.join(dir, `${safe}-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.${ext}`)
-  fs.writeFileSync(file, body, 'utf8')
+  // D15（PERF-MEM-REVIEW-2026-09-29 §五）：必须走原子写。
+  // 报告**紧接着就会被 read_attachment 读回喂给模型** —— 裸 writeFileSync 在
+  // 写到一半时崩掉/被杀，留下半截文件会被当成正文读进上下文（且没有任何
+  // 语法标记能让人看出它是残缺的）。core/fs/atomic.ts:8-10 自立的规矩就是
+  // 全仓只有那一份实现，这里不再另开一套。
+  atomicWriteFileSync(file, body)
   return { path: file, ext }
 }
 
@@ -48,7 +54,8 @@ export function writeCompareReport(exportsDir: string, title: string, markdown: 
   const dir = path.join(exportsDir, safe)
   fs.mkdirSync(dir, { recursive: true })
   const file = path.join(dir, `${safe}-compare-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.md`)
-  fs.writeFileSync(file, markdown, 'utf8')
+  // 同上：对比报告也是给模型读回的文件，裸写会留下半截正文
+  atomicWriteFileSync(file, markdown)
   return { path: file }
 }
 

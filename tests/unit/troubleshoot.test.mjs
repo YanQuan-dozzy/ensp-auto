@@ -73,10 +73,44 @@ test('buildTroubleshootTranscript：含失败行与后续调用，且可截断',
   assert.match(short, /轨迹已截断/)
 })
 
-test('troubleshootDraftTitle / Description：工具名去重、说明来源', () => {
+test('troubleshootDraftTitle：错误码主题优先、工具名兜底、长度收敛', () => {
+  const mk = (name, errorCode) => ({
+    failure: { nodeId: 'n', at: 1, name, ok: false, argKey: '{}', ...(errorCode ? { errorCode } : {}) },
+    after: []
+  })
+
+  // 错误码映射成人话主题，且标题里**不出现工具名**（列表一行要放得下）
+  assert.equal(troubleshootDraftTitle([mk('apply_config', 'FAILED')]), '配置下发排障')
+  assert.equal(troubleshootDraftTitle([mk('apply_config', 'DANGER_COMMAND_BLOCKED')]), '危险命令排障')
+  // 同一工具重复失败不叠加，去重后仍是一条
+  assert.equal(troubleshootDraftTitle([mk('apply_config', 'FAILED'), mk('apply_config', 'FAILED')]), '配置下发排障')
+  // 两个不同主题拼起来，顺序按片段出现顺序
+  assert.equal(
+    troubleshootDraftTitle([mk('connect_device', 'NOT_CONNECTED'), mk('apply_config', 'FAILED')]),
+    '设备连接、配置下发排障'
+  )
+  // 主题数封顶 2 个：第三个不同主题被丢弃，标题长度收敛
+  assert.equal(
+    troubleshootDraftTitle([
+      mk('connect_device', 'NOT_CONNECTED'),
+      mk('apply_config', 'FAILED'),
+      mk('register_device', 'DEVICE_BUSY')
+    ]),
+    '设备连接、配置下发排障',
+    '超过 2 个主题时按出现顺序截断'
+  )
+  // 无错误码 → 用工具名归主题；纯未知工具 → 通用名
+  assert.equal(troubleshootDraftTitle([mk('apply_config', undefined)]), '配置下发排障')
+  assert.equal(troubleshootDraftTitle([mk('some_unknown_tool', undefined)]), '排障经验')
+  assert.equal(troubleshootDraftTitle([mk('some_unknown_tool', 'WHATEVER_CODE')]), '排障经验')
+  assert.equal(troubleshootDraftTitle([]), '排障经验')
+
+  // 硬约束：任何输入都不该产出长标题
+  assert.ok(troubleshootDraftTitle([mk('apply_config', 'FAILED'), mk('connect_device', 'NOT_CONNECTED')]).length <= 12)
+})
+
+test('troubleshootDraftDescription：说明来源与片段数', () => {
   const mk = (name) => ({ failure: { nodeId: 'n', at: 1, name, ok: false, argKey: '{}' }, after: [] })
-  assert.equal(troubleshootDraftTitle([mk('a'), mk('a'), mk('b')]), '排障：a、b')
-  assert.equal(troubleshootDraftTitle([]), '排障：实验失败复盘')
   assert.match(troubleshootDraftDescription([mk('a'), mk('a')]), /2 个「失败→修正」片段/)
 })
 

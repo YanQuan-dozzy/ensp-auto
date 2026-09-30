@@ -269,7 +269,25 @@ export function TerminalPane(): React.ReactNode {
         .catch(() => setQueuedNotice(null))
     })
 
-    const ro = new ResizeObserver(() => safeFit())
+    /**
+     * R8（PERF-MEM-REVIEW-2026-09-29 §五）：`ResizeObserver` 用 rAF 合流。
+     *
+     * 原来每次回调都直接 `safeFit()` —— 它做的是「重排 xterm + **同步 IPC**
+     * （`terminal.resize`）+ 可能的整屏重绘」。拖分隔条时 `ResizeObserver`
+     * 可达 120Hz，等于每秒 120 次同步 IPC，而面板宽度一帧只可能落一个值。
+     *
+     * 合流后一帧最多 fit 一次；`disposed` 守卫让在途的那一帧在卸载后自动作废。
+     * 项目内的同款范式见 `AdaptiveContainer.tsx`。
+     */
+    let fitRaf: number | null = null
+    const ro = new ResizeObserver(() => {
+      if (fitRaf !== null) return
+      fitRaf = requestAnimationFrame(() => {
+        fitRaf = null
+        if (disposed) return
+        safeFit()
+      })
+    })
     ro.observe(host)
 
     term.writeln(welcome)
@@ -285,6 +303,12 @@ export function TerminalPane(): React.ReactNode {
       offClosed()
       offClear()
       ro.disconnect()
+      // R8：把在途的那一帧取消掉（`disposed` 守卫已能兜住，但显式取消更干净 ——
+      // 不然每切一次设备就留一个待执行回调）
+      if (fitRaf !== null) {
+        cancelAnimationFrame(fitRaf)
+        fitRaf = null
+      }
       term.dispose()
       termRef.current = null
       fitRef.current = null

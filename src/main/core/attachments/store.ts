@@ -168,13 +168,52 @@ function readHead(file: string, bytes: number): Buffer {
 }
 
 export class AttachmentStore {
-  /** 文档抽取缓存（v2.1）：key = 归档路径，值按 size+mtime 认版本，翻页时不必重抽 */
-  private docCache = new Map<string, { key: string; result: DocLinesResult }>()
+  /**
+   * 文档抽取缓存（v2.1）：key = 归档路径，值按 size+mtime 认版本，翻页时不必重抽。
+   *
+   * M5（PERF-MEM-REVIEW-2026-09-29 §4.1）：三条纪律，缺一条就是无界驻留 ——
+   * ① **LRU 而不是 FIFO**：`get` 命中时要把条目提到队尾，否则「翻第 5 页时把
+   *    第 1 页的文档挤掉、翻回去又要重抽整份 PDF」；
+   * ② **总字节预算**：条目数封顶 4 挡不住单条巨大 —— `DocLinesOk.lines` 的上限是
+   *    `MAX_OUTPUT_CHARS`（200 万字符），4 份满额 ≈ 16MB 常驻，且每行是独立
+   *    string 对象；
+   * ③ **`setRootDir` 必须清缓存**：切换附件目录后，旧目录下的大文档再也不会被
+   *    访问，却仍钉在内存里。
+   *
+   * 只缓存 `ok: true`：失败结果是「这份文件抽不出文本」，重试代价只是一次
+   * 快速失败，没有缓存价值，却会占掉一个名额把真正有用的成功结果挤走。
+   */
+  private docCache = new Map<string, { key: string; result: DocLinesResult; chars: number }>()
+  /** 缓存内 `lines` 字符数合计（`docCache` 的伴随记账，用于按字节淘汰） */
+  private docCacheChars = 0
 
   constructor(private rootDir: string) {}
 
   setRootDir(newDir: string): void {
+    if (newDir === this.rootDir) return
     this.rootDir = newDir
+    // M5：换了根目录 → 旧路径的缓存条目再也命中不了，直接清掉（否则旧目录的
+    // 大文档会一直占到进程退出）。不解引用也不影响正确性，只是白占内存。
+    this.clearDocCache()
+  }
+
+  /** M5：清空文档抽取缓存（`setRootDir` 与测试用） */
+  clearDocCache(): void {
+    this.docCache.clear()
+    this.docCacheChars = 0
+  }
+
+  /** M5：测试/诊断用 —— 当前缓存的条目数与字符数 */
+  docCacheStats(): { entries: number; chars: number } {
+    return { entries: this.docCache.size, chars: this.docCacheChars }
+  }
+
+  /** M5：缓存条目的容量记账 —— 只算 `lines` 与几个小字符串（其余是定长字段） */
+  private static cacheCharsOf(result: DocLinesResult): number {
+    if (!result.ok) return 0
+    let n = result.label.length + result.note.length + result.format.length
+    for (const line of result.lines) n += line.length
+    return n
   }
 
   get root(): string {
@@ -464,8 +503,8 @@ export class AttachmentStore {
    *
    * 返回 `null` 表示「不是我们能抽的文档」—— 调用方回落到普通文本读取
    * （于是普通 ZIP 会得到 NOT_TEXT + 「先解压」的建议，而不是被当成损坏文档）。
-   * 缓存按「路径 + 大小 + mtime」认文件：翻第 2 页时不必重抽整份文档；
-   * 只保留最近 4 份（附件是当次导入的东西，没有长期驻留价值）。
+   * 缓存按「路径 + 大小 + mtime」认文件：翻第 2 页时不必重抽整份文档。
+   * 容量与淘汰口径见 `docCache` 的注释（M5：LRU + 总字符预算）。
    */
   private documentLines(file: string, st: fs.Stats): DocLinesResult | null {
     const head = readHead(file, 8)
@@ -474,7 +513,12 @@ export class AttachmentStore {
 
     const key = `${st.size}:${st.mtimeMs}`
     const hit = this.docCache.get(file)
-    if (hit && hit.key === key) return hit.result
+    if (hit && hit.key === key) {
+      // M5：LRU 触达 —— 删了重插把它提到队尾（Map 保持插入序）
+      this.docCache.delete(file)
+      this.docCache.set(file, hit)
+      return hit.result
+    }
 
     // 只有确认要抽文档时才整份读：ZIP 与 CFB 的格式判定必须看全量
     // （中央目录在尾部、目录流在文件中间，头部若干字节认不出来）
@@ -491,13 +535,54 @@ export class AttachmentStore {
 
     const result = isPdf ? this.extractPdf(buf) : this.extractDoc(buf)
     if (!result) return null
-    this.docCache.set(file, { key, result })
-    if (this.docCache.size > 4) {
-      const oldest = this.docCache.keys().next().value
-      if (oldest !== undefined) this.docCache.delete(oldest)
+
+    // M5：失败结果不缓存（见 docCache 注释第 ③ 条）
+    if (result.ok) {
+      // 同路径的旧条目（版本已过期）先摘掉，避免它的记账残留
+      this.dropDocCacheEntry(file)
+      const chars = AttachmentStore.cacheCharsOf(result)
+      this.docCache.set(file, { key, result, chars })
+      this.docCacheChars += chars
+      this.trimDocCache()
     }
     return result
   }
+
+  /** M5：摘掉某条缓存并同步字符记账 */
+  private dropDocCacheEntry(file: string): void {
+    const cur = this.docCache.get(file)
+    if (!cur) return
+    this.docCacheChars -= cur.chars
+    this.docCache.delete(file)
+  }
+
+  /**
+   * M5：缓存淘汰 —— 先按条数（4 条），再按总字符预算（200 万）。
+   *
+   * 两条都要，因为两条各自都挡不住极端：条数上限挡不住「4 份各 200 万字」，
+   * 字符预算挡不住「很多份小文档」把 Map 撑出大量小对象。
+   * 一律**整条淘汰最旧的**（LRU：队首就是最久没被命中的）。
+   */
+  private trimDocCache(): void {
+    while (this.docCache.size > AttachmentStore.DOC_CACHE_MAX_ENTRIES) {
+      const oldest = this.docCache.keys().next().value
+      if (oldest === undefined) break
+      this.dropDocCacheEntry(oldest)
+    }
+    while (
+      this.docCacheChars > AttachmentStore.DOC_CACHE_MAX_CHARS &&
+      this.docCache.size > 1
+    ) {
+      const oldest = this.docCache.keys().next().value
+      if (oldest === undefined) break
+      this.dropDocCacheEntry(oldest)
+    }
+  }
+
+  /** M5：缓存条目数上限（原实现的口径，保留） */
+  private static readonly DOC_CACHE_MAX_ENTRIES = 4
+  /** M5：缓存 `lines` 字符数总预算 —— 约等于原实现「4 份满额」的 1/4，够翻页用 */
+  private static readonly DOC_CACHE_MAX_CHARS = 500_000
 
   private extractPdf(buf: Buffer): DocLinesOk | DocLinesFail {
     const r = extractPdfText(buf)

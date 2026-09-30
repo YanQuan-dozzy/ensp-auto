@@ -31,6 +31,23 @@ export interface AtomicWriteOptions {
   baseDelayMs?: number
   /** 失败时是否抛出（默认 true）；false 时返回 false 并把失败原因交给调用方 */
   throwOnError?: boolean
+  /**
+   * D4（PERF-MEM-REVIEW-2026-09-29 §4.2）：写完临时文件后是否 fsync，默认 **true**。
+   *
+   * 为什么默认要开：断电时可能「rename 已持久化、数据还在页缓存里」，
+   * 目标文件变成 0 字节 / 半截 —— 而 rename 原子只保证「要么旧要么新」，
+   * 不保证新内容已经落盘（见下面 `atomicWriteFileSync` 里的注释）。
+   *
+   * 什么时候可以关：**这份文件能从别处重建**的派生数据。
+   * 典型是会话树索引（`sessions-index.json`，真相在 `tree-*.jsonl`）——
+   * 它一天被写上百次，而 Windows 上 `fsyncSync` 是 `FlushFileBuffers`，
+   * 单次 0.1~数 ms，杀软扫描时可达数十 ms，且**整个主进程同步阻塞**
+   * （主进程同时在跑 telnet/SSH、工具执行、渲染层 IPC）。
+   * 丢了就重建，最坏是「会话列表顺序/条数滞后一次」。
+   *
+   * 纪律：**不得**因此新增第二套写盘实现 —— 仍走这一个函数，只切这个开关。
+   */
+  fsync?: boolean
 }
 
 /** 同步退避等待：写盘是同步路径，没法 await；单次最多几十毫秒 */
@@ -58,7 +75,14 @@ export function atomicWriteFileSync(
   options: AtomicWriteOptions = {}
 ): boolean {
   const retries = Math.max(0, options.retries ?? 3)
-  const baseDelayMs = Math.max(0, options.baseDelayMs ?? 10)
+  // D4：首次退避从 10ms 降到 2ms。
+  // sleepSync 用 Atomics.wait —— 那是**整个进程硬阻塞**（不只是这个调用栈），
+  // 而 Windows 上 rename 撞 EPERM/EBUSY 是常态（杀软 / 索引服务 / 资源管理器
+  // 预览），不是理论风险。原来最坏退避 10+20+40 = 70ms 主进程完全冻结，
+  // 改后 2+4+8 = 14ms。3 次重试的总等待只从 70ms 降到 14ms，
+  // 而「等 10ms 就能解锁」这种假设本来就不成立 —— 持有者释放通常要几十 ms，
+  // 真正起效的是重试**次数**而不是单次时长。
+  const baseDelayMs = Math.max(0, options.baseDelayMs ?? 2)
 
   const tmp = tempNameFor(file)
   let lastError: unknown = null
@@ -69,10 +93,12 @@ export function atomicWriteFileSync(
     // N40：写临时文件后必须 fsync 再 rename。否则断电时可能「rename 已持久化、数据未落盘」，
     // 目标文件变成 0 字节 / 半截 JSON —— 而 rename 是原子的这件事只保证「要么旧要么新」，
     // 不保证新内容已经落盘。父目录 fsync 在 Windows 上不受支持（可忽略），属已知限制。
+    // D4：`fsync: false` 时跳过 —— 只给「能从别处重建的派生数据」用（见选项注释）。
+    const wantFsync = options.fsync !== false
     const fd = fs.openSync(tmp, 'w')
     try {
       fs.writeFileSync(fd, data)
-      fs.fsyncSync(fd)
+      if (wantFsync) fs.fsyncSync(fd)
     } finally {
       fs.closeSync(fd)
     }

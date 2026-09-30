@@ -151,6 +151,11 @@ export class EventStream<T> implements AsyncIterable<T> {
   close(): void {
     if (this.closed) return
     this.closed = true
+    // 注意：这里**不能**清 buffer。事件流的契约是「缓冲里的先发完、再报 done」
+    // （见 next()：先 shift，再看 closed）—— `finish()` 是先 push({done}) 再
+    // close() 的，那条 done 往往还躺在缓冲里。在 close() 里清空会把每轮任务的
+    // 收尾事件（error / done）直接吞掉，表现为「任务卡在运行中」。
+    // 释放改在「缓冲真的被读空 / 消费者放弃」之后做，见 next() 与 return()。
     for (const waiter of this.waiters.splice(0, this.waiters.length)) {
       waiter({ value: undefined as never, done: true })
     }
@@ -161,12 +166,22 @@ export class EventStream<T> implements AsyncIterable<T> {
       next: (): Promise<IteratorResult<T>> => {
         const buffered = this.buffer.shift()
         if (buffered !== undefined) return Promise.resolve({ value: buffered, done: false })
-        if (this.closed) return Promise.resolve({ value: undefined as never, done: true })
+        if (this.closed) {
+          // M2（PERF-MEM-REVIEW-2026-09-29 §4.1）：缓冲里是 `tool_end.raw`
+          // ——设备原始回显，单条上限 512KB（DEFAULT_TELNET_OPTIONS.maxBytes）。
+          // 抛错 / 中止路径上常有大量未被消费的 raw 挂在这里（一条长实验几十次
+          //「读配置」就是几十 MB）。消费完毕后没有理由继续持有，把数组缩回空壳，
+          // 元素随之可回收。放在这里而不是 close()：此刻缓冲已确认读空。
+          if (this.buffer.length > 0) this.buffer.length = 0
+          return Promise.resolve({ value: undefined as never, done: true })
+        }
         return new Promise<IteratorResult<T>>((resolve) => {
           this.waiters.push(resolve)
         })
       },
       return: (): Promise<IteratorResult<T>> => {
+        // 消费者提前 break（中止后不再收事件）：缓冲直接丢弃
+        this.buffer.length = 0
         this.close()
         return Promise.resolve({ value: undefined as never, done: true })
       }

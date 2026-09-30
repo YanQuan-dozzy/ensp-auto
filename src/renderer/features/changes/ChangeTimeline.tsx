@@ -215,7 +215,7 @@ export function ChangeTimeline(): ReactNode {
 
       <div className="changes-hint">
         所有设备的配置变更（下发 / 回滚 / 保存）按时间倒序汇总。点开任意一条可看完整命令、
-        依据的快照与失败原因 —— 用于排障与「这配置谁在什么时候改的」的取证。
+        依据的快照与失败原因，用于排障与「这配置谁在什么时候改的」的取证。
       </div>
 
       <div className="changes-filters">

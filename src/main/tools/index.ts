@@ -17,7 +17,7 @@ import {
   runShowCommand,
   saveConfigSnapshot
 } from './command'
-import { applyConfig, restoreSnapshot, saveConfiguration, verifyExpectation } from './config'
+import { applyConfig, resetSavedConfiguration, restoreSnapshot, saveConfiguration, verifyExpectation } from './config'
 import { findTopologyFilesTool, getTopology, importTopologyFile, refreshTopology, saveTopoFile } from './topology'
 import { exportSessionReport, listSessions } from './sessions'
 import { analyzeReferenceConfigs } from './reference'
@@ -70,6 +70,9 @@ export const TOOLS: readonly ToolSpec[] = [
   verifyExpectation,
   restoreSnapshot,
   saveConfiguration,
+  // v2.30：清空启动配置的专属出口（danger + 闸门 + 代答自己触发的那次 [Y/N]）——
+  // 把「apply_config 先报视图错 → 换写法停在提示 → 再补应答」三步并成一步
+  resetSavedConfiguration,
   // D2（2026-09-23）：[Y/N] 挂起后唯一可用的应答通道（risk danger，过闸门）
   answerDevicePrompt,
   getTopology,

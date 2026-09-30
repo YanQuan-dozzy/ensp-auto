@@ -177,6 +177,11 @@ export interface TopoContextMenuProps {
   onClose: () => void
   onFocusAdd: () => void
   onRunLayout: () => void
+  /** v2.31：坐标恢复成 eNSP 工程里的原始摆布 */
+  onRestoreSource: () => void
+  /** 对齐到网格（B4 第五批）：node 菜单对单台，pane 菜单对全部 */
+  onAlignNode: (nodeId: string | null) => void
+  onAlignAll: () => void
   onFitView: () => void
 }
 
@@ -207,6 +212,15 @@ export function TopoContextMenu(p: TopoContextMenuProps): React.ReactNode {
             </button>
             <button className="topo-menu-item" onClick={() => p.onSetSub('roles')}>
               修改角色 ▸
+            </button>
+            <button
+              className="topo-menu-item"
+              onClick={() => {
+                p.onAlignNode(menu.nodeId ?? null)
+                p.onClose()
+              }}
+            >
+              对齐到网格
             </button>
             <div className="topo-menu-sep" />
             <button className="topo-menu-item" onClick={() => p.onDisconnect(menu.nodeId ?? null)}>
@@ -259,6 +273,18 @@ export function TopoContextMenu(p: TopoContextMenuProps): React.ReactNode {
                 </button>
                 <button className="topo-menu-item" onClick={p.onRunLayout}>
                   自适应布局
+                </button>
+                <button className="topo-menu-item" onClick={p.onRestoreSource}>
+                  恢复原始布局
+                </button>
+                <button
+                  className="topo-menu-item"
+                  onClick={() => {
+                    p.onAlignAll()
+                    p.onClose()
+                  }}
+                >
+                  全部对齐到网格
                 </button>
               </>
             )}

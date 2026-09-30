@@ -3,6 +3,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -58,10 +59,11 @@ import {
   hoistTrailingThinking,
   planRawCollapse,
   resolveTurnBoundary,
-  splitTurns,
+  splitTurnsReusing,
   type CollapseSignal,
   type Segment,
-  type ToolMsg
+  type ToolMsg,
+  type TurnSlice
 } from './messageSegments'
 import {
   DIFF_PREVIEW_LINES,
@@ -113,6 +115,10 @@ function shortDateTime(ts: number): string {
 
 export function AgentPanel({ onOpenSettings }: { onOpenSettings?: () => void }): ReactNode {
   const messages = useApp((s) => s.messages)
+  // R3：流式中的那条 assistant 正文单独订阅（不进 messages）。
+  // 它挂在消息流末尾，渲染时作为一条**虚拟段**并进去 —— 于是整段流式输出
+  // 期间 `messages` 引用不变，下面的四趟 O(n) 管线与 MarkdownView 的 memo 全部命中。
+  const streamingText = useApp((s) => s.streamingText)
   const running = useApp((s) => s.agentRunning)
   const runtime = useApp((s) => s.agentRuntime)
   const hasApiKey = useApp((s) => s.hasApiKey)
@@ -159,6 +165,8 @@ export function AgentPanel({ onOpenSettings }: { onOpenSettings?: () => void }):
    * 把浮层嵌在菜单里会被裁掉。
    */
   const [quick, setQuick] = useState<{ id: string; top: number; left: number } | null>(null)
+  /** 快捷设置浮层的外层容器：用来量它的真实高度（视口底部兜底，见下面的 useLayoutEffect） */
+  const quickRef = useRef<HTMLDivElement | null>(null)
   /** 会话区右键菜单（选中文字后复制单段） */
   const [streamMenu, setStreamMenu] = useState<{ x: number; y: number; text: string } | null>(null)
   const [mcpOpen, setMcpOpen] = useState(false)
@@ -178,6 +186,19 @@ export function AgentPanel({ onOpenSettings }: { onOpenSettings?: () => void }):
    * 把用户已经手动展开的块反复拉回收起态。
    */
   const [turnCollapse, setTurnCollapse] = useState<Record<string, CollapseSignal>>({})
+  /**
+   * R10（PERF-MEM-REVIEW-2026-09-29 §五）：切会话必须整体复位。
+   *
+   * `TurnSlice.key` 是按 user 段 id 建的，跨会话会撞键 —— 浏览 50 个会话 × 20 轮
+   * 就是 1000 个永不回收的条目，而且撞上的那一轮会带着上一个会话的折叠态。
+   * 对齐 `TracePanel.tsx:191` 的既有做法。
+   *
+   * 复位只动这张表，**不碰** `COLLAPSED_SIGNAL` 的模块级常量身份 ——
+   * 未点开过的轮必须继续拿到同一个引用（N16/B5 的硬约束，见报告 §十.1）。
+   */
+  useEffect(() => {
+    setTurnCollapse({})
+  }, [activeRootId])
   /**
    * N16：必须是**稳定引用** —— 它会被透传给 `FinalResponseView`（memo 组件），
    * 每次渲染新建函数会让 memo 全部失效，历史轮在流式期间照样整棵重渲染。
@@ -255,24 +276,53 @@ export function AgentPanel({ onOpenSettings }: { onOpenSettings?: () => void }):
     setHasNewBelow(false)
   }
 
+  /**
+   * R2（PERF-MEM-REVIEW-2026-09-29 §4.3）：跟随滚动用 rAF 合流。
+   *
+   * 原来的路径是「读-写交替」：`onStreamScroll` 读 `scrollHeight/scrollTop/clientHeight`
+   * 三个布局属性 → effect 里写 `scrollTop = scrollHeight` → 写入又派发 `scroll`
+   * → 回到 `onStreamScroll` 再读三个。**每个 token 4 次强制同步布局**，
+   * 被 reflow 的是整条消息流的 DOM（几百个节点），且读写交替正是 layout thrash 的定义。
+   *
+   * 合流后一帧最多提交一次写，且写之前不再读布局（`scrollHeight` 本身就是读，
+   * 但只有一帧一次、且不与别的读交替）。
+   */
+  const followRaf = useRef<number | null>(null)
+  const scheduleFollow = (): void => {
+    if (followRaf.current !== null) return
+    followRaf.current = requestAnimationFrame(() => {
+      followRaf.current = null
+      const el = streamRef.current
+      if (!el || !stickToBottom.current) return
+      el.scrollTop = el.scrollHeight
+    })
+  }
+  useEffect(
+    () => () => {
+      if (followRaf.current !== null) cancelAnimationFrame(followRaf.current)
+    },
+    []
+  )
+
   const onStreamScroll = (): void => {
     const el = streamRef.current
     if (!el) return
     const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+    // R2：只有「贴底与否」这个布尔翻转才值得 setState。用户手动滚动是 60~120Hz，
+    // 每次都 set 会把 AgentPanel 顶层整个重渲（`hasNewBelow` 挂在它上面）。
+    if (stickToBottom.current === atBottom) return
     stickToBottom.current = atBottom
     if (atBottom) {
       seenCount.current = messages.length
-      if (hasNewBelow) setHasNewBelow(false)
+      setHasNewBelow(false)
     }
   }
 
   useEffect(() => {
-    const el = streamRef.current
-    if (!el) return
     // 只在用户本来就贴着底部时自动滚到底；上翻看历史时不再被流式输出拽回
     if (stickToBottom.current) {
-      el.scrollTop = el.scrollHeight
       seenCount.current = messages.length
+      scheduleFollow()
     } else if (messages.length > seenCount.current) {
       // 视野之外多了新内容 → 亮出「有新内容」提示
       setHasNewBelow(true)
@@ -298,6 +348,23 @@ export function AgentPanel({ onOpenSettings }: { onOpenSettings?: () => void }):
   }, [messages])
 
   /**
+   * R3：把 `streamingText` 作为一条**虚拟 assistant 段**挂在末尾。
+   *
+   * 为什么要虚拟段而不是直接 push 进 `messages`：`messages` 一换引用，
+   * 上面那个 useMemo 就整个重跑（`dropEmptyMessages` 遍历 + 分配新数组、
+   * `hoistTrailingThinking`、`groupMessages` 重建 size=n 的 Map）。
+   * 单独拼在管线**之后**，`segments` 就能在整段流式期间保持同一引用。
+   *
+   * 段 id 用固定常量而不是 `nextId()`：它是「本轮正在流式的那一条」的身份，
+   * 整段流式期间必须保持不变，否则 React 会把它当成一条新消息反复重建。
+   */
+  const STREAM_SEG_ID = 'm-streaming'
+  const liveSegments = useMemo<Segment[]>(() => {
+    if (!streamingText || !streamingText.trim()) return segments
+    return [...segments, { kind: 'assistant', id: STREAM_SEG_ID, text: streamingText }]
+  }, [segments, streamingText])
+
+  /**
    * v2.13：本轮收尾锚点（回答 / 收尾卡的结构判定）。
    *
    * v2.19：判定下沉到**轮**粒度 —— 渲染不再只看「最后一条 user 之后」，
@@ -305,8 +372,107 @@ export function AgentPanel({ onOpenSettings }: { onOpenSettings?: () => void }):
    * 它自己的回答上，而不是整条流只认最后一张（旧实现里前几轮的收尾卡会被丢掉）。
    * 旧实现的两个坑（轮内最后一条日常信息被当成回答、收尾卡张冠李戴）
    * 在每轮内部由同一条规则挡住，见 `resolveTurnBoundary`。
+   *
+   * R3：改用带前缀复用的版本（`splitTurnsReusing`）—— 流式期间只有最后一轮在长，
+   * 前面的轮直接复用同一个 `TurnSlice` 对象，`turn.body` 引用不变。
    */
-  const turns = useMemo(() => splitTurns(segments), [segments])
+  const turnsRef = useRef<TurnSlice[]>([])
+  const turns = useMemo(() => {
+    const next = splitTurnsReusing(liveSegments, turnsRef.current)
+    turnsRef.current = next
+    return next
+  }, [liveSegments])
+
+  /**
+   * R3/R5（PERF-MEM-REVIEW-2026-09-29 §三 + §五）：把「每轮渲染」整段搬进 useMemo。
+   *
+   * 原来这段是写在 JSX 的 IIFE 里，等于**每次渲染**（含每个流式 delta）都重跑：
+   * ① 每轮一次 `resolveTurnBoundary(turn.body)` —— 从尾部倒扫的 O(段数)，20 轮就是
+   *    每 token 20 趟；
+   * ② 每轮一次 `turn.body.map(...)` 新建 React 元素数组 ——
+   *    这个数组作为 `process` prop 传给 memo 化的 `FinalResponseView`，
+   *    **每次都是新引用 ⇒ 那一轮的 memo 100% 失效**。
+   *    N16 当初的优化只覆盖了「折叠的轮」（`process={null}`，引用稳定），
+   *    「用户手动展开过的历史轮」一直漏在优化之外（R5）。
+   *
+   * 搬进 useMemo 后依赖只有 `turns` 与 `turnCollapse`：
+   * R3 让 `turns` 在整段流式期间只有**最后一轮**变引用（`splitTurnsReusing`），
+   * 于是 memo 内部再按 `turn.body` 引用跳过未变的轮 —— 展开着的历史轮也重新吃到 memo。
+   */
+  const renderedTurns = useMemo(() => {
+    return turns.map((turn) => {
+      // 每轮各判各的收尾锚点：回答 = 本轮最后一次说话且之后再无工具调用
+      const { replyIdx, tailIdx } = resolveTurnBoundary(turn.body)
+      const replySeg = replyIdx >= 0 ? turn.body[replyIdx] : undefined
+      const reply = replySeg && replySeg.kind === 'assistant' ? replySeg : undefined
+      const tailSeg = tailIdx >= 0 ? turn.body[tailIdx] : undefined
+      const turnEnd = tailSeg && tailSeg.kind === 'finish' ? tailSeg : undefined
+
+      const sig = turnCollapse[turn.key] ?? COLLAPSED_SIGNAL
+      /**
+       * v2.19：**已收尾的轮，过程整体收起** —— 只留「收尾行 + 最终回答」。
+       *
+       * 判据是"这一轮有没有收尾卡"，不是"它是不是最后一轮"：
+       * 正在执行的那一轮没有收尾卡 → 过程照常平铺可见（收起等于把
+       * 「正在干什么」藏起来，用户会以为卡死）；一旦收尾卡到达，
+       * 过程即刻收成一行，点收尾行才铺开 —— 与参考图的观感一致。
+       */
+      const folded = turnEnd !== undefined && !sig.open
+
+      /**
+       * 过程段：本轮 body 里除「回答」与「收尾卡」之外的全部段，保持事件顺序。
+       *
+       * **N16：折叠的轮根本不构造这段**。原实现无条件 `turn.body.map(...)`，
+       * 于是一轮已收尾（= 已折叠）的历史轮，在每个流式 delta 上都要重建
+       * O(段数) 个 React 元素对象 —— 这些对象随后被 `process={null}` 丢掉，
+       * 纯浪费，而且长会话下正是掉帧的主因。折叠时不构造，展开的那一轮照旧。
+       */
+      const processNodes = folded
+        ? null
+        : turn.body.map((seg, i) => {
+            if (i === replyIdx || i === tailIdx) return null
+            if (seg.kind === 'toolGroup') {
+              return <ToolGroup key={seg.key} items={seg.items} />
+            }
+            return <MessageView key={seg.id} m={seg} />
+          })
+
+      return (
+        <Fragment key={turn.key}>
+          {turn.user ? <MessageView m={turn.user} /> : null}
+          <CollapseContext.Provider value={sig}>
+            {reply ? (
+              <FinalResponseView
+                text={reply.text}
+                {...(turnEnd ? { turnEnd } : {})}
+                {...(turnEnd ? { turnKey: turn.key, onToggleTurn: toggleTurn } : {})}
+                allOpen={sig.open}
+                msgId={reply.id}
+                process={processNodes}
+                // R1：这一条还在流 → 不喂 react-markdown（对累积全文 O(len²) 重解析）
+                streaming={reply.id === STREAM_SEG_ID}
+              />
+            ) : (
+              <>
+                {processNodes}
+                {/* 没有可挂靠的正文（失败 / 达轮次上限而结束在工具上）时，
+                    收尾行在本轮末尾单独成块 —— 信息不丢，也照样是过程开关 */}
+                {turnEnd ? (
+                  <TurnCompleteBanner
+                    m={turnEnd}
+                    turnKey={turn.key}
+                    onToggleTurn={toggleTurn}
+                    allOpen={sig.open}
+                  />
+                ) : null}
+              </>
+            )}
+          </CollapseContext.Provider>
+        </Fragment>
+      )
+    })
+    // toggleTurn 是 useCallback([]) 恒稳定，不进依赖也不会造成漏算
+  }, [turns, turnCollapse, toggleTurn])
 
   const autoGrow = (): void => {
     const ta = taRef.current
@@ -451,6 +617,18 @@ export function AgentPanel({ onOpenSettings }: { onOpenSettings?: () => void }):
   }
 
   useEffect(() => cancelQuickClose, [])
+
+  /**
+   * 浮层高度只有渲染完才知道。openQuick 只能按「行的位置」猜一个起点，
+   * 面板内容一高（窗口档位、思考强度、图片开关全展开）就会从窗口底部漏出去被切掉。
+   * 这里量到真实高度后把溢出的部分顶回来；只上移、不下移（避免抖动）。
+   */
+  useLayoutEffect(() => {
+    const el = quickRef.current
+    if (!quick || !el) return
+    const top = Math.max(8, Math.min(quick.top, window.innerHeight - el.offsetHeight - 8))
+    if (Math.abs(top - quick.top) > 0.5) setQuick((q) => (q ? { ...q, top } : q))
+  }, [quick])
 
   /**
    * v2.3：会话区右键 —— 只有「选中了文字」时才接管，复制选中的那一段。
@@ -623,76 +801,7 @@ export function AgentPanel({ onOpenSettings }: { onOpenSettings?: () => void }):
               </Empty>
             ) : (
               <>
-                {turns.map((turn) => {
-                  // 每轮各判各的收尾锚点：回答 = 本轮最后一次说话且之后再无工具调用
-                  const { replyIdx, tailIdx } = resolveTurnBoundary(turn.body)
-                  const replySeg = replyIdx >= 0 ? turn.body[replyIdx] : undefined
-                  const reply =
-                    replySeg && replySeg.kind === 'assistant' ? replySeg : undefined
-                  const tailSeg = tailIdx >= 0 ? turn.body[tailIdx] : undefined
-                  const turnEnd = tailSeg && tailSeg.kind === 'finish' ? tailSeg : undefined
-
-                  const sig = turnCollapse[turn.key] ?? COLLAPSED_SIGNAL
-                  /**
-                   * v2.19：**已收尾的轮，过程整体收起** —— 只留「收尾行 + 最终回答」。
-                   *
-                   * 判据是"这一轮有没有收尾卡"，不是"它是不是最后一轮"：
-                   * 正在执行的那一轮没有收尾卡 → 过程照常平铺可见（收起等于把
-                   * 「正在干什么」藏起来，用户会以为卡死）；一旦收尾卡到达，
-                   * 过程即刻收成一行，点收尾行才铺开 —— 与参考图的观感一致。
-                   */
-                  const folded = turnEnd !== undefined && !sig.open
-
-                  /**
-                   * 过程段：本轮 body 里除「回答」与「收尾卡」之外的全部段，保持事件顺序。
-                   *
-                   * **N16：折叠的轮根本不构造这段**。原实现无条件 `turn.body.map(...)`，
-                   * 于是一轮已收尾（= 已折叠）的历史轮，在每个流式 delta 上都要重建
-                   * O(段数) 个 React 元素对象 —— 这些对象随后被 `process={null}` 丢掉，
-                   * 纯浪费，而且长会话下正是掉帧的主因。折叠时不构造，展开的那一轮照旧。
-                   */
-                  const processNodes = folded
-                    ? null
-                    : turn.body.map((seg, i) => {
-                        if (i === replyIdx || i === tailIdx) return null
-                        if (seg.kind === 'toolGroup') {
-                          return <ToolGroup key={seg.key} items={seg.items} />
-                        }
-                        return <MessageView key={seg.id} m={seg} />
-                      })
-
-                  return (
-                    <Fragment key={turn.key}>
-                      {turn.user ? <MessageView m={turn.user} /> : null}
-                      <CollapseContext.Provider value={sig}>
-                        {reply ? (
-                          <FinalResponseView
-                            text={reply.text}
-                            {...(turnEnd ? { turnEnd } : {})}
-                            {...(turnEnd ? { turnKey: turn.key, onToggleTurn: toggleTurn } : {})}
-                            allOpen={sig.open}
-                            msgId={reply.id}
-                            process={processNodes}
-                          />
-                        ) : (
-                          <>
-                            {processNodes}
-                            {/* 没有可挂靠的正文（失败 / 达轮次上限而结束在工具上）时，
-                                收尾行在本轮末尾单独成块 —— 信息不丢，也照样是过程开关 */}
-                            {turnEnd ? (
-                              <TurnCompleteBanner
-                                m={turnEnd}
-                                turnKey={turn.key}
-                                onToggleTurn={toggleTurn}
-                                allOpen={sig.open}
-                              />
-                            ) : null}
-                          </>
-                        )}
-                      </CollapseContext.Provider>
-                    </Fragment>
-                  )
-                })}
+                {renderedTurns}
               </>
             )}
           </div>
@@ -825,7 +934,15 @@ export function AgentPanel({ onOpenSettings }: { onOpenSettings?: () => void }):
                     </button>
                     {modelMenuOpen ? (
                       <>
-                        <div className="menu-backdrop" onClick={() => setModelMenuOpen(false)} />
+                        <div
+                          className="menu-backdrop"
+                          onClick={() => {
+                            // 浮层自己不再带遮罩（带了的遮罩会盖住面板本身，点不动）；
+                            // 点空白处关菜单时一并把浮层清掉
+                            setModelMenuOpen(false)
+                            setQuick(null)
+                          }}
+                        />
                         <div className="model-menu" role="menu" ref={modelMenuRef}>
                           {profiles.map((p) => (
                             <div
@@ -874,6 +991,7 @@ export function AgentPanel({ onOpenSettings }: { onOpenSettings?: () => void }):
                               if (!target) return null
                               return (
                                 <div
+                                  ref={quickRef}
                                   style={{ position: 'fixed', top: quick.top, left: quick.left, zIndex: 102 }}
                                   onMouseEnter={cancelQuickClose}
                                   onMouseLeave={scheduleQuickClose}
@@ -881,7 +999,6 @@ export function AgentPanel({ onOpenSettings }: { onOpenSettings?: () => void }):
                                   <ModelQuickPanel
                                     profile={target}
                                     onPatch={(patch) => patchProfile(target.id, patch)}
-                                    onClose={() => setQuick(null)}
                                   />
                                 </div>
                               )
@@ -1779,7 +1896,8 @@ const FinalResponseView = memo(function FinalResponseView({
   onToggleTurn,
   process,
   allOpen = false,
-  msgId
+  msgId,
+  streaming = false
 }: {
   text: string
   turnEnd?: Extract<UiMessage, { kind: 'finish' }>
@@ -1790,6 +1908,8 @@ const FinalResponseView = memo(function FinalResponseView({
   process?: ReactNode
   /** v2.19：本轮过程区的开合态（决定收尾行箭头方向） */
   allOpen?: boolean
+  /** R1：这条正文还在流式输出中（此时不解析 markdown，见 MarkdownView） */
+  streaming?: boolean
   /** v2.12：本条回答在会话树中的 UI 消息 id —— 提供给尾部状态行的 重新生成/删除 */
   msgId?: string
 }): ReactNode {
@@ -1827,7 +1947,7 @@ const FinalResponseView = memo(function FinalResponseView({
       ) : null}
       {process ? <div className="turn-process">{process}</div> : null}
       <div className="turn-final-body">
-        <MarkdownView text={text} />
+        <MarkdownView text={text} streaming={streaming} />
       </div>
       <TurnStatusLine
         turnEnd={turnEnd}

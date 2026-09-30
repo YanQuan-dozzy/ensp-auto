@@ -5,7 +5,7 @@ import type { GateDecision } from '@shared/types'
 import type { QuestionAnswers } from '@shared/interaction'
 import type { AgentEventPayload } from '@shared/api'
 import type { AppState, SliceGet, SliceSet } from './appState'
-import { SESSION_ID, errText, mergeAttachments, nextId, rejectionText, systemNote } from './storeUtil'
+import { SESSION_ID, errText, mergeAttachments, nextId, rejectionText, systemNote, type UiMessage } from './storeUtil'
 import { EMPTY_TURN_USAGE, accumulateUsage, type TurnUsage } from '@shared/turn-usage'
 import { activeProfile } from '@shared/profiles'
 import { blockedImagesForSend } from '@shared/image-attach'
@@ -19,6 +19,48 @@ import { blockedImagesForSend } from '@shared/image-attach'
  * 收尾时把它折进 `finish` 消息（那一刻才进 store），之后就没人再读它。
  */
 let turnUsage: TurnUsage = EMPTY_TURN_USAGE
+
+/**
+ * R9（PERF-MEM-REVIEW-2026-09-29 §4.3）：渲染层 `tool.raw` 的**总字符预算**。
+ *
+ * 展示侧一直有上限（`RAW_COLLAPSE_LINES = 24`，折叠显示），但**存储侧没有**：
+ * `tool_end` 把设备原始回显**全文**留在 `messages` 里。一次长实验（几十次
+ * `save_config_snapshot` / `display current-configuration`，单次几百 KB 回显）
+ * 就是几十 MB 常驻 —— 而渲染层的 `messages` 在整个会话期间不会被丢弃。
+ *
+ * 超预算时把**最早**的 `raw` 就地换成占位文案：最近几次的回显仍可展开查看
+ * （用户真正会看的就是刚跑完的那几次），历史回显滚动出视野后本来也不会再看。
+ *
+ * 为什么用「占位文案」而不是删字段：渲染侧判的是 `m.raw` 真值
+ * （`AgentPanel.tsx:2150`），空串会连「原始回显」小标题一起消失、看起来像
+ * 工具没产出回显；给一句明确说明才能让用户知道是**被回收**了而不是丢了。
+ */
+const RAW_TOTAL_CHARS = 2_000_000
+const RAW_EVICTED_NOTE = '（原始回显已回收以释放内存；需要时可重新执行该命令）'
+
+/**
+ * 把 `messages` 里 `tool.raw` 的总字符数压到预算内：从**最早的**开始回收，
+ * 最近的那些保持不动。返回是否真的回收过（没超预算时原样返回，避免无谓换引用）。
+ */
+function evictOldRawText(messages: UiMessage[]): UiMessage[] {
+  let total = 0
+  for (const m of messages) {
+    if (m.kind === 'tool' && m.raw && m.raw !== RAW_EVICTED_NOTE) total += m.raw.length
+  }
+  if (total <= RAW_TOTAL_CHARS) return messages
+
+  const next = [...messages]
+  let changed = false
+  // 从头（最早）往后回收，直到落进预算 —— 末尾的几条（刚跑完的）保持可用
+  for (let i = 0; i < next.length && total > RAW_TOTAL_CHARS; i++) {
+    const m = next[i]
+    if (m?.kind !== 'tool' || !m.raw || m.raw === RAW_EVICTED_NOTE) continue
+    total -= m.raw.length
+    next[i] = { ...m, raw: RAW_EVICTED_NOTE }
+    changed = true
+  }
+  return changed ? next : messages
+}
 
 export function agentActions(
   set: SliceSet,
@@ -298,25 +340,39 @@ export function agentActions(
     },
 
     clearConversation() {
-      set({ messages: [], gate: null, question: null, queueHint: 0 })
+      // R3：streamingText 必须一起清 —— 它是消息流末尾那条虚拟段，
+      // 留着会让「空会话」凭空多出一段正在流式的正文
+      set({ messages: [], streamingText: null, gate: null, question: null, queueHint: 0 })
     },
 
     applyAgentEvent({ event, runtime }: AgentEventPayload) {
-      set({ agentRuntime: runtime })
+      // R7（PERF-MEM-REVIEW-2026-09-29 §五）：原来是无条件 set。
+      // zustand 的 set 每次都触发一遍**全部** useSyncExternalStore 订阅的 selector ——
+      // 流式期间每个 token 都进来一次，一轮长回答几百个 token × 300~500 个订阅
+      // = 每秒几万次纯空转，而这个值恒为 'react'，永远不会变。
+      if (get().agentRuntime !== runtime) set({ agentRuntime: runtime })
+      // R3：任何**不是** text 的事件都意味着「这段流式正文到此收束」——
+      // 先把它并进 messages（若非空），后面各 case 才能安全地往 messages 尾部追加，
+      // 顺序与旧的「直接进 messages」完全一致。
+      if (event.type !== 'text') {
+        const streamed: string | null = get().streamingText
+        if (streamed !== null) {
+          set((s) => ({
+            messages: streamed.trim()
+              ? [...s.messages, { kind: 'assistant' as const, id: nextId(), text: streamed }]
+              : s.messages,
+            streamingText: null
+          }))
+        }
+      }
       switch (event.type) {
         case 'plan':
           set((s) => ({ messages: [...s.messages, { kind: 'plan', id: nextId(), steps: event.steps }] }))
           break
         case 'text':
-          set((s) => {
-            const last = s.messages[s.messages.length - 1]
-            if (last && last.kind === 'assistant') {
-              const next = [...s.messages]
-              next[next.length - 1] = { ...last, text: last.text + event.delta }
-              return { messages: next }
-            }
-            return { messages: [...s.messages, { kind: 'assistant', id: nextId(), text: event.delta }] }
-          })
+          // R3：只改一个字符串字段，`messages` 引用不动 ⇒ 渲染管线的
+          // 四趟 O(n) 重算与 MarkdownView 的 memo 全部命中。
+          set((s) => ({ streamingText: (s.streamingText ?? '') + event.delta }))
           break
         case 'thinking':
           // v2.2：一段思考结束 —— 独立的可折叠「思考」行
@@ -360,7 +416,9 @@ export function agentActions(
                 break
               }
             }
-            return { messages: next }
+            // R9：每次落一条新回显后校一次预算 —— 只在校验为「超了」时换引用，
+            // 正常路径（没超）原样返回，不多触发一次渲染管线重算。
+            return { messages: evictOldRawText(next) }
           })
           break
         case 'gate_request':
@@ -403,7 +461,19 @@ export function agentActions(
           // 只在过半时才记会把小任务的数字算漏（老逻辑的过半提示仍保留）。
           turnUsage = accumulateUsage(
             turnUsage,
-            { promptTokens: event.promptTokens, outputTokens: event.outputTokens },
+            {
+              promptTokens: event.promptTokens,
+              outputTokens: event.outputTokens,
+              // v2.28：缓存分项一并累加。provider 没给（老端点）就不带这三个键 ——
+              // 传 0 会让命中率计算的分母凭空多出 0，看上去和「确实全都没命中」一样。
+              ...(event.cacheReadTokens !== undefined
+                ? {
+                    cacheReadTokens: event.cacheReadTokens,
+                    cacheWriteTokens: event.cacheWriteTokens ?? 0,
+                    freshInputTokens: event.freshInputTokens ?? 0
+                  }
+                : {})
+            },
             { measured: event.measured, contextWindow: event.contextWindow, ratio: event.ratio }
           )
           // v2.6：真实用量。只在过半时才提示，否则每一轮都插一行会把对话淹掉。

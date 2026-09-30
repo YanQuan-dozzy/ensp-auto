@@ -18,6 +18,7 @@ import {
 } from '@shared/plan-mode'
 import { classifyDanger } from '@shared/risk'
 import {
+  COMMAND_GATE_SKIPPED_NOTE,
   GATE_DENIED_REASON,
   GATE_DENIED_SUMMARY,
   planDangerGate
@@ -164,6 +165,21 @@ const failResult = (code: string, message: string, ms: number): ToolRunResult =>
   error: { code, message },
   meta: { ms }
 })
+
+/**
+ * v2.28：判断本次工具结果里是否有「命令级危险清单被策略放行」。
+ *
+ * 只认 `data.skippedCommand` 这一个字段（由 `tools/config.ts` 的下发管道回传），
+ * 不猜别的形状 —— 猜错就会在摘要里对一次正常变更说「绕过了危险清单」。
+ */
+function commandGateSkipped(result: ToolRunResult): boolean {
+  const data = result.data
+  return (
+    typeof data === 'object' &&
+    data !== null &&
+    typeof (data as { skippedCommand?: unknown }).skippedCommand === 'string'
+  )
+}
 
 export class ReactRuntime implements AgentRuntime {
   private readonly gates = new Map<string, (d: GateDecision) => void>()
@@ -407,17 +423,27 @@ export class ReactRuntime implements AgentRuntime {
     const todoOwnerId = input.rootId ?? ''
     const todosReady = Boolean(this.deps.todos && todoOwnerId)
     const readTodos = (): TodoItem[] => (todosReady ? this.deps.todos!.get(todoOwnerId) : [])
-    // 快照成字符串而不是每轮现读：清单没变时 system prompt 必须逐字一致，
-    // 否则每一轮都是新前缀，服务端 prompt cache 全部失效（这个项目已经为它调过一次错）。
-    let todoBlock = buildTodoPromptBlock(readTodos())
 
+    // v2.28：清单**不进 system prompt**。
+    // system prompt 是服务端 prompt cache 的**第一个前缀** —— 它一变，后面整段
+    // transcript 都要按全价重算；而清单在长任务里会被 todo_write 更新很多次，
+    // 每次更新都整车重算的代价极大（据本仓实测：一次 33 轮的任务里 system prompt
+    // 被清单改动击穿数次，命中缓存的那些轮次全部白费）。
+    // 于是清单改为**追加到 transcript 末尾**：首轮挂在本轮用户消息上，之后挂在
+    // 触发 todo_write 的那一轮的工具结果上。追加只是延长前缀，不破坏
+    // `assistant(toolCalls) ↔ toolResult` 配对，也不改轮次划分（压缩的保留窗口
+    // 依赖 role 序列，插一条 user 消息会把刚跑完的轮次挤出窗口）。
+    // 结果是：system prompt 从任务开始到结束**逐字不变**，前缀缓存可以一直命中。
     const promptFor = (mode: boolean): string =>
-      basePrompt + (mode ? PLAN_MODE_PROMPT_BLOCK : '') + todoBlock
+      basePrompt + (mode ? PLAN_MODE_PROMPT_BLOCK : '')
     let systemPrompt = promptFor(planMode)
 
-    // 本轮开始时把已有清单推给界面：用户重开会话继续干活时，进度条不该是空的
+    // 本轮开始时把已有清单推给界面，并挂到首轮用户消息上 ——
+    // 用户重开会话继续干活时，模型与进度条都不该是空的
     const initialTodos = readTodos()
-    if (initialTodos.length > 0) {      out.push({
+    if (initialTodos.length > 0) {
+      appendTextToMessage(messages[messages.length - 1]!, buildTodoPromptBlock(initialTodos))
+      out.push({
         type: 'todo_update',
         todos: initialTodos,
         detail: `恢复任务清单：${describeTodos(initialTodos)}`,
@@ -706,13 +732,25 @@ export class ReactRuntime implements AgentRuntime {
           }
           const pUsage = pressureNow()
           const promptTokens = measured ?? pUsage.tokens
+          // v2.28：缓存分项单独下发。promptTokens 是三者的和，而命中部分通常按
+          // 0.1 倍计价 —— 不拆开，用户无法判断账单大头是「全价输入」还是「输出」。
+          const cacheRead = Math.max(0, Math.round(finalMessage.usage?.cacheRead ?? 0))
+          const cacheWrite = Math.max(0, Math.round(finalMessage.usage?.cacheWrite ?? 0))
+          const freshInput = Math.max(0, Math.round(finalMessage.usage?.input ?? 0))
           out.push({
             type: 'usage',
             promptTokens,
             outputTokens: Math.max(0, Math.round(finalMessage.usage?.output ?? 0)),
             contextWindow,
             ratio: promptTokens / Math.max(1, contextWindow),
-            measured: measured !== null
+            measured: measured !== null,
+            ...(measured !== null
+              ? {
+                  cacheReadTokens: cacheRead,
+                  cacheWriteTokens: cacheWrite,
+                  freshInputTokens: freshInput
+                }
+              : {})
           })
           break
         }
@@ -906,24 +944,6 @@ export class ReactRuntime implements AgentRuntime {
         return
       }
 
-      // v2.7：清单被改过就同时刷新「提示词块」与「界面」。
-      // 只在真的调用过 todo_write 且本轮有会话归属时才动 prompt ——
-      // 每轮无条件重建会让 prompt cache 失效。
-      if (
-        todosReady &&
-        acc.toolCalls.some((c) => c.name === 'todo_write' && executed.get(c.id)?.ok)
-      ) {
-        const todos = readTodos()
-        todoBlock = buildTodoPromptBlock(todos)
-        systemPrompt = promptFor(planMode)
-        out.push({
-          type: 'todo_update',
-          todos,
-          detail: describeTodos(todos),
-          ownerId: todoOwnerId
-        })
-      }
-
       // transcript 必须按**模型给出的调用顺序**写：provider 会拿 assistant 消息里的
       // toolCalls 顺序去校验工具结果配对，按完成先后写会直接 400。
       // 并发批次里 tool_end 的到达顺序是不确定的，这里靠 original order 归一。
@@ -955,6 +975,25 @@ export class ReactRuntime implements AgentRuntime {
           content,
           isError: !result.ok,
           timestamp: Date.now()
+        })
+      }
+
+      // v2.7 / v2.28：清单被改过就刷新界面，并把最新清单**追加到本轮最后一个
+      // 工具结果**里（而不是改 system prompt —— 见 drive() 里 v2.28 的说明）。
+      // 必须排在上面的写入循环之后：注入点是「本条轮次的最后一条消息」，
+      // 与重复调用防护的注入口径一致（追加到末尾 = 只延长前缀，不破结构）。
+      if (
+        todosReady &&
+        acc.toolCalls.some((c) => c.name === 'todo_write' && executed.get(c.id)?.ok)
+      ) {
+        const todos = readTodos()
+        const tail = messages[messages.length - 1]
+        if (tail) appendTextToMessage(tail, buildTodoPromptBlock(todos))
+        out.push({
+          type: 'todo_update',
+          todos,
+          detail: describeTodos(todos),
+          ownerId: todoOwnerId
         })
       }
 
@@ -1015,6 +1054,12 @@ export class ReactRuntime implements AgentRuntime {
       askUser: (req) => this.askQuestions(req.questions, req.source, signal, out),
       ...(this.deps.todos ? { todos: this.deps.todos } : {}),
       ...(input.rootId ? { todoOwnerId: input.rootId } : {}),
+      /*
+       * v2.28：命令级危险清单的放行资格 —— **只有本出口**（应用内代理，有确认框 UI，
+       * 且用户在设置里显式关掉了它）才给。对外 MCP 出口的 requestGate 恒为 false，
+       * 它走 base 的缺省值 false，命令级清单照拦（见 ToolContext.commandGateRelease）。
+       */
+      commandGateRelease: this.options.allowDangerousWithGate === false,
       requestGate: async (req) => {
         // 已停止时不再请求闸门：避免「批准 Promise 永不 resolve → drive() 挂死、流永不关闭」。
         // 同时也监听 abort，让等待批准期间点「停止」立即生效（与 sleepAbortable 同一约定）。
@@ -1429,6 +1474,9 @@ export class ReactRuntime implements AgentRuntime {
     } else {
       summary = summarizeToolCall(decision.spec, decision.args, outcome.result, decision.spec.name)
       if (decision.skipConfirm) summary += '（确认框已关闭，按策略跳过确认）'
+      // v2.28：命令级清单被策略放行时同样留痕 —— 与工具级闸门是两层，
+      // 各自松开都要能从轨迹里看出来（不然「关了开关到底放行了哪一层」无从回答）。
+      if (commandGateSkipped(outcome.result)) summary += COMMAND_GATE_SKIPPED_NOTE
     }
     const code = outcome.result.error?.code
     // H（v2.14）：可回放卡片数据。求值放在这里（而不是让界面自己算）——
@@ -1585,6 +1633,29 @@ export class ReactRuntime implements AgentRuntime {
       ...(payload !== undefined ? { data: payload } : {}),
       ...(cardMeta !== undefined ? { cardMeta } : {})
     })
+  }
+}
+
+/**
+ * v2.28：把一段文本追加到消息内容的末尾。
+ *
+ * 内容有两种形态（`composeUserContent` 在带图时给 parts 数组、否则给字符串；
+ * 工具结果的 content 恒为 parts 数组），两种都要能接 —— 只处理其中一种，
+ * 另一种会静默丢掉整段文本，现象是「清单更新了但模型看不到」。
+ *
+ * 为什么需要这个动作：注入点是 transcript 的**末尾**而不是 system prompt。
+ * system prompt 是服务端 prompt cache 的第一个前缀，逐字改变会让后面整段
+ * transcript 按全价重算（见 drive() 里 v2.28 的说明）。
+ */
+function appendTextToMessage(message: Message, text: string): void {
+  if (!text) return
+  const content = (message as { content?: unknown }).content
+  if (typeof content === 'string') {
+    ;(message as { content?: string }).content = content ? `${content}\n\n${text}` : text
+    return
+  }
+  if (Array.isArray(content)) {
+    content.push({ type: 'text', text })
   }
 }
 

@@ -51,7 +51,7 @@ export function IntegrationSettings({ onManage }: { onManage: () => void }) {
       setLocate(r)
       if (r.found) {
         setEnspPath(r.found)
-        void updateSettings({ ensp: { exePath: r.found } })
+        void updateSettings({ ensp: { ...useApp.getState().settings.ensp, exePath: r.found } })
       }
     } catch (e) {
       // N65：原来只有 try/finally —— 探测失败只留一条未处理 rejection，
@@ -67,7 +67,7 @@ export function IntegrationSettings({ onManage }: { onManage: () => void }) {
     if (!picked?.exePath) return
     setEnspPath(picked.exePath)
     setLocate(null)
-    void updateSettings({ ensp: { exePath: picked.exePath } })
+    void updateSettings({ ensp: { ...useApp.getState().settings.ensp, exePath: picked.exePath } })
   }
 
   return (
@@ -171,7 +171,7 @@ export function IntegrationSettings({ onManage }: { onManage: () => void }) {
                                     onChange={(e) => {
                                       const val = e.target.value
                                       setEnspPath(val)
-                                      void updateSettings({ ensp: { exePath: val } })
+                                      void updateSettings({ ensp: { ...useApp.getState().settings.ensp, exePath: val } })
                                     }}
                                     placeholder="留空则自动探测"
                                     title="eNSP_Client.exe 的完整路径"
@@ -228,6 +228,19 @@ export function IntegrationSettings({ onManage }: { onManage: () => void }) {
                                   </div>
                                 ) : null}
                               </>
+                            }
+                          />
+                          <Row
+                            title="导入后自动重排拓扑"
+                            desc="默认关闭：导入工程时按 eNSP 里原来的摆放显示。打开后导入即按网络层级重排一次（会覆盖工程里的摆放并持久保存）；无论开关如何，都可以随时点画布工具栏的「自适应布局」手动重排。"
+                            control={
+                              <Switch
+                                checked={settings.ensp.autoLayoutOnImport}
+                                onChange={(v) => {
+                                  const cur = useApp.getState().settings.ensp
+                                  void updateSettings({ ensp: { ...cur, autoLayoutOnImport: v } })
+                                }}
+                              />
                             }
                           />
                         </Section>

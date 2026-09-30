@@ -165,7 +165,7 @@ export function ProfileSettings(): ReactNode {
             <DismissibleBanner tone={TEST_TONE[tested.r.level]} onDismiss={() => setTested(null)}>
               <span>
                 <b>{tested.name}</b>：{tested.r.detail}
-                {tested.r.hint ? ` —— ${tested.r.hint}` : ''}
+                {tested.r.hint ? ` (${tested.r.hint})` : ''}
               </span>
               <button className="btn ghost icon sm" onClick={() => setTested(null)} title="收起该结论">
                 ×
@@ -284,7 +284,7 @@ export function ProfileSettings(): ReactNode {
       <Section label="请求韧性">
         <Row
           title="失败自动重试"
-          desc="只重试临时性失败（限流 429、超时、5xx、连接中断）；密钥无效、模型名不存在、额度耗尽这类确定性错误会立刻失败 —— 重试它们只是让你多等几秒看到同一个错。"
+          desc="只重试临时性失败（限流 429、超时、5xx、连接中断）；密钥无效、模型名不存在、额度耗尽这类确定性错误会立刻失败，重试它们只是让你多等几秒看到同一个错。"
           control={
             <Switch
               checked={retryDraft.enabled}
@@ -380,7 +380,7 @@ export function ProfileSettings(): ReactNode {
         />
         <Row
           title="上下文预算（字符）"
-          desc="整个对话的字符预算，超出即压缩老轮次。默认 80 万字符 ≈ 256k token，与默认模型窗口同量级；它和按窗口算的「触发水位」是双判据，谁先到谁触发 —— 换了窗口明显更大的模型（512k / 1M）时，这个值也要跟着调大，否则压缩仍会提前触发，大窗口就白开了。"
+          desc="整个对话的字符预算，超出即压缩老轮次。默认 80 万字符 ≈ 256k token，与默认模型窗口同量级；它和按窗口算的「触发水位」是双判据，谁先到谁触发。换了窗口明显更大的模型（512k / 1M）时，这个值也要跟着调大，否则压缩仍会提前触发，大窗口就白开了。"
           control={
             <input
               type="number"
@@ -423,7 +423,7 @@ export function ProfileSettings(): ReactNode {
         />
         <Row
           title="用模型生成摘要"
-          desc="把较早的几轮原文交给模型压成「结论摘要」再进上下文：设备名与 IP、掩码、VLAN、接口名、已下发的命令、验证结论、失败与未完成项都会原样保留，回显明细与中间推理则省略。多花一次模型请求。关掉则退回本地修剪 —— 老工具输出会被换成「请重新调用该工具」，不再可恢复，但不多花请求。"
+          desc="把较早的几轮原文交给模型压成「结论摘要」再进上下文：设备名与 IP、掩码、VLAN、接口名、已下发的命令、验证结论、失败与未完成项都会原样保留，回显明细与中间推理则省略。多花一次模型请求。关掉则退回本地修剪：老工具输出会被换成「请重新调用该工具」，不再可恢复，但不多花请求。"
           control={
             <Switch
               checked={compactDraft.summarize}
@@ -437,7 +437,7 @@ export function ProfileSettings(): ReactNode {
         />
         <Row
           title="触发水位（占模型窗口比例）"
-          desc="真实用量达到窗口的这个比例就压缩，默认 0.75。用量数字来自服务商返回的 usage（已补上缓存命中部分），不是字符估算。留出的余量要给本轮输出与本轮工具回显 —— 调到 0.9 以上基本等于等着溢出。"
+          desc="真实用量达到窗口的这个比例就压缩，默认 0.75。用量数字来自服务商返回的 usage（已补上缓存命中部分），不是字符估算。留出的余量要给本轮输出与本轮工具回显，调到 0.9 以上基本等于等着溢出。"
           control={
             <input
               type="number"
@@ -459,10 +459,10 @@ export function ProfileSettings(): ReactNode {
         />
       </Section>
 
-      <Section label="并发执行（v2.5）">
+      <Section label="并发执行">
         <Row
           title="同时进行的调用上限"
-          desc="批量巡检多台设备时，跨设备的只读命令可以同时下发，不用一台一台排队等回显。同设备仍然严格串行（VRP 一次只能跑一条命令），配置类写操作始终独占，且会把它前后的只读调用隔开 —— 保证「改完再看」读到的是改后的状态。填 1 = 完全串行。"
+          desc="批量巡检多台设备时，跨设备的只读命令可以同时下发，不用一台一台排队等回显。同设备仍然严格串行（VRP 一次只能跑一条命令），配置类写操作始终独占，且会把它前后的只读调用隔开，保证「改完再看」读到的是改后的状态。填 1 = 完全串行。"
           control={
             <input
               type="number"
@@ -483,7 +483,7 @@ export function ProfileSettings(): ReactNode {
         />
       </Section>
 
-      <Section label="重复调用防护（v2.14）">
+      <Section label="重复调用防护">
         <Row
           title="重复调用提醒"
           desc="代理偶尔会卡在同一个动作上：用完全相同的参数反复调同一条命令，每次都得到同样的结果却继续重发，直到把轮次预算烧光。开启后，同一工具 + 同一参数连续出现第 3、5、8 次时，会在对话末尾追加一条系统提醒，让它换参数、换命令或直接给结论。只提醒、不改任何工具结果，也不改系统提示词（后者会让服务端缓存整段失效）。参数按「值」比较，键序不同视为同一次调用；你插一句话就重新计数。"
@@ -500,7 +500,7 @@ export function ProfileSettings(): ReactNode {
         />
       </Section>
 
-      <Section label="会话标题（v2.8）">
+      <Section label="会话标题">
         <Row
           title="用模型给会话起名"
           desc="一轮任务成功收尾后，让模型用一两句话概括这次做了什么，作为会话标题（如「给 3 台接入交换机配 VLAN 10」），比「新建会话 1 / 2 / 3」好找。每轮只多花一次很小的模型请求（只在还没起过名时发）。首轮没起成（任务失败/被中止）时，之后成功收尾的轮次会自动补起。你手动改过的标题不会被覆盖。"
@@ -539,7 +539,7 @@ export function ProfileSettings(): ReactNode {
         />
         <Row
           title="生成超时（毫秒）"
-          desc="起名请求的等待上限，默认 15000。超时不会影响你的任务 —— 请求被丢弃，标题退回「首条消息截断」的兜底值，任务照常收尾。"
+          desc="起名请求的等待上限，默认 15000。超时不会影响你的任务：请求被丢弃，标题退回「首条消息截断」的兜底值，任务照常收尾。"
           control={
             <input
               type="number"

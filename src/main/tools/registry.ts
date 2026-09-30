@@ -45,6 +45,20 @@ export interface ToolContext {
   /** 危险操作闸门裁决回调；返回 true 表示获准执行 */
   requestGate: (req: GateRequest) => Promise<boolean>
   /**
+   * v2.28：命令级危险清单是否可被「关掉确认框」这一策略放行。
+   *
+   * **只有内置人工闸门通道的出口才能置 true** —— 也就是应用内的代理运行时
+   * （`ReactRuntime`，且仅当 `permission.confirmDanger === false`）。
+   *
+   * 为什么必须显式传递而不是让工具层直接读 `settings.permission.confirmDanger`：
+   * 对外 MCP 出口复用同一个 `apply_config`（risk: write，在暴露白名单内），
+   * 却**没有任何确认 UI**（它的 `requestGate` 恒为 `false`，"外部客户端一律视为拒绝"）。
+   * 若工具层直接读全局设置，用户在本机为「一台可随时重装的实验设备」关掉确认框，
+   * 会顺带把**远程 MCP 客户端**的破坏性命令也放行 —— 那是一处没有人授权过的提权。
+   * 缺省 false = 保守拦截，与改动前完全一致。
+   */
+  commandGateRelease?: boolean
+  /**
    * v2.7：结构化提问回调（`ask_user_question` 的唯一出口）。
    * 返回答案映射；用户取消或任务中止时返回 null。
    * 缺省 = 当前出口没有提问通道（对外 MCP），工具会返回 UNSUPPORTED。
